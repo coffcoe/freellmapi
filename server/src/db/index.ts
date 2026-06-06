@@ -61,6 +61,7 @@ export function initDb(dbPath?: string): Database.Database {
   // After all model migrations: add/refresh paid-equivalent pricing
   // (drives the realistic "Est. savings" analytics stat).
   applyModelPricing(db);
+  migrateModelsV23XunfeiSpark(db);
   migrateEmbeddingsV1(db);
   ensureUnifiedKey(db);
 
@@ -1721,6 +1722,37 @@ function migrateModelsV22Tools(db: Database.Database) {
         OR LOWER(model_id) LIKE '%nemotron-3-super%' -- benchmarked #8 with real tool calls; nano stays excluded
       )
     `).run();
+  });
+  apply();
+}
+
+// iFlytek Spark (讯飞星火) — OpenAI-compatible endpoint at spark-api-open.xf-yun.com.
+// Auth uses APIKey:APISecret colon-separated Bearer token.
+// Lite: permanently free, unlimited tokens. generalv3.5 & 4.0Ultra: trial quotas.
+function migrateModelsV23XunfeiSpark(db: Database.Database) {
+  const insert = db.prepare(`
+    INSERT OR IGNORE INTO models (platform, model_id, display_name,
+      intelligence_rank, speed_rank, size_label,
+      rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
+      supports_vision, supports_tools)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const additions: Array<[string, string, string, number, number, string,
+    number | null, number | null, number | null, number | null, string, number | null,
+    number, number]> = [
+    // lite — permanently free, unlimited, very fast
+    ['xunfei', 'lite', 'Spark Lite (iFlytek)', 20, 3, 'Small',
+     2, 500, 4000, 50000, 'free', 8192, 0, 0],
+    // generalv3.5 — Spark 3.5, moderate intelligence, trial quota
+    ['xunfei', 'generalv3.5', 'Spark 3.5 (iFlytek)', 16, 5, 'Medium',
+     2, 200, 4000, 50000, 'free', 8192, 0, 1],
+    // 4.0Ultra — Spark 4.0 Ultra flagship, strongest Spark model, trial quota
+    ['xunfei', '4.0Ultra', 'Spark 4.0 Ultra (iFlytek)', 13, 8, 'Large',
+     2, 100, 4000, 50000, 'free', 128000, 0, 1],
+  ];
+  const apply = db.transaction(() => {
+    for (const a of additions) insert.run(...a);
+    backfillFallback(db);
   });
   apply();
 }

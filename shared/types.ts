@@ -25,6 +25,8 @@ export type Platform =
   // OpenCode Zen — OpenAI-compatible gateway. Free promotional models require a
   // free (no-card) account key from opencode.ai/auth; see migrateModelsV18.
   | 'opencode'
+  // iFlytek Spark (讯飞星火) — OpenAI-compatible endpoint.
+  | 'xunfei'
   // User-configured OpenAI-compatible endpoint (llama.cpp, LM Studio, vLLM,
   // Ollama, any base_url). The endpoint URL lives on the api_keys row; see #117.
   | 'custom';

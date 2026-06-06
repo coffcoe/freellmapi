@@ -161,6 +161,15 @@ register(new OpenAICompatProvider({
   baseUrl: 'https://opencode.ai/zen/v1',
 }));
 
+// iFlytek Spark (讯飞星火) — OpenAI-compatible.
+// Auth: Bearer token format is APIKey:APISecret (colon-separated).
+// Lite is permanently free (unlimited); other models have trial quotas.
+register(new OpenAICompatProvider({
+  platform: 'xunfei',
+  name: 'iFlytek Spark',
+  baseUrl: 'https://spark-api-open.xf-yun.com/v1',
+}));
+
 // Chutes was evaluated for V11 and dropped: probe with a free-tier key
 // returned 402 on every model — "Quota exceeded and account balance is
 // $0.0, please pay with fiat or send tao". The "free" tier requires a
