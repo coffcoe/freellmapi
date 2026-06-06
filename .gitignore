@@ -13,5 +13,11 @@ server/data/
 deploy-pi.sh
 update-hermes.sh
 
-# Monetization planning — private, never committed
-monetization/
+# Local scripts (one-off setup/maintenance, not upstream)
+*.bat
+*.vbs
+*.log
+add-*.js
+freellmapi-*.user.js
+README-AUTOSTART.md
+README-CHINESE-USERSCRIPT.md
