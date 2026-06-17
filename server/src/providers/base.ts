@@ -153,7 +153,6 @@ export abstract class BaseProvider {
       clearTimeout(timeout);
     }
   }
-<<<<<<< Updated upstream
 
   protected makeId(): string {
     return `chatcmpl-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
