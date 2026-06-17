@@ -28,18 +28,19 @@ register(new OpenAICompatProvider({
   baseUrl: 'https://api.cerebras.ai/v1',
 }));
 
-// SambaNova - OpenAI-compatible
-register(new OpenAICompatProvider({
-  platform: 'sambanova',
-  name: 'SambaNova',
-  baseUrl: 'https://api.sambanova.ai/v1',
-}));
+// SambaNova was dropped in V23 (June 2026): the free tier is permanently gone.
+// The always-free tier was retired in early 2025 for a one-time $5 trial
+// credit (expires in 3 months); once it lapses, every chat call 402s
+// "payment method required" with no recurring no-card path back.
 
-// NVIDIA NIM - OpenAI-compatible
+// NVIDIA NIM - OpenAI-compatible. Several NIM models reject parallel tool calls
+// ("This model only supports single tool-calls at once!"), so pin
+// parallel_tool_calls to false when tools are present. See issue #255.
 register(new OpenAICompatProvider({
   platform: 'nvidia',
   name: 'NVIDIA NIM',
   baseUrl: 'https://integrate.api.nvidia.com/v1',
+  forceSingleToolCall: true,
 }));
 
 // Mistral - OpenAI-compatible
@@ -133,10 +134,17 @@ register(new OpenAICompatProvider({
 // endpoint lives at `/openai/v1/chat/completions` (NOT `/v1/...` — the
 // `/openai` prefix is mandatory). Public model list returns one anonymous
 // model (`openai-fast` = GPT-OSS 20B on OVH, tools=true).
+// Registered keyless (June 2026): the legacy text API is deprecated for
+// AUTHENTICATED users (replacement enter.pollinations.ai is pay-as-you-go
+// "pollen"), while anonymous access is explicitly unaffected — so the anon
+// path is the only recurring-free one left. Anon is queue-limited to 1
+// concurrent request per IP (429 "Queue full" on overlap; live-probed
+// 2026-06-10).
 register(new OpenAICompatProvider({
   platform: 'pollinations',
   name: 'Pollinations',
   baseUrl: 'https://text.pollinations.ai/openai/v1',
+  keyless: true,
 }));
 
 // LLM7.io — OpenAI-compatible aggregator. 100 req/hr free; anonymous access
@@ -161,19 +169,54 @@ register(new OpenAICompatProvider({
   baseUrl: 'https://opencode.ai/zen/v1',
 }));
 
-// iFlytek Spark (讯飞星火) — OpenAI-compatible.
-// Auth: Bearer token format is APIKey:APISecret (colon-separated).
-// Lite is permanently free (unlimited); other models have trial quotas.
+// OVHcloud AI Endpoints — OpenAI-compatible. Two free modes: anonymous
+// (documented 2 req/min per IP per model — observed even stricter across
+// models in practice) and authenticated (400 req/min), but an API key
+// requires a Public Cloud project with a payment method on file, so the
+// keyless row is the no-card path this catalog ships. Live-probed keyless
+// 2026-06-10: structured tool_calls on gpt-oss-120b and
+// Meta-Llama-3_3-70B-Instruct. OVH reserves the right to add token caps;
+// individual models get deprecated on notice. See migrateModelsV26.
 register(new OpenAICompatProvider({
-  platform: 'xunfei',
-  name: 'iFlytek Spark',
-  baseUrl: 'https://spark-api-open.xf-yun.com/v1',
+  platform: 'ovh',
+  name: 'OVH AI Endpoints',
+  baseUrl: 'https://oai.endpoints.kepler.ai.cloud.ovh.net/v1',
+  keyless: true,
+}));
+
+// Agnes AI (Sapiens AI) — OpenAI-compatible, backed by LiteLLM + vLLM. Its
+// proprietary Agnes models are currently served at $0/token: live-probed
+// 2026-06-15, the LiteLLM cost headers (x-litellm-response-cost-original) come
+// back 0.0 with no credit drain, so usage is genuinely free rather than a
+// one-time signup-credit grant. The $0 is promotional ("previously $X" /
+// "during this period"), and there is a paid Token/Unlimited subscription
+// underneath, so watch for reversion to paid. ~30 concurrent requests succeed
+// before 429s (no documented RPM/RPD). Free key from platform.agnes-ai.com,
+// no card. Catalog rows live in the catalog (premium → age into free); not
+// shipped as freeapi model migrations.
+register(new OpenAICompatProvider({
+  platform: 'agnes',
+  name: 'Agnes AI',
+  baseUrl: 'https://apihub.agnes-ai.com/v1',
 }));
 
 // Chutes was evaluated for V11 and dropped: probe with a free-tier key
 // returned 402 on every model — "Quota exceeded and account balance is
 // $0.0, please pay with fiat or send tao". The "free" tier requires a
 // non-zero balance, which conflicts with the project's no-card criterion.
+
+// Reka — OpenAI-compatible (api.reka.ai/v1). Live-probed 2026-06-17: free via a
+// recurring monthly credit grant (no card; key from platform.reka.ai), billed
+// calls succeed with no 402. The OpenAI-compatible /v1/models lists two models:
+// reka-flash-3 (text reasoning) and reka-edge-2603 (natively multimodal —
+// accepts image/video input). Balance is dashboard-only (no credits API).
+// Catalog rows live in the catalog (premium → age into free); they are NOT
+// shipped as freeapi model migrations.
+register(new OpenAICompatProvider({
+  platform: 'reka',
+  name: 'Reka',
+  baseUrl: 'https://api.reka.ai/v1',
+}));
 
 // Placeholder so getProvider('custom')/hasProvider('custom')/getAllProviders()
 // behave — but the real instance is built per-key by resolveProvider(), since

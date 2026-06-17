@@ -17,12 +17,15 @@ import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarke
 import {
   isRetryableError,
   isPaymentRequiredError,
+  isModelNotFoundError,
+  isModelAccessForbiddenError,
   timingSafeStringEqual,
   extractApiToken,
   getStickyModel,
   setStickyModel,
   logRequest,
 } from './proxy.js';
+import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 
 export const responsesRouter = Router();
 
@@ -340,6 +343,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
   const responseId = newId('resp');
   const skipKeys = new Set<string>();
+  const skipModels = new Set<number>();
   let lastError: any = null;
 
   // Stream bookkeeping (used only when stream === true).
@@ -353,11 +357,11 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
     let route: RouteResult;
     try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, false, wantsTools);
+      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, false, wantsTools, skipModels.size > 0 ? skipModels : undefined);
     } catch (err: any) {
       const status = lastError ? 429 : (err.status ?? 503);
       const message = lastError
-        ? `All models rate-limited. Last error: ${lastError.message}`
+        ? `All models rate-limited. Last error: ${sanitizeProviderErrorMessage(lastError.message)}`
         : err.message;
       const type = lastError ? 'rate_limit_error' : 'routing_error';
       if (streamStarted) {
@@ -368,8 +372,6 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       }
       return;
     }
-
-    recordRequest(route.platform, route.modelId, route.keyId);
 
     try {
       if (stream) {
@@ -584,6 +586,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         sse('response.completed', { response: finalResponse });
         res.end();
 
+        recordRequest(route.platform, route.modelId, route.keyId);
         recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
         recordSuccess(route.modelDbId);
         setStickyModel(messages, route.modelDbId, sessionIdHeader);
@@ -628,6 +631,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           continue;
         }
 
+        recordRequest(route.platform, route.modelId, route.keyId);
         recordTokens(route.platform, route.modelId, route.keyId, result.usage?.total_tokens ?? 0);
         recordSuccess(route.modelDbId);
         setStickyModel(messages, route.modelDbId, sessionIdHeader);
@@ -645,7 +649,8 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       }
     } catch (err: any) {
       const latency = Date.now() - start;
-      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, err.message);
+      const safeError = sanitizeProviderErrorMessage(err.message);
+      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError);
 
       // Mid-stream failures can't be retried (bytes already sent) — close cleanly.
       if (stream && streamStarted) {
@@ -655,6 +660,9 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
       }
 
       if (isRetryableError(err)) {
+        // Model-level 404: rule out the whole model for this request — its
+        // other keys would 404 the same way. (PR #111, credits @barbotkonv.)
+        if (isModelNotFoundError(err) || isModelAccessForbiddenError(err)) skipModels.add(route.modelDbId);
         skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
         setCooldown(route.platform, route.modelId, route.keyId, isPaymentRequiredError(err)
           ? PAYMENT_REQUIRED_COOLDOWN_MS
@@ -664,7 +672,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         continue;
       }
 
-      res.status(502).json({ error: { message: `Provider error (${route.displayName}): ${err.message}`, type: 'provider_error' } });
+      res.status(502).json({ error: { message: `Provider error (${route.displayName}): ${safeError}`, type: 'provider_error' } });
       return;
     }
   }

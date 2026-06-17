@@ -6,23 +6,37 @@ import type {
   ChatToolChoice,
   Platform,
 } from '@freellmapi/shared/types.js';
-import { needsProxy, getProxyAgent, getProxyConfigForProvider, PROXY_CONFIG, type ProxyProviderConfig } from '../lib/proxy-manager.js';
+import { proxyFetch } from '../lib/proxy.js';
 
-// ──────────────────────────────────────────────
-// Proxy hot-swap: per-platform direct-connect test
-// If a "needsProxy: true" platform responds faster
-// (or at all) without a proxy, remember the decision
-// so future requests skip the proxy hop.
-// Cache is refreshed every RETEST_INTERVAL_MS.
-// ──────────────────────────────────────────────
-interface ProxyHotSwapEntry {
-  tested: boolean;
-  directWon: boolean;       // true = direct connect worked
-  testedAt: number;         // timestamp of last test
+/** A provider HTTP error carrying the upstream status and, when the response
+ *  included a Retry-After header, the parsed delay so the router can bench the
+ *  key for at least that long. */
+export interface ProviderHttpError extends Error {
+  status?: number;
+  retryAfterMs?: number;
 }
-const proxyHotSwapCache = new Map<string, ProxyHotSwapEntry>();
-const HOT_SWAP_TEST_TIMEOUT_MS = 5000;   // generous enough for both paths
-const HOT_SWAP_RETEST_MS = 6 * 60 * 60 * 1000; // re-test every 6 hours
+
+/** Parse an HTTP `Retry-After` header (delta-seconds or an HTTP-date) into a
+ *  millisecond delay. Returns undefined when absent or unparseable. */
+export function parseRetryAfterMs(value: string | null | undefined): number | undefined {
+  if (!value) return undefined;
+  const trimmed = value.trim();
+  if (/^\d+$/.test(trimmed)) return Number(trimmed) * 1000;
+  const when = Date.parse(trimmed);
+  if (!Number.isNaN(when)) return Math.max(0, when - Date.now());
+  return undefined;
+}
+
+/** Build an error for a non-OK upstream response, capturing the status and any
+ *  Retry-After hint. Used by every provider adapter so the proxy can honor a
+ *  provider's explicit back-off when it sets the cooldown. */
+export function providerHttpError(res: Response, message: string): ProviderHttpError {
+  const err = new Error(message) as ProviderHttpError;
+  err.status = res.status;
+  const retryAfterMs = parseRetryAfterMs(res.headers?.get('retry-after'));
+  if (retryAfterMs !== undefined) err.retryAfterMs = retryAfterMs;
+  return err;
+}
 
 export interface CompletionOptions {
   model?: string;
@@ -32,14 +46,11 @@ export interface CompletionOptions {
   tools?: ChatToolDefinition[];
   tool_choice?: ChatToolChoice;
   parallel_tool_calls?: boolean;
+  /** Per-call HTTP timeout override. Not part of the OpenAI wire format (it is
+   * stripped before the request body is built); used by the probe script so
+   * NVIDIA's 15-60s serverless cold starts don't read as failures. */
+  timeoutMs?: number;
 }
-
-// Global toggle for proxy hot-swap — disables the direct-connect probe that
-// fires a *real* fetch before the mocked one can intercept. Useful in tests
-// where mocking `global.fetch` should take effect immediately without a
-// preliminary real network round-trip. Controlled via the environment variable
-// DISABLE_PROXY_HOT_SWAP (e.g. `DISABLE_PROXY_HOT_SWAP=1 vitest run ...`).
-const HOT_SWAP_DISABLED = Boolean(process.env.DISABLE_PROXY_HOT_SWAP);
 
 export abstract class BaseProvider {
   abstract readonly platform: Platform;
@@ -66,20 +77,6 @@ export abstract class BaseProvider {
 
   abstract validateKey(apiKey: string): Promise<boolean>;
 
-  protected makeId(): string {
-    return `chatcmpl-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  }
-
-  /**
-   * 带超时的 fetch 请求，支持按平台动态选择代理
-   * 新增：海外厂商支持代理热交换（Hot-Swap）——如果直连效果优于走代理，自动切直连。
-   * 
-   * ⚠️ 关键改动：
-   * - 不再依赖全局 HTTP_PROXY 环境变量
-   * - 根据平台（如 'custom', 'zhipu', 'openrouter' 等）动态决定是否使用代理
-   * - 需要代理的平台通过 getProxyAgent() 获取 Agent；不需要的直连
-   * - 代理热交换：首次或缓存过期时，同时测试直连和代理，取更快的路径
-   */
   protected async fetchWithTimeout(
     url: string,
     init: RequestInit,
@@ -87,71 +84,15 @@ export abstract class BaseProvider {
   ): Promise<Response> {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
-
-    let shouldUseProxy: boolean;
-
     try {
-      // ── Proxy Hot-Swap 逻辑 ──────────────────────
-      // When HOT_SWAP_DISABLED (e.g. in CI/test), skip the real fetch probe
-      // so that mocking `global.fetch` takes effect immediately.
-      if (HOT_SWAP_DISABLED) {
-        const pc = getProxyConfigForProvider(this.platform);
-        shouldUseProxy = Boolean(pc?.needsProxy && PROXY_CONFIG.enabled);
-      } else {
-        const platformConfig = getProxyConfigForProvider(this.platform);
-
-        if (platformConfig?.needsProxy) {
-          // 平台标记为需要代理，但我们先测试直连
-          let hsEntry = proxyHotSwapCache.get(this.platform);
-          const now = Date.now();
-          const stale = !hsEntry || (now - hsEntry.testedAt) > HOT_SWAP_RETEST_MS;
-
-          if (stale) {
-            // 首次测试或未测试过 → 尝试直连
-            try {
-              const proxyInit: RequestInit = { ...init, signal: AbortSignal.timeout(HOT_SWAP_TEST_TIMEOUT_MS) };
-              await fetch(url, proxyInit);
-              proxyHotSwapCache.set(this.platform, {
-                tested: true,
-                directWon: true,
-                testedAt: now,
-              });
-              shouldUseProxy = false;
-            } catch {
-              // 直连失败（超时/连接拒绝）→ 退回走代理
-              proxyHotSwapCache.set(this.platform, {
-                tested: true,
-                directWon: false,
-                testedAt: now,
-              });
-              shouldUseProxy = true;
-            }
-          } else {
-            // 已测试过 → 直接用之前的结果
-            shouldUseProxy = !hsEntry.directWon;
-          }
-        } else {
-          // 平台不需要代理 → 直连
-          shouldUseProxy = false;
-        }
-      }
-
-      // ── 构建 fetch ────────────────────────────────
-      const proxyAgent = shouldUseProxy ? await getProxyAgent(this.platform) : null;
-
-      const fetchInit: RequestInit = {
-        ...init,
-        signal: controller.signal,
-      };
-
-      if (proxyAgent) {
-        (fetchInit as any).agent = proxyAgent;
-      }
-
-      return await fetch(url, fetchInit);
+      return await proxyFetch(url, { ...init, signal: controller.signal }, this.platform);
     } finally {
       clearTimeout(timeout);
     }
+  }
+
+  protected makeId(): string {
+    return `chatcmpl-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   }
 
   /**

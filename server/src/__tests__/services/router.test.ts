@@ -1,7 +1,12 @@
-import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import { initDb, getDb } from '../../db/index.js';
 import { encrypt } from '../../lib/crypto.js';
-import { routeRequest, setRoutingStrategy } from '../../services/router.js';
+import {
+  getAllPenalties,
+  recordRateLimitHit,
+  routeRequest,
+  setRoutingStrategy,
+} from '../../services/router.js';
 
 describe('Router', () => {
   beforeAll(() => {
@@ -15,12 +20,18 @@ describe('Router', () => {
     // bandit (now the default strategy) doesn't reorder by score.
     setRoutingStrategy('priority');
     db.prepare('DELETE FROM api_keys').run();
+    // Disable active profile so the router falls back to fallback_config
+    db.prepare("DELETE FROM settings WHERE key = 'active_profile_id'").run();
     // Reset fallback order to intelligence ranking
     const models = db.prepare('SELECT id, intelligence_rank FROM models ORDER BY intelligence_rank ASC').all() as any[];
     const update = db.prepare('UPDATE fallback_config SET priority = ? WHERE model_db_id = ?');
     for (let i = 0; i < models.length; i++) {
       update.run(i + 1, models[i].id);
     }
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it('should throw when no keys are configured', () => {
@@ -157,5 +168,20 @@ describe('Router', () => {
     expect(result.platform).toBe('groq');
     expect(result.apiKey).toBe('test-groq-key');
     expect(corruptKey.status).toBe('error');
+  });
+
+  it('applies elapsed decay before adding a new 429 penalty', () => {
+    vi.useFakeTimers();
+    const modelDbId = 987654321;
+
+    recordRateLimitHit(modelDbId);
+    vi.advanceTimersByTime(10 * 60 * 1000);
+    recordRateLimitHit(modelDbId);
+
+    expect(getAllPenalties()).toContainEqual({
+      modelDbId,
+      count: 2,
+      penalty: 3,
+    });
   });
 });
