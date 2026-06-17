@@ -15,6 +15,12 @@ import { settingsRouter } from './routes/settings.js';
 import { authRouter } from './routes/auth.js';
 import { requireAuth } from './middleware/requireAuth.js';
 import { createProxyRateLimiter } from './middleware/rateLimit.js';
+import { proxyAuth } from './middleware/proxyAuth.js';
+import { requestSanitizer } from './middleware/requestSanitizer.js';
+import { requestValidator } from './middleware/requestValidator.js';
+import { messageNormalizer } from './middleware/messageNormalizer.js';
+import { tokenEstimator } from './middleware/tokenEstimator.js';
+import { capabilityGate } from './middleware/capabilityGate.js';
 import { errorHandler } from './middleware/errorHandler.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -32,6 +38,34 @@ function getAllowedCorsOrigins() {
     .filter(Boolean);
 
   return new Set([...DEFAULT_DASHBOARD_ORIGINS, ...configuredOrigins]);
+}
+
+/**
+ * Feature flags: each new middleware has its own flag so we can
+ * disable individual pieces without touching the handler.
+ * Set DISABLE_ALL_MIDDLEWARE=true to skip ALL new middleware.
+ */
+const DISABLE_ALL = process.env.DISABLE_ALL_MIDDLEWARE === 'true';
+const ENABLE_PROXY_AUTH = !DISABLE_ALL && process.env.ENABLE_PROXY_AUTH !== 'false';
+const ENABLE_SANITIZER = !DISABLE_ALL && process.env.ENABLE_SANITIZER !== 'false';
+const ENABLE_VALIDATOR = !DISABLE_ALL && process.env.ENABLE_VALIDATOR !== 'false';
+const ENABLE_NORMALIZER = !DISABLE_ALL && process.env.ENABLE_NORMALIZER !== 'false';
+const ENABLE_TOKEN_ESTIMATOR = !DISABLE_ALL && process.env.ENABLE_TOKEN_ESTIMATOR !== 'false';
+const ENABLE_CAPABILITY_GATE = !DISABLE_ALL && process.env.ENABLE_CAPABILITY_GATE !== 'false';
+
+// Build the /v1 middleware chain respecting feature flags.
+// Order matters: auth → sanitize → validate → normalize → estimate → gate
+function buildProxyMiddlewareChain(): Array<express.RequestHandler> {
+  const mws: Array<express.RequestHandler> = [createProxyRateLimiter()];
+
+  if (ENABLE_PROXY_AUTH) mws.push(proxyAuth());
+  if (ENABLE_SANITIZER) mws.push(requestSanitizer());
+  if (ENABLE_VALIDATOR) mws.push(requestValidator());
+  if (ENABLE_NORMALIZER) mws.push(messageNormalizer());
+  if (ENABLE_TOKEN_ESTIMATOR) mws.push(tokenEstimator());
+  if (ENABLE_CAPABILITY_GATE) mws.push(capabilityGate());
+
+  return mws;
 }
 
 export function createApp() {
@@ -69,10 +103,9 @@ export function createApp() {
   app.use('/api/health', requireAuth, healthRouter);
   app.use('/api/settings', requireAuth, settingsRouter);
 
-  // OpenAI-compatible proxy. Per-IP rate limiting (#35 item #6) runs first so
-  // it throttles unauthenticated brute-force / flood attempts before any
-  // routing work. Tune via PROXY_RATE_LIMIT_RPM; 0 disables it.
-  app.use('/v1', createProxyRateLimiter());
+  // OpenAI-compatible proxy. The new middleware chain is built with feature
+  // flags so each piece can be toggled independently.
+  app.use('/v1', ...buildProxyMiddlewareChain());
   app.use('/v1', proxyRouter);
   // OpenAI Responses API shim (Codex CLI requires wire_api="responses"; see #96)
   app.use('/v1', responsesRouter);
