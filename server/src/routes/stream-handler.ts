@@ -38,12 +38,12 @@ export async function handleStreamRoute(
     isPaymentRequiredError: (err: any) => boolean;
     logRequest: (platform: string, modelId: string, keyId: number, status: string, inputTokens: number, outputTokens: number, latencyMs: number, error: string | null) => void;
     getCooldownDurationForLimit: typeof import('../services/ratelimit.js').getCooldownDurationForLimit;
-    getEstimatedInputTokens: typeof import('./proxy.js').getEstimatedInputTokens;
+    getEstimatedInputTokens: (_ctx: { messages: any[] }) => number;
   },
 ): Promise<void> {
   const { start, estimatedInputTokens, attempt, recordTokens: rt, recordSuccess: rs, setStickyModel: ssm,
     setCooldown: sc, isRetryableError: ire, isPaymentRequiredError: ipre, logRequest: lr,
-    getCooldownDurationForLimit: gcdfl, getEstimatedInputTokens: geteit } = ctx;
+    getCooldownDurationForLimit: gcdfl } = ctx;
 
   const gen = route.provider.streamChatCompletion(route.apiKey, messages, modelId, {
     temperature: opts.temperature,

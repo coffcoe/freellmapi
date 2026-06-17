@@ -154,10 +154,6 @@ export abstract class BaseProvider {
     }
   }
 
-  protected makeId(): string {
-    return `chatcmpl-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  }
-
   /**
    * Shared SSE reader for OpenAI-wire streaming endpoints (#231 audit).
    *
