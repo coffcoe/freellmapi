@@ -1,5 +1,5 @@
 import type { Request, Response, NextFunction } from 'express';
-import { chatCompletionSchema, embeddingsBody } from './schemas.js';
+import { chatCompletionSchema, chatCompletionSchemaWithFusion, embeddingsBody } from './schemas.js';
 
 /**
  * Request body validation middleware for /v1 proxy endpoints.
@@ -23,9 +23,13 @@ export function requestValidator() {
       if (isEmbeddings) {
         const parsed = embeddingsBody.safeParse(req.body);
         if (!parsed.success) {
+          const detail = parsed.error.errors
+            .map(e => (e.path.length ? `${e.path.join('.')}: ${e.message}` : e.message))
+            .slice(0, 5)
+            .join(', ');
           res.status(400).json({
             error: {
-              message: `Invalid request: ${parsed.error.errors.map(e => e.message).join(', ')}`,
+              message: `Invalid request: ${detail}`,
               type: 'invalid_request_error',
             },
           });
@@ -37,12 +41,16 @@ export function requestValidator() {
         next();
         return;
       } else {
-        // Default: chat completions
-        const parsed = chatCompletionSchema.safeParse(req.body);
+        // Default: chat completions (use the version with fusion support).
+        const parsed = chatCompletionSchemaWithFusion.safeParse(req.body);
         if (!parsed.success) {
+          const detail = parsed.error.errors
+            .map(e => (e.path.length ? `${e.path.join('.')}: ${e.message}` : e.message))
+            .slice(0, 5)
+            .join(', ');
           res.status(400).json({
             error: {
-              message: `Invalid request: ${parsed.error.errors.map(e => e.message).join(', ')}`,
+              message: `Invalid request: ${detail}`,
               type: 'invalid_request_error',
             },
           });
