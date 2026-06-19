@@ -1,0 +1,8 @@
+=== Model Routing Test on NAS Docker ===
+ERR glm-4.7-flash
+OK qwen/qwen3-coder:free -> openai/gpt-oss-120b:free (OpenInference)
+OK openai/gpt-oss-20b:free -> openai/gpt-oss-20b:free (Darkbloom)
+OK nemotron-3-super-free -> openai/gpt-oss-120b:free (OpenInference)
+OK poolside/laguna-xs.2:free -> poolside/laguna-xs.2-20260421:free (Poolside)
+ERR gpt-oss-120b
+ERR openrouter/owl-alpha

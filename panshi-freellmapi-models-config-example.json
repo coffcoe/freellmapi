@@ -1,0 +1,102 @@
+{
+  "_comment": "FreeLLMAPI 模型配置模板 — 粘贴到 WorkBuddy 的 models.json 或 model-routing.json 中",
+  "freellmapi_source": {
+    "name": "FreeLLMAPI (localhost:3001)",
+    "base_url": "http://localhost:3001/v1",
+    "api_key": "freellmapi-75b227f03e70501e0715cc4a1bf9accfd9873b9031837000",
+    "models": [
+      {
+        "id": "freellmapi/auto",
+        "name": "FreeLLMAPI Auto (推荐)",
+        "model_id": "auto",
+        "status": "active",
+        "priority": 1
+      },
+      {
+        "id": "freellmapi/openai-gpt-oss-20b",
+        "name": "GPT-OSS 20B (Pollinations)",
+        "model_id": "openai/gpt-oss-20b:free",
+        "status": "active",
+        "priority": 2
+      },
+      {
+        "id": "freellmapi/gpt-oss-120b",
+        "name": "GPT-OSS 120B",
+        "model_id": "openai/gpt-oss-120b:free",
+        "status": "active",
+        "priority": 3
+      },
+      {
+        "id": "freellmapi/owl-alpha",
+        "name": "OWL Alpha (OpenRouter)",
+        "model_id": "openrouter/owl-alpha",
+        "status": "active",
+        "priority": 4
+      },
+      {
+        "id": "freellmapi/gemini-4-26b",
+        "name": "Gemma 4 26B",
+        "model_id": "google/gemma-4-26b-a4b-it:free",
+        "status": "active",
+        "priority": 5
+      },
+      {
+        "id": "freellmapi/gemma-31b",
+        "name": "Gemma 4 31B",
+        "model_id": "google/gemma-4-31b-it:free",
+        "status": "active",
+        "priority": 6
+      },
+      {
+        "id": "freellmapi/nemotron-nano",
+        "name": "Nemotron Nano 30B",
+        "model_id": "nvidia/nemotron-3-nano-30b-a3b:free",
+        "status": "active",
+        "priority": 7
+      },
+      {
+        "id": "freellmapi/step-3.7-flash",
+        "name": "Step 3.7 Flash",
+        "model_id": "stepfun/step-3.7-flash:free",
+        "status": "active",
+        "priority": 8
+      },
+      {
+        "id": "freellmapi/qwen3-coder",
+        "name": "Qwen3 Coder",
+        "model_id": "qwen/qwen3-coder:free",
+        "status": "active",
+        "priority": 9
+      },
+      {
+        "id": "freellmapi/llama-3.3-70b",
+        "name": "Llama 3.3 70B",
+        "model_id": "meta-llama/llama-3.3-70b-instruct:free",
+        "status": "active",
+        "priority": 10
+      },
+      {
+        "id": "freellmapi/glm-5.1",
+        "name": "GLM-5.1",
+        "model_id": "z-ai/glm-5.1",
+        "status": "active",
+        "priority": 11
+      },
+      {
+        "id": "freellmapi/glm-4.7-flash",
+        "name": "GLM-4.7-Flash",
+        "model_id": "glm-4.7-flash",
+        "status": "active",
+        "priority": 12
+      },
+      {
+        "id": "freellmapi/fastchat",
+        "name": "FastChat (OpenAI Compatible)",
+        "model_id": "fastchat/tiger-latest",
+        "status": "inactive",
+        "priority": 0,
+        "_comment": "需要配置 FASTCHAT_BASE_URL"
+      }
+    ]
+  }
+}
