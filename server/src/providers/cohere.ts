@@ -18,15 +18,17 @@ export class CohereProvider extends BaseProvider {
     modelId: string,
     options?: CompletionOptions,
   ): Promise<ChatCompletionResponse> {
+    // Build body defensively: skip null/undefined values to avoid sending
+    // null primitives to strict providers
     const body: Record<string, unknown> = {
       model: modelId,
       messages: flattenMessageContent(messages),
-      temperature: options?.temperature,
-      max_tokens: options?.max_tokens,
-      top_p: options?.top_p,
-      tools: options?.tools,
-      tool_choice: options?.tool_choice,
     };
+    if (options?.temperature != null) body.temperature = options.temperature;
+    if (options?.max_tokens != null) body.max_tokens = options.max_tokens;
+    if (options?.top_p != null) body.top_p = options.top_p;
+    if (options?.tools != null && options.tools.length > 0) body.tools = options.tools;
+    if (options?.tool_choice != null) body.tool_choice = options.tool_choice;
 
     const res = await this.fetchWithTimeout(`${API_BASE}/chat/completions`, {
       method: 'POST',
@@ -56,13 +58,13 @@ export class CohereProvider extends BaseProvider {
     const body: Record<string, unknown> = {
       model: modelId,
       messages: flattenMessageContent(messages),
-      temperature: options?.temperature,
-      max_tokens: options?.max_tokens,
-      top_p: options?.top_p,
-      tools: options?.tools,
-      tool_choice: options?.tool_choice,
       stream: true,
     };
+    if (options?.temperature != null) body.temperature = options.temperature;
+    if (options?.max_tokens != null) body.max_tokens = options.max_tokens;
+    if (options?.top_p != null) body.top_p = options.top_p;
+    if (options?.tools != null && options.tools.length > 0) body.tools = options.tools;
+    if (options?.tool_choice != null) body.tool_choice = options.tool_choice;
 
     const res = await this.fetchWithTimeout(`${API_BASE}/chat/completions`, {
       method: 'POST',

@@ -96,6 +96,21 @@ export class OpenAICompatProvider extends BaseProvider {
     modelId: string,
     options?: CompletionOptions,
   ): Promise<ChatCompletionResponse> {
+    // Build body defensively: skip null/undefined values to avoid sending
+    // `temperature:null` to strict local providers (Ollama, LM Studio, llama.cpp)
+    // that may 400 on unexpected keys.
+    const body: Record<string, unknown> = {
+      model: modelId,
+      messages,
+    };
+    if (options?.temperature != null) body.temperature = options.temperature;
+    if (options?.max_tokens != null) body.max_tokens = options.max_tokens;
+    if (options?.top_p != null) body.top_p = options.top_p;
+    if (options?.tools != null && options.tools.length > 0) body.tools = options.tools;
+    if (options?.tool_choice != null) body.tool_choice = options.tool_choice;
+    const ptc = this.resolveParallelToolCalls(options);
+    if (ptc != null) body.parallel_tool_calls = ptc;
+
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -103,16 +118,7 @@ export class OpenAICompatProvider extends BaseProvider {
         'Content-Type': 'application/json',
         ...this.extraHeaders,
       },
-      body: JSON.stringify({
-        model: modelId,
-        messages,
-        temperature: options?.temperature,
-        max_tokens: options?.max_tokens,
-        top_p: options?.top_p,
-        tools: options?.tools,
-        tool_choice: options?.tool_choice,
-        parallel_tool_calls: this.resolveParallelToolCalls(options),
-      }),
+      body: JSON.stringify(body),
     }, options?.timeoutMs ?? this.timeoutMs);
 
     if (!res.ok) {
@@ -158,6 +164,20 @@ export class OpenAICompatProvider extends BaseProvider {
     modelId: string,
     options?: CompletionOptions,
   ): AsyncGenerator<ChatCompletionChunk> {
+    // Build body defensively: skip null/undefined values
+    const body: Record<string, unknown> = {
+      model: modelId,
+      messages,
+      stream: true,
+    };
+    if (options?.temperature != null) body.temperature = options.temperature;
+    if (options?.max_tokens != null) body.max_tokens = options.max_tokens;
+    if (options?.top_p != null) body.top_p = options.top_p;
+    if (options?.tools != null && options.tools.length > 0) body.tools = options.tools;
+    if (options?.tool_choice != null) body.tool_choice = options.tool_choice;
+    const ptc = this.resolveParallelToolCalls(options);
+    if (ptc != null) body.parallel_tool_calls = ptc;
+
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: {
@@ -165,17 +185,7 @@ export class OpenAICompatProvider extends BaseProvider {
         'Content-Type': 'application/json',
         ...this.extraHeaders,
       },
-      body: JSON.stringify({
-        model: modelId,
-        messages,
-        temperature: options?.temperature,
-        max_tokens: options?.max_tokens,
-        top_p: options?.top_p,
-        tools: options?.tools,
-        tool_choice: options?.tool_choice,
-        parallel_tool_calls: this.resolveParallelToolCalls(options),
-        stream: true,
-      }),
+      body: JSON.stringify(body),
     }, this.timeoutMs);
 
     if (!res.ok) {
