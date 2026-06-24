@@ -107,14 +107,7 @@ export function createApp() {
   app.use('/api/settings', requireAuth, settingsRouter);
   app.use('/api/premium', requireAuth, premiumRouter);
 
-  // OpenAI-compatible proxy. The new middleware chain is built with feature
-  // flags so each piece can be toggled independently.
-  app.use('/v1', ...buildProxyMiddlewareChain());
-  app.use('/v1', proxyRouter);
-  // OpenAI Responses API shim (Codex CLI requires wire_api="responses"; see #96)
-  app.use('/v1', responsesRouter);
-
-  // OpenAPI spec (static JSON)
+  // OpenAPI spec (static JSON) — must be BEFORE /v1 middleware to avoid being caught
   app.get('/v1/openapi.json', (_req, res) => {
     res.sendFile(path.resolve(__dirname, 'docs/openapi.json'));
   });
@@ -139,6 +132,13 @@ export function createApp() {
   </body>
 </html>`);
   });
+
+  // OpenAI-compatible proxy. The new middleware chain is built with feature
+  // flags so each piece can be toggled independently.
+  app.use('/v1', ...buildProxyMiddlewareChain());
+  app.use('/v1', proxyRouter);
+  // OpenAI Responses API shim (Codex CLI requires wire_api="responses"; see #96)
+  app.use('/v1', responsesRouter);
 
   // Health check
   app.get('/api/ping', (_req, res) => {
