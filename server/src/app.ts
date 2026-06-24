@@ -114,6 +114,32 @@ export function createApp() {
   // OpenAI Responses API shim (Codex CLI requires wire_api="responses"; see #96)
   app.use('/v1', responsesRouter);
 
+  // OpenAPI spec (static JSON)
+  app.get('/v1/openapi.json', (_req, res) => {
+    res.sendFile(path.resolve(__dirname, 'docs/openapi.json'));
+  });
+
+  // Swagger UI (served from CDN — zero server-side dependencies)
+  app.get('/v1/docs', (_req, res) => {
+    res.type('html').send(`<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <title>FreeLLMAPI – API Docs</title>
+    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist/swagger-ui.css">
+  </head>
+  <body>
+    <div id="swagger-ui"></div>
+    <script src="https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js"></script>
+    <script>
+      SwaggerUIBundle({
+        url: '/v1/openapi.json',
+        dom_id: '#swagger-ui',
+      });
+    </script>
+  </body>
+</html>`);
+  });
+
   // Health check
   app.get('/api/ping', (_req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
