@@ -114,23 +114,7 @@ export function createApp() {
 
   // Swagger UI (served from CDN — zero server-side dependencies)
   app.get('/v1/docs', (_req, res) => {
-    res.type('html').send(`<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <title>FreeLLMAPI – API Docs</title>
-    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist/swagger-ui.css">
-  </head>
-  <body>
-    <div id="swagger-ui"></div>
-    <script src="https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js"></script>
-    <script>
-      SwaggerUIBundle({
-        url: '/v1/openapi.json',
-        dom_id: '#swagger-ui',
-      });
-    </script>
-  </body>
-</html>`);
+    res.sendFile(path.resolve(__dirname, 'docs/swagger-ui.html'));
   });
 
   // OpenAI-compatible proxy. The new middleware chain is built with feature

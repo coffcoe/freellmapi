@@ -33,7 +33,7 @@ import ptBR from './locales/pt-BR.json'
 export const SUPPORTED_LOCALES = ['en', 'zh-CN', 'fr', 'es', 'pt-BR'] as const
 export type Locale = (typeof SUPPORTED_LOCALES)[number]
 
-export const DEFAULT_LOCALE: Locale = 'en'
+export const DEFAULT_LOCALE: Locale = 'zh-CN'
 
 // `navigator.language` returns values like `zh`, `zh-CN`, `fr-CA`, `pt-BR`,
 // `es-419`, `en-US`. We snap to the closest supported locale (match on the
