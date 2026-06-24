@@ -5,48 +5,75 @@
   <title>FreeLLMAPI – API 文档</title>
   <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist/swagger-ui.css">
   <style>
-    .swagger-ui .info .title { font-size: 28px; }
-    #lang-switcher { position: fixed; top: 10px; right: 10px; z-index: 9999; }
+    #lang-bar { position:fixed; top:0; left:0; right:0; background:#1b1b1b; color:#fff; padding:8px 15px; z-index:10000; display:flex; gap:10px; align-items:center; font-size:14px; }
+    #lang-bar button { background:#49cc90; color:#fff; border:none; padding:5px 12px; cursor:pointer; border-radius:3px; font-size:13px; }
+    #lang-bar button.active { background:#fff; color:#1b1b1b; }
+    #lang-bar span { margin-right:5px; }
   </style>
 </head>
-<body>
-  <div id="lang-switcher">
-    <button onclick="setLang('zh')">中文</button>
-    <button onclick="setLang('en')">English</button>
+<body style="margin-top:40px;">
+  <div id="lang-bar">
+    <span>🌐 语言 / Language:</span>
+    <button onclick="switchLang('zh')" id="btn-zh" class="active">中文</button>
+    <button onclick="switchLang('en')" id="btn-en">English</button>
   </div>
   <div id="swagger-ui"></div>
 
   <script src="https://unpkg.com/swagger-ui-dist/swagger-ui-bundle.js"></script>
   <script>
-    // 中文翻译字典
-    const zhTranslations = {
-      'FreeLLMAPI': 'FreeLLMAPI',
-      'API 文档': 'API 文档',
-      '试玩台': '试玩台',
-      '模型列表': '模型列表',
-      '创建对话': '创建对话',
-      '发送请求': '发送请求',
-      '响应': '响应',
-      '参数': '参数',
-      '请求体': '请求体',
-      '响应示例': '响应示例',
-      '状态码': '状态码',
-      '说明': '说明',
+    // ===== 中英文切换：加载不同的 openapi 文件 =====
+    let ui = null;
+    let currentLang = 'zh';
+
+    function switchLang(lang) {
+      currentLang = lang;
+      document.getElementById('btn-zh').className = lang === 'zh' ? 'active' : '';
+      document.getElementById('btn-en').className = lang === 'en' ? 'active' : '';
+      const specUrl = '/v1/openapi-' + lang + '.json';
+      if (ui) {
+        ui.specActions.download(specUrl);
+      } else {
+        initUI(specUrl);
+      }
+    }
+
+    function initUI(specUrl) {
+      ui = SwaggerUIBundle({
+        url: specUrl,
+        dom_id: '#swagger-ui',
+        deepLinking: true,
+        presets: [
+          SwaggerUIBundle.presets.apis,
+          SwaggerUIBundle.SwaggerUIStandalonePreset,
+        ],
+        onComplete: function() {
+          // Swagger UI 渲染完成后，翻译 UI 本身的英文按钮
+          if (currentLang === 'zh') {
+            translateSwaggerUI();
+            // 监听 DOM 变化，持续翻译动态内容
+            const observer = new MutationObserver(() => translateSwaggerUI());
+            observer.observe(document.getElementById('swagger-ui'), { childList: true, subtree: true });
+          }
+        },
+      });
+    }
+
+    // ===== 翻译 Swagger UI 界面上的英文按钮/标签 =====
+    const zhUI = {
       'Try it out': '试一试',
       'Execute': '发送请求',
       'Clear': '清除',
       'Cancel': '取消',
       'Authorize': '授权',
       'Authorized': '已授权',
-      'Logout': '退出',
+      'Logout': '退出登录',
       'Available authorizations': '可用的授权方式',
-      'apiKey': 'API 密钥',
+      'api_key': 'API 密钥',
       'Value': '值',
       'Description': '说明',
       'Errors': '错误',
       'Example Value': '示例值',
       'Schema': '结构',
-      'Model': '模型',
       'Response details': '响应详情',
       'Response headers': '响应头',
       'Response body': '响应体',
@@ -61,56 +88,73 @@
       'Response Headers': '响应头',
       'Hide Response': '隐藏响应',
       'Close': '关闭',
+      'Parameters': '参数',
+      'Responses': '响应',
+      'Models': '模型',
+      'Model': '模型',
+      'Show': '显示',
+      'Hide': '隐藏',
+      'GET': 'GET',
+      'POST': 'POST',
+      'PUT': 'PUT',
+      'DELETE': 'DELETE',
+      'PATCH': 'PATCH',
+      'Description': '说明',
+      'Parameter': '参数',
+      'Type': '类型',
+      'Required': '必填',
+      'Optional': '可选',
+      'Send': '发送',
+      'Reset': '重置',
+      'Download file': '下载文件',
+      'Fetching resource': '正在获取资源…',
+      'Fetching resource list': '正在获取资源列表…',
+      'Parse error': '解析错误',
+      'Please specify a URL': '请指定 URL',
+      'Please specify a protocol': '请指定协议',
+      'Please specify a host': '请指定主机',
+      'Please specify a basePath': '请指定 basePath',
+      'Canot read from server. It may not have the approprate CORS settings.': '无法从服务器读取。可能未配置正确的 CORS 设置。',
+      'server': '服务器',
+      'Servers': '服务器列表',
+      'Show/Hide': '显示/隐藏',
+      '展示了': '试玩台',
+      'Model': '模型',
+      'apply': '应用',
+      'delete': '删除',
+      'Add authorizations': '添加授权',
+      'OAuth2': 'OAuth2',
+      'API key': 'API 密钥',
+      'HTTP bearer': 'HTTP bearer',
+      'openidconnect': 'OpenID Connect',
+      'Select authorizaton': '选择授权方式',
+      'All': '全部',
+      'Expand all': '展开全部',
+      'Collapse all': '折叠全部',
     };
 
-    let currentLang = 'zh';
-
-    function setLang(lang) {
-      currentLang = lang;
-      if (lang === 'zh') {
-        // 应用中文翻译
-        document.querySelectorAll('.swagger-ui').forEach(el => {
-          el.querySelectorAll('*').forEach(node => {
-            if (node.childNodes.length === 1 && node.childNodes[0].nodeType === 3) {
-              const text = node.textContent.trim();
-              if (zhTranslations[text]) {
-                node.textContent = zhTranslations[text];
-              }
-            }
-          });
-        });
-        document.documentElement.lang = 'zh-CN';
-      } else {
-        location.reload();
-      }
+    function translateSwaggerUI() {
+      // 翻译按钮
+      document.querySelectorAll('button, input[type="button"], a.btn').forEach(el => {
+        const t = el.textContent.trim();
+        if (zhUI[t]) el.textContent = zhUI[t];
+      });
+      // 翻译带属性的标签
+      document.querySelectorAll('span, div, label, h4, h3, p, strong, small').forEach(el => {
+        if (el.childNodes.length === 1 && el.childNodes[0].nodeType === 3) {
+          const t = el.textContent.trim();
+          if (zhUI[t]) el.textContent = zhUI[t];
+        }
+      });
+      // 翻译 placeholder
+      document.querySelectorAll('input[placeholder]').forEach(el => {
+        const ph = el.getAttribute('placeholder');
+        if (zhUI[ph]) el.setAttribute('placeholder', zhUI[ph]);
+      });
     }
 
-    // 等待 Swagger UI 加载完成后应用翻译
-    function applyTranslations() {
-      if (currentLang === 'zh') {
-        setLang('zh');
-      }
-    }
-
-    SwaggerUIBundle({
-      url: '/v1/openapi.json',
-      dom_id: '#swagger-ui',
-      deepLinking: true,
-      presets: [
-        SwaggerUIBundle.presets.apis,
-        SwaggerUIBundle.SwaggerUIStandalonePreset,
-      ],
-      onComplete: function() {
-        setTimeout(applyTranslations, 500);
-        // 监听 DOM 变化，持续翻译新加载的内容
-        const observer = new MutationObserver(() => {
-          if (currentLang === 'zh') {
-            setTimeout(() => setLang('zh'), 100);
-          }
-        });
-        observer.observe(document.getElementById('swagger-ui'), { childList: true, subtree: true });
-      },
-    });
+    // 初始加载中文版 openapi
+    initUI('/v1/openapi-zh.json');
   </script>
 </body>
 </html>
