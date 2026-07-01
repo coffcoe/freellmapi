@@ -10,6 +10,8 @@ import { getDb } from '../db/index.js';
 import { getAllPenalties, getRoutingScores, getRoutingStrategy, setRoutingStrategy, setCustomWeights } from '../services/router.js';
 import { BANDIT_PRESETS, type RoutingStrategy } from '../services/scoring.js';
 import { parseBudget } from '../lib/budget.js';
+import { getModelGroups } from '../services/model-groups.js';
+import { getPenaltyInspector } from '../services/penalty-inspector.js';
 
 export const fallbackRouter = Router();
 
@@ -18,6 +20,10 @@ export const fallbackRouter = Router();
 //                 breakdown (reliability / speed / intelligence + guardrails).
 fallbackRouter.get('/routing', (_req: Request, res: Response) => {
   res.json(getRoutingScores());
+});
+
+fallbackRouter.get('/penalty-inspector', (_req: Request, res: Response) => {
+  res.json(getPenaltyInspector());
 });
 
 const routingSchema = z.object({
@@ -61,10 +67,14 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
     SELECT fc.model_db_id, fc.priority, fc.enabled,
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.speed_rank, m.size_label, m.rpm_limit, m.rpd_limit,
-           m.tpm_limit, m.tpd_limit,
-           m.monthly_token_budget, m.supports_vision, m.supports_tools
+           m.tpm_limit, m.tpd_limit, m.context_window,
+           m.monthly_token_budget, m.supports_vision, m.supports_tools,
+           m.key_id, ak.label AS key_label,
+           mo.overrides_json IS NOT NULL AS has_overrides
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id
+    LEFT JOIN api_keys ak ON ak.id = m.key_id
+    LEFT JOIN model_overrides mo ON mo.platform = m.platform AND mo.model_id = m.model_id
     WHERE m.enabled = 1
     ORDER BY fc.priority ASC
   `).all() as any[];
@@ -81,10 +91,24 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
   const penalties = getAllPenalties();
   const penaltyMap = new Map(penalties.map(p => [p.modelDbId, p]));
 
+  // Logical-model grouping per row, so the dashboard can collapse the same
+  // model served by several providers into one expandable group. Always sent
+  // (cheap); the client renders grouped only when its unify toggle is on.
+  const groupByDbId = new Map<number, { groupKey: string; canonicalId: string; groupLabel: string }>();
+  for (const g of getModelGroups()) {
+    for (const m of g.members) {
+      groupByDbId.set(m.model_db_id, { groupKey: g.groupKey, canonicalId: g.canonicalId, groupLabel: g.groupLabel });
+    }
+  }
+
   res.json(rows.map(r => {
     const penalty = penaltyMap.get(r.model_db_id);
+    const group = groupByDbId.get(r.model_db_id);
     return {
       modelDbId: r.model_db_id,
+      groupKey: group?.groupKey,
+      canonicalId: group?.canonicalId,
+      groupLabel: group?.groupLabel,
       priority: r.priority,
       effectivePriority: r.priority + (penalty?.penalty ?? 0),
       penalty: penalty?.penalty ?? 0,
@@ -100,9 +124,19 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
       rpdLimit: r.rpd_limit,
       tpmLimit: r.tpm_limit,
       tpdLimit: r.tpd_limit,
+      // Max context length (tokens), used by the dashboard catalog filter. Null
+      // for models whose context window the catalog doesn't record.
+      contextWindow: r.context_window,
       monthlyTokenBudget: r.monthly_token_budget,
+      // Parsed once here (single source of truth) so the dashboard never re-implements
+      // budget-label parsing; 0 for rate-limited/placeholder labels. See lib/budget.ts.
+      monthlyTokenBudgetTokens: parseBudget(r.monthly_token_budget),
       supportsVision: r.supports_vision === 1,
       supportsTools: r.supports_tools === 1,
+      source: r.platform === 'custom' || r.key_id != null ? 'custom' : 'catalog',
+      keyId: r.key_id ?? null,
+      keyLabel: r.key_label ?? null,
+      hasOverrides: Boolean(r.has_overrides),
       keyCount: keyCountMap.get(r.platform) ?? 0,
     };
   }));
@@ -252,13 +286,24 @@ fallbackRouter.get('/token-usage', (_req: Request, res: Response) => {
   }
 
   // Build per-model breakdown (only platforms with keys), preserving enabled state
+  const usageRows = db.prepare(`
+    SELECT platform, model_id, COALESCE(SUM(input_tokens + output_tokens), 0) AS used
+    FROM requests
+    WHERE created_at >= datetime('now', 'start of month')
+      AND request_type = 'chat'
+    GROUP BY platform, model_id
+  `).all() as { platform: string; model_id: string; used: number }[];
+  const usageByModel = new Map(usageRows.map(r => [`${r.platform}:${r.model_id}`, r.used]));
+
   const modelBudgets = rawModels
     .filter(m => platformSet.has(m.platform))
     .map(m => ({
       modelDbId: m.model_db_id,
       displayName: m.display_name,
       platform: m.platform,
+      modelId: m.model_id,
       budget: parseBudget(m.monthly_token_budget),
+      used: usageByModel.get(`${m.platform}:${m.model_id}`) ?? 0,
       enabled: m.enabled === 1,
       rpmLimit: m.rpm_limit,
       rpdLimit: m.rpd_limit,
@@ -268,19 +313,11 @@ fallbackRouter.get('/token-usage', (_req: Request, res: Response) => {
 
   // Total budget counts all models (both enabled and disabled — they contribute to the pool)
   const totalBudget = modelBudgets.reduce((s, m) => s + m.budget, 0);
-
-  // Tokens used this month
-  const usage = db.prepare(`
-    SELECT
-      COALESCE(SUM(input_tokens + output_tokens), 0) as total_used
-    FROM requests
-    WHERE created_at >= datetime('now', 'start of month')
-      AND request_type = 'chat'
-  `).get() as { total_used: number };
+  const totalUsed = modelBudgets.reduce((s, m) => s + m.used, 0);
 
   res.json({
     totalBudget,
-    totalUsed: usage.total_used,
+    totalUsed,
     models: modelBudgets,
   });
 });

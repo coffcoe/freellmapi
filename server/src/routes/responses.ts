@@ -7,9 +7,10 @@ import type {
   ChatToolCall,
   ChatToolDefinition,
   ChatToolChoice,
+  Platform,
 } from '@freellmapi/shared/types.js';
 import { routeRequest, recordRateLimitHit, recordSuccess, hasEnabledToolsModel, type RouteResult } from '../services/router.js';
-import { recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit, PAYMENT_REQUIRED_COOLDOWN_MS } from '../services/ratelimit.js';
+import { recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit, PAYMENT_REQUIRED_COOLDOWN_MS, learnLimitFromError } from '../services/ratelimit.js';
 import { getUnifiedApiKey } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
@@ -21,11 +22,15 @@ import {
   isModelAccessForbiddenError,
   timingSafeStringEqual,
   extractApiToken,
+  getRequestGroupId,
   getStickyModel,
   setStickyModel,
+  traceRouteEvent,
+  exhaustedRetryError,
   logRequest,
 } from './proxy.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
+import { inferQuotaPoolKey, type QuotaObservationContext } from '../services/provider-quota.js';
 
 export const responsesRouter = Router();
 
@@ -214,6 +219,10 @@ export function toChatToolChoice(tc?: ResponsesRequest['tool_choice']): ChatTool
   return { type: 'function', function: { name: tc.name } };
 }
 
+function requestDeclaresToolUse(req: ResponsesRequest): boolean {
+  return (req.tools?.length ?? 0) > 0 && req.tool_choice !== 'none';
+}
+
 // ── Build the final (non-stream) Responses object ─────────────────────────
 export function buildResponseObject(opts: {
   id: string;
@@ -262,8 +271,21 @@ export function buildResponseObject(opts: {
   };
 }
 
+function quotaContextForRoute(route: RouteResult, endpoint: string): QuotaObservationContext {
+  return {
+    platform: route.platform as Platform,
+    keyId: route.keyId,
+    modelId: route.modelId,
+    quotaPoolKey: inferQuotaPoolKey(route.platform as Platform, route.modelId),
+    endpoint,
+    origin: 'responses',
+  };
+}
+
 responsesRouter.post('/responses', async (req: Request, res: Response) => {
   const start = Date.now();
+  const requestGroupId = getRequestGroupId(req);
+  res.setHeader('X-Request-ID', requestGroupId);
 
   // Same unified-key auth as the proxy (accepts Bearer or x-api-key).
   const token = extractApiToken(req);
@@ -305,7 +327,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   // name → parameter schema, for repairing double-encoded tool arguments on
   // the way back out (see lib/tool-args.ts).
   const toolSchemas = toolSchemaMap(tools);
-  const tool_choice = toChatToolChoice(reqData.tool_choice);
+  const tool_choice = tools?.length ? toChatToolChoice(reqData.tool_choice) : undefined;
   const completionOpts = {
     temperature: reqData.temperature ?? undefined,
     max_tokens: reqData.max_output_tokens ?? undefined,
@@ -324,12 +346,14 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   const rawSessionId = req.headers['x-session-id'];
   const sessionIdHeader = Array.isArray(rawSessionId) ? rawSessionId[0] : rawSessionId;
   const preferredModel = getStickyModel(messages, sessionIdHeader);
+  const requestedModelLabel = reqData.model ?? 'auto';
 
   // Tool-bearing requests (the normal case for Codex/agent clients on this
-  // endpoint) must stay on models that emit structured tool_calls — a model
-  // that serializes the call into text strands the agent harness with a
-  // "successful" run it can't act on. Mirrors the /chat/completions gate.
-  const wantsTools = (tools?.length ?? 0) > 0;
+  // endpoint) must stay on models that emit structured tool_calls. Make the
+  // routing decision from the original Responses payload, not the subset of
+  // function tools we can forward to chat providers, because Codex may include
+  // built-in tool descriptors alongside or instead of function descriptors.
+  const wantsTools = requestDeclaresToolUse(reqData);
   if (wantsTools && !hasEnabledToolsModel()) {
     res.status(422).json({
       error: {
@@ -359,11 +383,10 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     try {
       route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, false, wantsTools, skipModels.size > 0 ? skipModels : undefined);
     } catch (err: any) {
-      const status = lastError ? 429 : (err.status ?? 503);
-      const message = lastError
-        ? `All models rate-limited. Last error: ${sanitizeProviderErrorMessage(lastError.message)}`
-        : err.message;
-      const type = lastError ? 'rate_limit_error' : 'routing_error';
+      const exhausted = lastError ? exhaustedRetryError(lastError) : null;
+      const status = exhausted?.status ?? err.status ?? 503;
+      const message = exhausted?.message ?? err.message;
+      const type = exhausted?.type ?? 'routing_error';
       if (streamStarted) {
         sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error: { message, type } } });
         res.end();
@@ -374,6 +397,14 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     }
 
     try {
+      traceRouteEvent('Responses', {
+        event: attempt === 0 ? 'start' : 'next',
+        requestId: requestGroupId,
+        attempt,
+        platform: route.platform,
+        model: route.modelId,
+        requestedModel: attempt === 0 ? requestedModelLabel : undefined,
+      });
       if (stream) {
         let outputIndex = 0;
         let msgItemId: string | null = null;
@@ -406,7 +437,13 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           }
         };
 
-        const gen = route.provider.streamChatCompletion(route.apiKey, messages, route.modelId, completionOpts);
+        const gen = route.provider.streamChatCompletion(
+          route.apiKey,
+          messages,
+          route.modelId,
+          completionOpts,
+          quotaContextForRoute(route, 'responses'),
+        );
 
         for await (const chunk of gen) {
           // In-band upstream error frame ({"error":...} inside a 200 SSE
@@ -510,6 +547,15 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
             ? rescueInlineToolCalls(heldText, new Set((tools ?? []).map(t => t.function.name)))
             : { detected: false as const, calls: null, cleanText: heldText };
           if (rescue.detected && !rescue.calls) {
+            traceRouteEvent('Responses', {
+              event: 'fail',
+              requestId: requestGroupId,
+              attempt,
+              platform: route.platform,
+              model: route.modelId,
+              latencyMs: Date.now() - start,
+              error: 'unparseable inline tool-call dialect',
+            });
             logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, `unparseable inline tool-call dialect: ${heldText.slice(0, 120)}`);
             skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
             setCooldown(route.platform, route.modelId, route.keyId, getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
@@ -551,6 +597,15 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         // skeletons are out), so it's safe to fail over to the next model on
         // the same SSE stream.
         if (msgText.length === 0 && toolAcc.size === 0) {
+          traceRouteEvent('Responses', {
+            event: 'fail',
+            requestId: requestGroupId,
+            attempt,
+            platform: route.platform,
+            model: route.modelId,
+            latencyMs: Date.now() - start,
+            error: 'empty completion',
+          });
           logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)');
           skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
           setCooldown(route.platform, route.modelId, route.keyId, getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
@@ -590,10 +645,26 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
         recordTokens(route.platform, route.modelId, route.keyId, estimatedInputTokens + totalOutputTokens);
         recordSuccess(route.modelDbId);
         setStickyModel(messages, route.modelDbId, sessionIdHeader);
+        traceRouteEvent('Responses', {
+          event: 'ok',
+          requestId: requestGroupId,
+          attempt,
+          platform: route.platform,
+          model: route.modelId,
+          latencyMs: Date.now() - start,
+          inputTokens: estimatedInputTokens,
+          outputTokens: totalOutputTokens,
+        });
         logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null);
         return;
       } else {
-        const result = await route.provider.chatCompletion(route.apiKey, messages, route.modelId, completionOpts);
+        const result = await route.provider.chatCompletion(
+          route.apiKey,
+          messages,
+          route.modelId,
+          completionOpts,
+          quotaContextForRoute(route, 'responses'),
+        );
 
         const msg = result.choices[0]?.message;
         let text = contentToString(msg?.content ?? '');
@@ -623,7 +694,16 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
         // Empty completion → fail over (see the streaming-path comment above).
         if (!text && toolCalls.length === 0) {
-          logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)');
+          traceRouteEvent('Responses', {
+            event: 'fail',
+            requestId: requestGroupId,
+            attempt,
+            platform: route.platform,
+            model: route.modelId,
+            latencyMs: Date.now() - start,
+            error: 'empty completion',
+          });
+          logRequest(route.platform, route.modelId, route.keyId, 'error', promptTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)');
           skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
           setCooldown(route.platform, route.modelId, route.keyId, getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
           recordRateLimitHit(route.modelDbId);
@@ -643,13 +723,31 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           promptTokens, completionTokens,
         }));
 
-        logRequest(route.platform, route.modelId, route.keyId, 'success',
-          promptTokens, completionTokens, Date.now() - start, null);
+        traceRouteEvent('Responses', {
+          event: 'ok',
+          requestId: requestGroupId,
+          attempt,
+          platform: route.platform,
+          model: route.modelId,
+          latencyMs: Date.now() - start,
+          inputTokens: promptTokens,
+          outputTokens: completionTokens,
+        });
+        logRequest(route.platform, route.modelId, route.keyId, 'success', promptTokens, completionTokens, Date.now() - start, null);
         return;
       }
     } catch (err: any) {
       const latency = Date.now() - start;
       const safeError = sanitizeProviderErrorMessage(err.message);
+      traceRouteEvent('Responses', {
+        event: 'fail',
+        requestId: requestGroupId,
+        attempt,
+        platform: route.platform,
+        model: route.modelId,
+        latencyMs: latency,
+        error: safeError,
+      });
       logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError);
 
       // Mid-stream failures can't be retried (bytes already sent) — close cleanly.
@@ -668,6 +766,9 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
           ? PAYMENT_REQUIRED_COOLDOWN_MS
           : getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
         recordRateLimitHit(route.modelDbId);
+        // Learn a provider-reported ceiling (e.g. a 413 TPM limit) so the next
+        // request's pre-check fails over before the 413. Mirrors the chat path.
+        learnLimitFromError(route.modelDbId, err);
         lastError = err;
         continue;
       }
@@ -681,13 +782,13 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   // (reachable since empty-completion failover can burn every attempt after
   // streamStarted) — close the SSE stream with a failed event instead of
   // writing JSON onto a committed event-stream response.
-  const exhaustedMsg = `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${lastError?.message}`;
+  const exhausted = exhaustedRetryError(lastError, MAX_RETRIES);
   if (streamStarted) {
-    sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error: { message: exhaustedMsg, type: 'rate_limit_error' } } });
+    sse('response.failed', { response: { id: responseId, object: 'response', status: 'failed', error: { message: exhausted.message, type: exhausted.type } } });
     res.end();
     return;
   }
-  res.status(429).json({
-    error: { message: exhaustedMsg, type: 'rate_limit_error' },
+  res.status(exhausted.status).json({
+    error: { message: exhausted.message, type: exhausted.type },
   });
 });

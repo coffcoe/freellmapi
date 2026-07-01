@@ -8,6 +8,7 @@ import type {
 import { BaseProvider, providerHttpError, type CompletionOptions } from './base.js';
 import { rescueInlineToolCalls } from '../lib/tool-call-rescue.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
+import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
 
 /**
  * Generic provider for platforms that use an OpenAI-compatible API.
@@ -95,6 +96,7 @@ export class OpenAICompatProvider extends BaseProvider {
     messages: ChatMessage[],
     modelId: string,
     options?: CompletionOptions,
+    quotaContext?: QuotaObservationContext,
   ): Promise<ChatCompletionResponse> {
     // Build body defensively: skip null/undefined values to avoid sending
     // `temperature:null` to strict local providers (Ollama, LM Studio, llama.cpp)
@@ -106,6 +108,7 @@ export class OpenAICompatProvider extends BaseProvider {
     if (options?.temperature != null) body.temperature = options.temperature;
     if (options?.max_tokens != null) body.max_tokens = options.max_tokens;
     if (options?.top_p != null) body.top_p = options.top_p;
+    if (options?.stop != null) body.stop = options.stop;
     if (options?.tools != null && options.tools.length > 0) body.tools = options.tools;
     if (options?.tool_choice != null) body.tool_choice = options.tool_choice;
     const ptc = this.resolveParallelToolCalls(options);
@@ -120,6 +123,15 @@ export class OpenAICompatProvider extends BaseProvider {
       },
       body: JSON.stringify(body),
     }, options?.timeoutMs ?? this.timeoutMs);
+
+    recordQuotaObservationsFromResponse(res, {
+      platform: this.platform,
+      keyId: quotaContext?.keyId,
+      providerAccountId: quotaContext?.providerAccountId,
+      modelId,
+      quotaPoolKey: quotaContext?.quotaPoolKey,
+      endpoint: 'chat/completions',
+    });
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -163,6 +175,7 @@ export class OpenAICompatProvider extends BaseProvider {
     messages: ChatMessage[],
     modelId: string,
     options?: CompletionOptions,
+    quotaContext?: QuotaObservationContext,
   ): AsyncGenerator<ChatCompletionChunk> {
     // Build body defensively: skip null/undefined values
     const body: Record<string, unknown> = {
@@ -173,6 +186,7 @@ export class OpenAICompatProvider extends BaseProvider {
     if (options?.temperature != null) body.temperature = options.temperature;
     if (options?.max_tokens != null) body.max_tokens = options.max_tokens;
     if (options?.top_p != null) body.top_p = options.top_p;
+    if (options?.stop != null) body.stop = options.stop;
     if (options?.tools != null && options.tools.length > 0) body.tools = options.tools;
     if (options?.tool_choice != null) body.tool_choice = options.tool_choice;
     const ptc = this.resolveParallelToolCalls(options);
@@ -187,6 +201,15 @@ export class OpenAICompatProvider extends BaseProvider {
       },
       body: JSON.stringify(body),
     }, this.timeoutMs);
+
+    recordQuotaObservationsFromResponse(res, {
+      platform: this.platform,
+      keyId: quotaContext?.keyId,
+      providerAccountId: quotaContext?.providerAccountId,
+      modelId,
+      quotaPoolKey: quotaContext?.quotaPoolKey,
+      endpoint: 'chat/completions',
+    });
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
@@ -205,7 +228,7 @@ export class OpenAICompatProvider extends BaseProvider {
     yield* this.readSseStream(res);
   }
 
-  async validateKey(apiKey: string): Promise<boolean> {
+  async validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<boolean> {
     // Note: transport errors (DNS / timeout / TLS) propagate to the caller.
     // health.ts catches them and marks status='error' WITHOUT incrementing
     // the consecutive-failure counter — only confirmed 401/403 disables a key.
@@ -222,6 +245,13 @@ export class OpenAICompatProvider extends BaseProvider {
         ...this.extraHeaders,
       },
     }, 30000);
+    recordQuotaObservationsFromResponse(res, {
+      platform: this.platform,
+      keyId: quotaContext?.keyId,
+      providerAccountId: quotaContext?.providerAccountId,
+      quotaPoolKey: quotaContext?.quotaPoolKey,
+      endpoint: 'models',
+    });
     return res.status !== 401 && res.status !== 403;
   }
 }

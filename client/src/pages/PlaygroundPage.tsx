@@ -1,9 +1,11 @@
 import { useState, useRef, useEffect } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { ChevronRight } from 'lucide-react'
+import { ChevronRight, ChevronsUpDown, Check, Search } from 'lucide-react'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover'
+import { buildModelOptions } from '@/lib/model-groups'
+import { Tooltip } from '@/components/tooltip'
 import { PageHeader } from '@/components/page-header'
 import { Markdown } from '@/components/markdown'
 import { CopyButton } from '@/components/copy-button'
@@ -17,6 +19,7 @@ interface FallbackEntry {
   modelId: string
   displayName: string
   sizeLabel: string
+  intelligenceRank: number
   keyCount: number
 }
 
@@ -108,11 +111,26 @@ function FusionTrace({ panel, judge, streaming, answerStarted }: {
 export default function PlaygroundPage() {
   const { t } = useI18n()
   const [messages, setMessages] = useState<ChatMessage[]>([])
+  // Optional system prompt for this Playground session. Client-side only:
+  // when set, it's prepended as a `system` message to the request. Persisted
+  // to localStorage so it survives reloads.
+  const [systemPrompt, setSystemPrompt] = useState<string>(
+    () => localStorage.getItem('playground.systemPrompt') ?? '',
+  )
+  const [systemPromptOpen, setSystemPromptOpen] = useState<boolean>(
+    () => !!localStorage.getItem('playground.systemPrompt'),
+  )
+  const updateSystemPrompt = (v: string) => {
+    setSystemPrompt(v)
+    localStorage.setItem('playground.systemPrompt', v)
+  }
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [selectedModel, setSelectedModel] = useState<string>(
     () => localStorage.getItem('playground.model') ?? 'auto',
   )
+  const [modelQuery, setModelQuery] = useState('')
+  const [modelPickerOpen, setModelPickerOpen] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
 
@@ -126,7 +144,14 @@ export default function PlaygroundPage() {
     queryFn: () => apiFetch('/api/fallback'),
   })
 
+  // Unification is always on now (the on/off toggle was removed), so the picker
+  // always collapses a model's providers into one option.
+  const unifyOn = true
+
   const availableModels = fallbackEntries.filter(e => e.keyCount > 0 && e.enabled)
+  // Collapse the same model from multiple providers into one option (value =
+  // canonical id, which the proxy resolves to the whole group).
+  const modelOptions = buildModelOptions(availableModels, unifyOn)
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -200,8 +225,12 @@ export default function PlaygroundPage() {
       if (keyData?.apiKey) headers['Authorization'] = `Bearer ${keyData.apiKey}`
 
       const isFusion = selectedModel === 'fusion'
+      const sysPrompt = systemPrompt.trim()
       const body: any = {
-        messages: newMessages.map(m => ({ role: m.role, content: m.content })),
+        messages: [
+          ...(sysPrompt ? [{ role: 'system', content: sysPrompt }] : []),
+          ...newMessages.map(m => ({ role: m.role, content: m.content })),
+        ],
       }
       if (selectedModel !== 'auto') body.model = selectedModel
       // Fusion streams its panel + judge trace; ask for a stream so the
@@ -283,11 +312,46 @@ export default function PlaygroundPage() {
     inputRef.current?.focus()
   }
 
+  // Searchable picker options: auto + fusion pinned at the top, then every model
+  // ordered BY INTELLIGENCE — size tier first (Frontier→Small), then the catalog
+  // rank within the tier, name as the final tiebreaker. (Raw intelligence_rank is
+  // per-provider, not global, so tier-first matches the server's preset; #135.)
+  const pickerOptions = [
+    { value: 'auto', label: t('playground.autoModel'), sub: '', isNew: false, platforms: [] as string[] },
+    { value: 'fusion', label: t('playground.fusionModel'), sub: '', isNew: true, platforms: [] as string[] },
+    ...modelOptions
+      .slice()
+      .sort((a, b) =>
+        a.sizeTier - b.sizeTier ||
+        a.intelligenceRank - b.intelligenceRank ||
+        a.label.localeCompare(b.label, undefined, { sensitivity: 'base' }))
+      .map(o => ({
+        value: o.value,
+        label: o.label,
+        sub: o.providerCount > 1 ? t('models.providerCount', { count: o.providerCount }) : o.platform,
+        isNew: false,
+        // Provider names for the multi-provider hover + search; empty when solo.
+        platforms: o.providerCount > 1 ? o.platforms : [],
+      })),
+  ]
+  // Literal, case-insensitive substring match against name, providers, and id.
+  const modelQ = modelQuery.trim().toLowerCase()
+  const filteredOptions = modelQ
+    ? pickerOptions.filter(o => `${o.label} ${o.sub} ${o.value} ${o.platforms.join(' ')}`.toLowerCase().includes(modelQ))
+    : pickerOptions
+
+  function pickModel(v: string) {
+    setSelectedModel(v)
+    localStorage.setItem('playground.model', v)
+    setModelPickerOpen(false)
+    setModelQuery('')
+  }
+
   const activeModelLabel = selectedModel === 'auto'
     ? t('playground.autoModel')
     : selectedModel === 'fusion'
     ? t('playground.fusionModel')
-    : availableModels.find(m => m.modelId === selectedModel)?.displayName ?? selectedModel
+    : modelOptions.find(o => o.value === selectedModel)?.label ?? selectedModel
 
   return (
     <div className="flex flex-col h-[calc(100vh-8rem)]">
@@ -296,35 +360,53 @@ export default function PlaygroundPage() {
         description={t('playground.description')}
         actions={
           <>
-            <Select value={selectedModel} onValueChange={(v) => { const m = v ?? 'auto'; setSelectedModel(m); localStorage.setItem('playground.model', m) }}>
-              <SelectTrigger className="w-[260px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="auto">{t('playground.autoModel')}</SelectItem>
-                <SelectItem value="fusion">
-                  <span className="flex items-center gap-2">
-                    <span>{t('playground.fusionModel')}</span>
-                    <span className="rounded px-1 py-0.5 text-[9px] font-semibold uppercase leading-none tracking-wide bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">{t('models.newBadge')}</span>
-                  </span>
-                </SelectItem>
-                {availableModels.map(m => (
-                  <SelectItem key={m.modelDbId} value={m.modelId}>
-                    <span className="flex items-center gap-2">
-                      <span>{m.displayName}</span>
-                      <span className="text-xs text-muted-foreground">{m.platform}</span>
-                    </span>
-                  </SelectItem>
-                ))}
-                {availableModels.length === 0 && (
-                  // Models only appear once a platform has an enabled key. Without
-                  // one, the list is just "Auto" and looks broken — say why. (#269)
-                  <div className="px-2 py-1.5 text-xs text-muted-foreground">
-                    {t('playground.noModels')}
-                  </div>
-                )}
-              </SelectContent>
-            </Select>
+            <Popover open={modelPickerOpen} onOpenChange={(o) => { setModelPickerOpen(o); if (!o) setModelQuery('') }}>
+              <PopoverTrigger
+                aria-label={t('playground.selectModel')}
+                className="flex h-8 w-[260px] items-center justify-between gap-2 whitespace-nowrap rounded-lg border border-input bg-transparent px-3 text-sm outline-none transition-colors hover:bg-muted/50 focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50 dark:bg-input/30"
+              >
+                <span className="truncate">{activeModelLabel}</span>
+                <ChevronsUpDown className="size-4 shrink-0 text-muted-foreground" />
+              </PopoverTrigger>
+              <PopoverContent align="end" className="w-[300px] p-0">
+                <div className="flex items-center gap-2 border-b px-3">
+                  <Search className="size-4 shrink-0 text-muted-foreground" />
+                  <input
+                    autoFocus
+                    value={modelQuery}
+                    onChange={e => setModelQuery(e.target.value)}
+                    placeholder={t('playground.searchModels')}
+                    className="h-9 w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+                  />
+                </div>
+                <div className="max-h-72 overflow-y-auto p-1">
+                  {filteredOptions.length === 0 ? (
+                    <div className="px-2 py-6 text-center text-xs text-muted-foreground">{t('playground.noModelsFound')}</div>
+                  ) : (
+                    filteredOptions.map(o => (
+                      <button
+                        key={o.value}
+                        type="button"
+                        onClick={() => pickModel(o.value)}
+                        className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors hover:bg-accent hover:text-accent-foreground ${o.value === selectedModel ? 'bg-accent/50' : ''}`}
+                      >
+                        <Check className={`size-4 shrink-0 ${o.value === selectedModel ? 'opacity-100' : 'opacity-0'}`} />
+                        <span className="min-w-0 flex-1 truncate">{o.label}</span>
+                        {o.isNew && <span className="rounded px-1 py-0.5 text-[9px] font-semibold uppercase leading-none tracking-wide bg-emerald-500/15 text-emerald-600 dark:text-emerald-400">{t('models.newBadge')}</span>}
+                        {o.sub && (o.platforms.length > 1
+                          ? <Tooltip text={t('models.servedBy', { providers: o.platforms.join(', ') })}><span className="shrink-0 text-xs text-muted-foreground underline decoration-dotted underline-offset-2">{o.sub}</span></Tooltip>
+                          : <span className="shrink-0 text-xs text-muted-foreground">{o.sub}</span>)}
+                      </button>
+                    ))
+                  )}
+                  {!modelQ && availableModels.length === 0 && (
+                    // Models only appear once a platform has an enabled key. Without
+                    // one, the list is just Auto/Fusion and looks broken — say why. (#269)
+                    <div className="px-2 py-1.5 text-xs text-muted-foreground">{t('playground.noModels')}</div>
+                  )}
+                </div>
+              </PopoverContent>
+            </Popover>
             {messages.length > 0 && (
               <Button variant="outline" size="sm" onClick={handleClear}>
                 {t('playground.clear')}
@@ -435,6 +517,26 @@ export default function PlaygroundPage() {
         </div>
 
         <div className="border-t bg-background/50 p-3">
+          <div className="mb-2">
+            <button
+              type="button"
+              onClick={() => setSystemPromptOpen(o => !o)}
+              className="flex items-center gap-1 text-xs text-muted-foreground transition-colors hover:text-foreground"
+            >
+              <ChevronRight className={`size-3.5 transition-transform ${systemPromptOpen ? 'rotate-90' : ''}`} />
+              {t('playground.systemPromptLabel')}
+              {systemPrompt.trim() && <span className="ml-1 size-1.5 rounded-full bg-primary/70" />}
+            </button>
+            {systemPromptOpen && (
+              <textarea
+                value={systemPrompt}
+                onChange={e => updateSystemPrompt(e.target.value)}
+                placeholder={t('playground.systemPromptPlaceholder')}
+                rows={2}
+                className="mt-1.5 w-full resize-y rounded-lg border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring/50 min-h-[44px] max-h-[160px]"
+              />
+            )}
+          </div>
           <div className="flex gap-2 items-end">
             <textarea
               ref={inputRef}
