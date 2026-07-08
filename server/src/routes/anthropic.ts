@@ -20,6 +20,7 @@ import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError } from '../lib/error-classify.js';
+import { getRequestMaxTokensBudget, getMaxConsecutiveUpstreamFails, newBreaker, recordUpstreamFailure, exceedsTokenBudget } from '../lib/guardrails.js';
 import { logRequest } from '../lib/request-log.js';
 import { extractApiToken, timingSafeStringEqual, getStickyModel, setStickyModel } from './proxy.js';
 import { resolveAnthropicModel } from '../services/anthropic-map.js';
@@ -375,6 +376,16 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
   let preferredModel = resolved.preferredModelDbId;
   if (preferredModel == null) preferredModel = getStickyModel(messages, sessionId);
 
+  // ── 策略 24 护栏：单请求 token 预算天花板（反 Goodhart） ──
+  const budget = getRequestMaxTokensBudget();
+  if (exceedsTokenBudget(estimatedTotal, budget)) {
+    sendError(res, 413, 'invalid_request_error', `Request estimated ${estimatedTotal} tokens exceeds request_max_tokens_budget (${budget}). Reduce input or max_tokens.`);
+    return;
+  }
+
+  // ── 策略 24 护栏：连续上游失败断路器 ──
+  const breaker = newBreaker();
+
   const skipKeys = new Set<string>();
   const skipModels = new Set<number>();
   let lastError: any = null;
@@ -467,7 +478,9 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
         setCooldown(route.platform, route.modelId, route.keyId, cooldownFor(route, err));
         recordRateLimitHit(route.modelDbId);
         learnLimitFromError(route.modelDbId, err);
+        recordUpstreamFailure(breaker);
         lastError = err;
+        if (breaker.tripped) break;
         continue;
       }
 
@@ -476,6 +489,12 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
     }
   }
 
+  // ── 策略 24 护栏：连续上游失败断路器跳闸优先于普通耗尽 ──
+  if (breaker.tripped) {
+    const limit = getMaxConsecutiveUpstreamFails();
+    sendError(res, 503, 'circuit_breaker', `Circuit breaker tripped after ${limit} consecutive upstream failures. The model pool appears unhealthy — aborting failover to avoid burning quota/latency on doomed attempts.`);
+    return;
+  }
   sendError(res, 429, 'rate_limit_error', `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${sanitizeProviderErrorMessage(lastError?.message)}`);
 });
 

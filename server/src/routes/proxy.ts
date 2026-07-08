@@ -20,6 +20,7 @@ import type { Platform } from '@freellmapi/shared/types.js';
 import { inferQuotaPoolKey, type QuotaObservationContext } from '../services/provider-quota.js';
 import { isUnifyEnabled, getModelGroups, resolveRequestedIdToMembers } from '../services/model-groups.js';
 import { buildModelListing } from '../services/model-listing.js';
+import { getRequestMaxTokensBudget, getMaxConsecutiveUpstreamFails, newBreaker, recordUpstreamFailure, exceedsTokenBudget } from '../lib/guardrails.js';
 
 export const proxyRouter = Router();
 
@@ -258,11 +259,40 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
         // Non-standard but additive: OpenAI clients ignore unknown fields.
         available: m.available === 1,
         unavailable_reason: m.available === 1 ? null : (m.enabled === 1 ? 'no_key' : 'disabled'),
+        // Enhanced fields (Non-standard, additive)
+        category: m.category,
+        last_verified_at: m.lastVerifiedAt,
+        probe_status: m.probeStatus === 1,
+        rate_limit: m.rateLimit,
+        tier: m.tier,
+        requires_credit_card: m.requiresCreditCard,
       })),
     ],
   });
 });
 
+/** Detect the best category scene from request content for soft routing preference. */
+function detectCategoryScene(messages: any[], hasTools: boolean): string | null {
+  if (hasTools) return 'coding'; // tools tend to pair with code-capable models; routeRequest handles requireTools
+  for (const msg of messages) {
+    if (!msg.content) continue;
+    const blocks = Array.isArray(msg.content) ? msg.content : [msg.content];
+    for (const part of blocks) {
+      if (typeof part === 'object' && part !== null) {
+        if (part.type === 'image_url' || part.type === 'image') return 'vision';
+        if (part.type === 'input_audio') return 'audio';
+      }
+      const text: string = typeof part === 'string' ? part : (part?.text ?? '');
+      if (!text) continue;
+      const t = text.toLowerCase();
+      if (/\b(write|implement|refactor|debug|fix)\b/.test(t) && /\b(code|function|class|method|module)\b/.test(t) ||
+          t.includes('编程') || t.includes('写代码') || t.includes('实现算法') || t.includes('重构')) return 'coding';
+      if (/\b(reason about|analyze|deduce|why.*happen|explain.*mechanism)\b/.test(t) ||
+          t.includes('推理') || t.includes('逻辑分析')) return 'reasoning';
+    }
+  }
+  return null;
+}
 
 const MAX_RETRIES = 20;
 
@@ -697,6 +727,22 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
   }
 
   const pinnedModelId = requestedModel && !isAutoModel(requestedModel) ? requestedModel : null;
+
+  // ── 策略 24 护栏：单请求 token 预算天花板（反 Goodhart） ──
+  const budget = getRequestMaxTokensBudget();
+  if (exceedsTokenBudget(estimatedTotal, budget)) {
+    res.status(413).json({
+      error: {
+        message: `Request estimated ${estimatedTotal} tokens exceeds request_max_tokens_budget (${budget}). Reduce input or max_tokens.`,
+        type: 'invalid_request_error',
+      },
+    });
+    return;
+  }
+
+  // ── 策略 24 护栏：连续上游失败断路器 ──
+  const breaker = newBreaker();
+
   const skipKeys = new Set<string>();
   const skipModels = new Set<number>();
   let lastError: any = null;
@@ -911,7 +957,9 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
         );
         recordRateLimitHit(route.modelDbId);
         learnLimitFromError(route.modelDbId, err);
+        recordUpstreamFailure(breaker);
         lastError = err;
+        if (breaker.tripped) break;
         continue;
       }
 
@@ -925,6 +973,17 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
     }
   }
 
+  // ── 策略 24 护栏：连续上游失败断路器跳闸优先于普通耗尽 ──
+  if (breaker.tripped) {
+    const limit = getMaxConsecutiveUpstreamFails();
+    res.status(503).json({
+      error: {
+        message: `Circuit breaker tripped after ${limit} consecutive upstream failures. The model pool appears unhealthy — aborting failover to avoid burning quota/latency on doomed attempts.`,
+        type: 'circuit_breaker',
+      },
+    });
+    return;
+  }
   const error = exhaustedRetryError(lastError, MAX_RETRIES);
   res.status(error.status).json({
     error: {
@@ -1232,6 +1291,22 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   if (isAutoModel(requestedModel)) {
     resolvedChain = resolveRoutingChain(requestedModel);
     strategyKey = resolvedChain.strategyKey;
+
+    // Scene-aware category reorder: when auto-routing and the request hints at a
+    // specific use-case, promote models in that category to the front of the chain.
+    // This is a "soft" preference — the full chain is still available as fallback.
+    const scene = detectCategoryScene(messages, wantsTools);
+    if (scene && resolvedChain.chain.length > 0) {
+      const db = getDb();
+      const placeholders = resolvedChain.chain.map(() => '?').join(',');
+      const dbIds = resolvedChain.chain.map(e => e.model_db_id);
+      const categories = db.prepare(
+        `SELECT id, category FROM models WHERE id IN (${placeholders})`
+      ).all(...dbIds) as { id: number; category: string | null }[];
+      const catMap = new Map(categories.map(c => [c.id, c.category]));
+      const boost = (e: ChainRow) => catMap.get(e.model_db_id) === scene ? 1 : 0;
+      resolvedChain.chain.sort((a, b) => boost(b) - boost(a));
+    }
   }
 
   // Context handoff only applies to auto-routed requests. Pinned-model requests
@@ -1321,6 +1396,24 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // ('auto' or omitted). Logged with every request row so pinned vs auto
   // traffic and failover overrides are visible.
   const pinnedModelId = requestedModel && !isAutoModel(requestedModel) ? requestedModel : null;
+
+  // ── 策略 24 护栏：单请求 token 预算天花板（反 Goodhart） ──
+  // budget<=0 表示不限制（默认）。若预估总 token（输入 + max_tokens）超限，
+  // 路由前硬拒（413），避免在已知超预算的请求上白烧 failover。
+  const budget = getRequestMaxTokensBudget();
+  if (exceedsTokenBudget(estimatedTotal, budget)) {
+    res.status(413).json({
+      error: {
+        message: `Request estimated ${estimatedTotal} tokens exceeds request_max_tokens_budget (${budget}). Reduce input or max_tokens.`,
+        type: 'invalid_request_error',
+      },
+    });
+    return;
+  }
+
+  // ── 策略 24 护栏：连续上游失败断路器 ──
+  // 阈值<=0 不启用（默认），保持原有 MAX_RETRIES 行为。
+  const breaker = newBreaker();
 
   // Retry loop: on 429/rate limit, skip that model+key and try the next one
   const skipKeys = new Set<string>();
@@ -1442,6 +1535,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         });
         const writeChunk = (c: unknown) => res.write(`data: ${JSON.stringify(c)}\n\n`);
 
+        let truncated = false; // set when the streaming budget cap trips mid-stream
+
         try {
           const gen = route.provider.streamChatCompletion(
             route.apiKey, outboundMessages, route.modelId,
@@ -1516,6 +1611,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             }
 
             totalOutputTokens += Math.ceil(text.length / 4);
+
+            // ── 策略 24 护栏：流内 token 预算提前截断（early stop） ──
+            // 累计输出 + 输入超预算即中止生成，避免单请求无限膨胀（与 413
+            // 预检互补：此处覆盖"边生成边超"的运行时场景）。
+            if (budget > 0 && estimatedInputTokens + injectedHandoffTokens + totalOutputTokens > budget) {
+              truncated = true;
+              break;
+            }
 
             if (mode === 'passthrough') {
               writeChunk({ ...anyChunk, choices: [{ ...choice, delta: { ...choice.delta, tool_calls: undefined }, finish_reason: null }] });
@@ -1785,7 +1888,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // persist it so the next request's pre-check fails over BEFORE the 413
         // instead of re-discovering it. No-op for errors with no parseable limit.
         learnLimitFromError(route.modelDbId, err);
+        recordUpstreamFailure(breaker);
         lastError = err;
+        if (breaker.tripped) break;
         continue;
       }
 
@@ -1801,6 +1906,17 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   }
 
   // Exhausted all retries
+  // ── 策略 24 护栏：连续上游失败断路器跳闸优先于普通耗尽 ──
+  if (breaker.tripped) {
+    const limit = getMaxConsecutiveUpstreamFails();
+    res.status(503).json({
+      error: {
+        message: `Circuit breaker tripped after ${limit} consecutive upstream failures. The model pool appears unhealthy — aborting failover to avoid burning quota/latency on doomed attempts.`,
+        type: 'circuit_breaker',
+      },
+    });
+    return;
+  }
   const error = exhaustedRetryError(lastError, MAX_RETRIES);
   res.status(error.status).json({
     error: {
