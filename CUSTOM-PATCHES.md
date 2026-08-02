@@ -169,7 +169,16 @@ git stash pop                                      # 取回自定义改动
 - 作用：国产/海外/聚合/特殊平台的免费额度参考 + 排错三例 + 组合建议。自定义文档资产。
 
 ### 4.7 ✅ 运维脚本
-- `restart-freellmapi.ps1`：杀旧 3001 → 清 7 天日志 → `Start-Process -UseNewEnvironment` 拉起 + 日志重定向 → 健康验证。🔴 **注**：`-UseNewEnvironment` 本意修 PS5.1 Path/PATH 碰撞，但在 2026-08-02 实测本环境该脚本 exit 1 + 空日志（异常被 catch 吞）；兜底 = 直接 `node server/dist/index.js` 继承环境拉起（当前 PID 2632）。属**环境依赖型**，需复查。
+- `restart-freellmapi.ps1`：**标准重启脚本（2026-08-02 终态）**。流程 = 杀旧 3001 监听进程 → 清 7 天前日志 → `Start-Process` 直连 `node.exe`（绝对路径）+ `-WorkingDirectory $root` + `-RedirectStandardOutput/Error` 落盘 + `-WindowStyle Hidden -PassThru` 脱离会话拉起 → 健康验证（端口监听 + 提示必须测 POST）。**2026-08-02 终态修复史（真根因=编码，非启动机制）**：
+  1. 原脚本含中文注释/日志，被按 **UTF-8 无 BOM** 保存；本机 PowerShell 5.1 在非 UTF-8 区域下把 .ps1 当 **系统 GBK** 读取，中文被解析成乱码，某个字节被误读成未闭合的 `"`/`}`，触发**解析期 `ParserError: UnexpectedToken`（级联报 `unexpected }`）**——脚本**零副作用**（不生成 debug 日志、端口不变）因为根本没执行。这才是反复"调用失败"的真凶，不是启动机制。
+  2. 附带确认两点本环境不可用：`Start-Process -UseNewEnvironment`（实测 exit 1 / 空日志）+ `cmd.exe`/`cmd /c start`（被宿主安全层拦截 "Starting cmd.exe from PowerShell bypasses validation"）。
+  3. **终态**：脚本改为**纯 ASCII（英文注释/日志）+ UTF-8 BOM 保存**；启动一律 `Start-Process node.exe` 直拉（继承当前环境，不用 `-UseNewEnvironment`、不用 `cmd.exe`）。本环境**实跑验证通过**：杀旧 PID 4492 → 拉新 PID 18756 → 3001 监听 → HTTP `/health` **200**、`/v1/models` **401**（服务在线、正常拒未授权），err.log 仅一条无害 `[crypto] No ENCRYPTION_KEY` 警告。**注意**：本文件须保持纯 ASCII；若用中文须确保带 BOM，否则复现解析错误。
+- `start_local.sh`：source `.env` + `exec node server/dist/index.js`（Git Bash 可用）。
+- `start-freellmapi-manual.cmd`：最小化窗口 + 日志重定向拉起（历史可用，但 `cmd` 链路在本 agent 宿主被拦截，非生产首选）。
+- `vault_inject.js`（T-SEC-2）：从 credential-vault（openssl aes-256-cbc）解密 `freellmapi-encryption-key` 输出 stdout；失败静默交回 `.env`。安全集成。
+- `ensure-main-model.py`：幂等固化主模型 `zhipu/glm-4-flash`（绑健康智谱 key → `key_id` 非空 → 豁免 catalog-sync 删除；`size_label='User'` 二重豁免）。缓解 §6.1。
+- `cleanup_clusterB.py`：把 glm-4-flash 置顶 profile 1（priority=1）、死平台(coze/github)降级 priority 9000+；执行前备份 DB。维护 auto 回退链。
+- `agnes-provider.json`：Agnes AI 自定义 provider 配置模板（placeholder key）。
 - `start_local.sh`：source `.env` + `exec node server/dist/index.js`。
 - `start-freellmapi-manual.cmd`：最小化窗口 + 日志重定向拉起。
 - `vault_inject.js`（T-SEC-2）：从 credential-vault（openssl aes-256-cbc）解密 `freellmapi-encryption-key` 输出 stdout；失败静默交回 `.env`。安全集成。
@@ -230,8 +239,8 @@ git stash pop                                      # 取回自定义改动
 ### 6.8 ✅ 未注册迁移 `20260701_*`（已解决 2026-08-02）
 - 见 §4.1/§4.2。两文件已注册进 `DEFAULT_MIGRATIONS` 并加 PRAGMA 幂等守卫。全新 clone 现在会正确建 `category`/`last_verified_at`/`probe_status` 列 + `probe_logs` 表；live DB 重跑因 PRAGMA 守卫跳过 ALTER，不报错。风险消除。
 
-### 6.9 🔴 重启脚本 `-UseNewEnvironment` 环境依赖（风险未决）
-- 见 §4.7。本环境实测失败；需复查或改用继承环境启动。
+### 6.9 ✅ 重启脚本解析失败（真根因=编码，已修复 2026-08-02）
+- 见 §4.7。原 `restart-freellmapi.ps1` 反复"调用失败"的真根因**不是启动机制**，而是 **UTF-8 无 BOM + 中文内容被 PowerShell 5.1 当 GBK 读取 → 解析期 `ParserError`**（脚本从未执行，故零副作用）。已改为**纯 ASCII + UTF-8 BOM**，`Start-Process node.exe` 直拉启动，本环境**实跑全链路通过**（杀旧→拉新→3001 监听→HTTP 200/401）。`cmd.exe` 链路与 `-UseNewEnvironment` 均证实本环境不可用。
 
 ---
 
