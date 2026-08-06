@@ -59,8 +59,12 @@ export function extractApiToken(req: Request): string | undefined {
  */
 import crypto from 'crypto';
 export function timingSafeStringEqual(provided: string, expected: string): boolean {
-  const a = Buffer.from(provided);
-  const b = Buffer.from(expected);
-  const compareA = a.length === b.length ? a : Buffer.alloc(b.length);
-  return crypto.timingSafeEqual(compareA, b) && a.length === b.length;
+  // Use HMAC to produce fixed-length digests so timingSafeEqual always
+  // receives same-length buffers regardless of input length. This eliminates
+  // both the per-character timing leak and the length-branch timing leak that
+  // the Buffer.alloc-on-mismatch approach had.
+  const key = Buffer.alloc(32);
+  const a = crypto.createHmac('sha256', key).update(provided).digest();
+  const b = crypto.createHmac('sha256', key).update(expected).digest();
+  return crypto.timingSafeEqual(a, b);
 }

@@ -15,7 +15,7 @@
 # NOTE: keep this file pure ASCII. Chinese rationale lives in CUSTOM-PATCHES.md.
 
 $ErrorActionPreference = "Stop"
-$root   = "C:\Users\coffcoe\freellmapi"
+$root   = "D:\Users\Yin\freellmapi"
 $node   = "C:\Users\coffcoe\.workbuddy\binaries\node\versions\22.22.2\node.exe"
 $logDir = Join-Path $root "server\logs"
 $debug  = Join-Path $logDir "restart-debug.log"
@@ -43,7 +43,7 @@ try {
 
     # 2. clean logs older than 7 days
     Get-ChildItem $logDir -Filter "freellmapi-*.log" -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } | Remove-Item -Force
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } | Remove-Item -Force -ErrorAction SilentlyContinue
     Log "step2: old logs cleaned"
 
     # 3. start detached + redirect logs

@@ -140,6 +140,27 @@ export function exhaustedRetryError(lastError: any, maxRetries?: number) {
   };
 }
 
+// ── client_tag（P2-a）：调用方自标识，用于 auto 流量溯源 ──
+// Priority: x-client-tag header > x-app-tag header > auto-inferred from connection
+function inferClientTag(req: Request): string | null {
+  const explicit =
+    (typeof req.headers['x-client-tag'] === 'string' && req.headers['x-client-tag']) ||
+    (typeof req.headers['x-app-tag'] === 'string' && req.headers['x-app-tag']);
+  if (explicit) return explicit;
+
+  const ip = req.socket.remoteAddress || 'unknown';
+  const isLoopback = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+
+  if (isLoopback) {
+    // Distinguish local apps by user-agent token
+    const rawUa = typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : '';
+    const appToken = rawUa.split(' ')[0].toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 32);
+    return `loopback-${appToken || 'unknown'}`;
+  }
+
+  return `remote-${ip}`;
+}
+
 // Sticky sessions: track which model served each "session"
 // Key: hash of first user message → model_db_id
 // This prevents model switching mid-conversation which causes hallucination
@@ -273,7 +294,8 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
 
 /** Detect the best category scene from request content for soft routing preference. */
 function detectCategoryScene(messages: any[], hasTools: boolean): string | null {
-  if (hasTools) return 'coding'; // tools tend to pair with code-capable models; routeRequest handles requireTools
+  // 1. Agent / tool-use intent: explicit tool call or agentic keywords
+  if (hasTools) return 'agent';
   for (const msg of messages) {
     if (!msg.content) continue;
     const blocks = Array.isArray(msg.content) ? msg.content : [msg.content];
@@ -285,13 +307,75 @@ function detectCategoryScene(messages: any[], hasTools: boolean): string | null 
       const text: string = typeof part === 'string' ? part : (part?.text ?? '');
       if (!text) continue;
       const t = text.toLowerCase();
+
+      // 2. Coding / 代码 (highest priority after multimodal)
       if (/\b(write|implement|refactor|debug|fix)\b/.test(t) && /\b(code|function|class|method|module)\b/.test(t) ||
           t.includes('编程') || t.includes('写代码') || t.includes('实现算法') || t.includes('重构')) return 'coding';
+
+      // 3. Long-context / 长文档论文
+      if (/\b(long document|paper|thesis|dissertation|book| manuscript)\b/.test(t) ||
+          /\b(长文档|论文|学位论文|书籍|手稿|上下文|上下文窗口|100k|200k|1m)\b/.test(t)) return 'long-context';
+
+      // 4. Agent / 自主Agent
+      if (/\b(agent|autonomous|self-driving|tool use|function call)\b/.test(t) ||
+          t.includes('自主') || t.includes('Agent') || t.includes('工具调用') || t.includes('智能体')) return 'agent';
+
+      // 5. Reasoning / 推理
       if (/\b(reason about|analyze|deduce|why.*happen|explain.*mechanism)\b/.test(t) ||
           t.includes('推理') || t.includes('逻辑分析')) return 'reasoning';
+
+      // 6. Speed / 低延迟 (explicit latency requirement)
+      if (/\b(fast|low latency|realtime|real-time|quick|speedy)\b/.test(t) ||
+          t.includes('快速') || t.includes('低延迟') || t.includes('实时') || t.includes('快')) return 'speed';
+
+      // 7. Compliance / 国内合规 (data sovereignty)
+      if (/\b(china|domestic|compliant|data residency|sovereignty)\b/.test(t) ||
+          t.includes('国内') || t.includes('合规') || t.includes('数据不出境') || t.includes('境内')) return 'compliance';
     }
   }
   return null;
+}
+
+/** Map detectCategoryScene output to actual DB category values. */
+function sceneToCategory(scene: string): string | null {
+  const map: Record<string, string> = {
+    'coding': 'coding',
+    'vision': 'vision',
+    'audio': 'audio',
+    'reasoning': 'reasoning',
+    'agent': 'function-calling',
+  };
+  return map[scene] || null;
+}
+
+/** Detect L3 scene tags from request content (free-tier, long-context, low-latency, compliance). */
+function detectSceneTags(messages: any[]): string[] {
+  const tags: string[] = [];
+  for (const msg of messages) {
+    if (!msg.content) continue;
+    const blocks = Array.isArray(msg.content) ? msg.content : [msg.content];
+    for (const part of blocks) {
+      const text: string = typeof part === 'string' ? part : (part?.text ?? '');
+      if (!text) continue;
+      const t = text.toLowerCase();
+      if (/\b(fast|low latency|realtime|real-time|quick|speedy)\b/.test(t) ||
+          t.includes('快速') || t.includes('低延迟') || t.includes('实时') || t.includes('快')) {
+        tags.push('low-latency');
+      }
+      if (/\b(long document|paper|thesis|dissertation|book| manuscript|100k|200k|1m)\b/.test(t) ||
+          t.includes('长文档') || t.includes('论文') || t.includes('上下文窗口') || t.includes('上下文')) {
+        tags.push('long-context');
+      }
+      if (/\b(china|domestic|compliant|data residency|sovereignty)\b/.test(t) ||
+          t.includes('国内') || t.includes('合规') || t.includes('数据不出境')) {
+        tags.push('compliance');
+      }
+      if (/\b(free|free tier)\b/.test(t) || t.includes('免费')) {
+        tags.push('free-tier');
+      }
+    }
+  }
+  return [...new Set(tags)];
 }
 
 const MAX_RETRIES = 20;
@@ -411,6 +495,34 @@ const toolChoiceSchema = z.union([
 ]);
 
 const stopSchema = z.union([z.string(), z.array(z.string()).min(1).max(64)]);
+
+// ── github 专属请求尺寸护栏（动作① / P0 收尾）──
+// github 上游硬限：输入 ≤ 8000 tokens（超限返回 413 "Request body too large"）、
+// max_tokens 亦受限（超限返回 400 "max_tokens too large"）。模型本身活着，
+// 故请求发给上游前截断输入消息 + 封顶 max_tokens，消灭 97% 的错误。
+const GITHUB_MAX_INPUT_TOKENS = 7500;   // 留 500 token 余量（上游硬限 8000）
+const GITHUB_MAX_OUTPUT_TOKENS = 4096;  // 保守封顶，避免 400 max_tokens too large
+
+function estimateMessageTokensForGithub(m: ChatMessage): number {
+  return Math.ceil(contentToString(m.content).length / 4);
+}
+
+// 从最旧的非 system/tool 消息开始丢弃，保留 system + 最近对话，直至 ≤ 阈值。
+function truncateMessagesForGithub(msgs: ChatMessage[]): ChatMessage[] {
+  const total = msgs.reduce((s, m) => s + estimateMessageTokensForGithub(m), 0);
+  if (total <= GITHUB_MAX_INPUT_TOKENS) return msgs;
+  const keep = msgs.slice();
+  let cur = total;
+  for (let i = 0; i < keep.length && cur > GITHUB_MAX_INPUT_TOKENS; i++) {
+    const role = keep[i].role;
+    if (role === 'system' || role === 'tool') continue; // 不丢系统/工具消息，避免破坏结构
+    if (keep.length <= 1) break;
+    cur -= estimateMessageTokensForGithub(keep[i]);
+    keep.splice(i, 1);
+    i--; // 删除后回退索引
+  }
+  return keep;
+}
 
 function providerSafeStop(stop: string | string[] | undefined): string | string[] | undefined {
   if (!Array.isArray(stop)) return stop;
@@ -649,6 +761,16 @@ function legacyCompletionChunk(route: RouteResult, chunk: any, text: string) {
 proxyRouter.post('/completions', async (req: Request, res: Response) => {
   const start = Date.now();
   const requestGroupId = getRequestGroupId(req);
+
+  // ── abort 熔断（P1-c）：客户端断开即停上游调用 / 跳出 failover ──
+  // res 'close' fires on both normal completion (writableFinished=true) and client
+  // abort (writableFinished=false). Only treat the latter as abort so we don't
+  // bail out of a request we already finished serving.
+  let clientAborted = false;
+  res.on('close', () => { if (!res.writableFinished) clientAborted = true; });
+
+  // ── client_tag（P2-a）：调用方自标识，用于 auto 流量溯源 ──
+  const clientTag = inferClientTag(req);
   res.setHeader('X-Request-ID', requestGroupId);
 
   const token = extractApiToken(req);
@@ -821,8 +943,9 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
             quotaContextForRoute(route, 'chat/completions'),
           );
 
-          for await (const chunk of gen) {
-            const text = streamChunkText(chunk);
+        for await (const chunk of gen) {
+          if (clientAborted) break;
+          const text = streamChunkText(chunk);
             if (text.length > 0) sawText = true;
             totalOutputTokens += Math.ceil(text.length / 4);
             const frame = legacyCompletionChunk(route, chunk, text);
@@ -834,6 +957,11 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
             res.write(`data: ${JSON.stringify(frame)}\n\n`);
           }
 
+          if (clientAborted) {
+            // 客户端已断开：不记账、不 failover，直接收尾（socket 已关闭）
+            try { res.end(); } catch { /* socket gone */ }
+            return;
+          }
           if (!sawText) {
             throw new Error(`empty completion from ${route.displayName} (legacy stream produced no text)`);
           }
@@ -855,7 +983,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
             inputTokens: estimatedInputTokens,
             outputTokens: totalOutputTokens,
           });
-          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId);
+          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId, clientTag);
           return;
         } catch (streamErr: any) {
           if (headerSent) {
@@ -872,7 +1000,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
               latencyMs: Date.now() - start,
               error: sanitizeProviderErrorMessage(streamErr.message),
             });
-            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message), ttfbMs, pinnedModelId);
+            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message), ttfbMs, pinnedModelId, clientTag);
             return;
           }
           throw streamErr;
@@ -892,6 +1020,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
         }
 
         const totalTokens = result.usage?.total_tokens ?? 0;
+        if (clientAborted) return;
         recordRequest(route.platform, route.modelId, route.keyId);
         recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
         recordSuccess(route.modelDbId);
@@ -922,7 +1051,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
           inputTokens: result.usage?.prompt_tokens ?? 0,
           outputTokens: result.usage?.completion_tokens ?? 0,
         });
-        logRequest(route.platform, route.modelId, route.keyId, 'success', result.usage?.prompt_tokens ?? 0, result.usage?.completion_tokens ?? 0, Date.now() - start, null, null, pinnedModelId);
+        logRequest(route.platform, route.modelId, route.keyId, 'success', result.usage?.prompt_tokens ?? 0, result.usage?.completion_tokens ?? 0, Date.now() - start, null, null, pinnedModelId, clientTag);
         return;
       }
     } catch (err: any) {
@@ -937,7 +1066,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
         latencyMs: latency,
         error: safeError,
       });
-      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId);
+      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId, clientTag);
 
       if (isRetryableError(err)) {
         if (isModelNotFoundError(err) || isModelAccessForbiddenError(err)) skipModels.add(route.modelDbId);
@@ -996,6 +1125,13 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
 proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   const start = Date.now();
   const requestGroupId = getRequestGroupId(req);
+
+  // ── abort 熔断（P1-c）：客户端断开即停上游调用 / 跳出 failover ──
+  let clientAborted = false;
+  res.on('close', () => { if (!res.writableFinished) clientAborted = true; });
+
+  // ── client_tag（P2-a）：调用方自标识，用于 auto 流量溯源 ──
+  const clientTag = inferClientTag(req);
   res.setHeader('X-Request-ID', requestGroupId);
 
   // Authenticate with the unified API key for every proxy request, including
@@ -1292,19 +1428,47 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     resolvedChain = resolveRoutingChain(requestedModel);
     strategyKey = resolvedChain.strategyKey;
 
-    // Scene-aware category reorder: when auto-routing and the request hints at a
-    // specific use-case, promote models in that category to the front of the chain.
+    // Three-layer soft preference: L1 network_tier + L2 category + L3 tags.
     // This is a "soft" preference — the full chain is still available as fallback.
-    const scene = detectCategoryScene(messages, wantsTools);
-    if (scene && resolvedChain.chain.length > 0) {
+    const sceneCategory = detectCategoryScene(messages, wantsTools);
+    const sceneTags = detectSceneTags(messages);
+    const preferredNetworkTier = (req.headers['x-network-tier'] as string | undefined)?.toLowerCase();
+
+    if ((sceneCategory || sceneTags.length > 0 || preferredNetworkTier) && resolvedChain.chain.length > 0) {
       const db = getDb();
       const placeholders = resolvedChain.chain.map(() => '?').join(',');
       const dbIds = resolvedChain.chain.map(e => e.model_db_id);
-      const categories = db.prepare(
-        `SELECT id, category FROM models WHERE id IN (${placeholders})`
-      ).all(...dbIds) as { id: number; category: string | null }[];
-      const catMap = new Map(categories.map(c => [c.id, c.category]));
-      const boost = (e: ChainRow) => catMap.get(e.model_db_id) === scene ? 1 : 0;
+      const modelRows = db.prepare(
+        `SELECT id, category, network_tier, tags FROM models WHERE id IN (${placeholders})`
+      ).all(...dbIds) as { id: number; category: string | null; network_tier: string | null; tags: string | null }[];
+
+      const catMap = new Map(modelRows.map(r => [r.id, r.category]));
+      const tierMap = new Map(modelRows.map(r => [r.id, r.network_tier]));
+      const tagsMap = new Map<number, string[]>();
+      for (const r of modelRows) {
+        try {
+          tagsMap.set(r.id, r.tags ? JSON.parse(r.tags) : []);
+        } catch {
+          tagsMap.set(r.id, []);
+        }
+      }
+
+      const sceneCat = sceneCategory ? sceneToCategory(sceneCategory) : null;
+
+      const boost = (e: ChainRow) => {
+        let score = 0;
+        // L1: network_tier match (highest weight)
+        if (preferredNetworkTier && tierMap.get(e.model_db_id) === preferredNetworkTier) score += 4;
+        // L2: category match
+        if (sceneCat && catMap.get(e.model_db_id) === sceneCat) score += 2;
+        // L3: tag match
+        const modelTags = tagsMap.get(e.model_db_id) || [];
+        for (const tag of sceneTags) {
+          if (modelTags.includes(tag)) score += 1;
+        }
+        return score;
+      };
+
       resolvedChain.chain.sort((a, b) => boost(b) - boost(a));
     }
   }
@@ -1481,6 +1645,15 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       injectedHandoffTokens = handoff.injectedTokens;
     }
 
+    // ── github 专属请求尺寸护栏（动作①）──
+    // github 上游硬限输入 ≤ 8000 tokens（超限 413）/ max_tokens 受限（超限 400）。
+    // 模型本身活着，故请求前截断输入 + 封顶 max_tokens，消灭 97% 错误。
+    let githubCappedMaxTokens = max_tokens;
+    if (route.platform === 'github') {
+      outboundMessages = truncateMessagesForGithub(outboundMessages);
+      githubCappedMaxTokens = Math.min(max_tokens ?? GITHUB_MAX_OUTPUT_TOKENS, GITHUB_MAX_OUTPUT_TOKENS);
+    }
+
     try {
       if (stream) {
         // — Stream turn-integrity (#231 audit) —
@@ -1540,11 +1713,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         try {
           const gen = route.provider.streamChatCompletion(
             route.apiKey, outboundMessages, route.modelId,
-            { temperature, max_tokens, top_p, stop, tools, tool_choice, parallel_tool_calls },
+            { temperature, max_tokens: githubCappedMaxTokens, top_p, stop, tools, tool_choice, parallel_tool_calls },
             quotaContextForRoute(route, 'chat/completions'),
           );
 
           for await (const chunk of gen) {
+            if (clientAborted) break;
             const anyChunk = chunk as Record<string, any>;
 
             // In-band upstream error frame (observed live: Groq emits
@@ -1567,7 +1741,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
                 latencyMs: Date.now() - start,
                 error: sanitizeProviderErrorMessage(String(msg)),
               });
-              logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, `in-band error frame: ${sanitizeProviderErrorMessage(String(msg))}`, ttfbMs, pinnedModelId);
+              logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, `in-band error frame: ${sanitizeProviderErrorMessage(String(msg))}`, ttfbMs, pinnedModelId, clientTag);
               return;
             }
 
@@ -1638,6 +1812,12 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
               heldText = '';
             }
             // else: still a strict prefix of a marker — keep holding.
+          }
+
+          if (clientAborted) {
+            // 客户端已断开：不记账、不 failover，直接收尾（socket 已关闭）
+            try { res.end(); } catch { /* socket gone */ }
+            return;
           }
 
           // — Stream ended cleanly (provider saw [DONE] or a finish_reason) —
@@ -1715,7 +1895,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             inputTokens: estimatedInputTokens + injectedHandoffTokens,
             outputTokens: totalOutputTokens,
           });
-          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens + injectedHandoffTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId);
+          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens + injectedHandoffTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId, clientTag);
           return;
         } catch (streamErr: any) {
           if (headerSent) {
@@ -1734,7 +1914,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
               latencyMs: Date.now() - start,
               error: sanitizeProviderErrorMessage(streamErr.message),
             });
-            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message), ttfbMs, pinnedModelId);
+            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message), ttfbMs, pinnedModelId, clientTag);
             return;
           }
           // Headers never sent — bubble to the outer retry handler, which
@@ -1746,7 +1926,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       } else {
         const result = await route.provider.chatCompletion(
           route.apiKey, outboundMessages, route.modelId,
-          { temperature, max_tokens, top_p, stop, tools, tool_choice, parallel_tool_calls },
+          { temperature, max_tokens: githubCappedMaxTokens, top_p, stop, tools, tool_choice, parallel_tool_calls },
           quotaContextForRoute(route, 'chat/completions'),
         );
 
@@ -1765,7 +1945,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             latencyMs: Date.now() - start,
             error: 'empty completion',
           });
-          logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)', null, pinnedModelId);
+          logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)', null, pinnedModelId, clientTag);
           skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
           setCooldown(route.platform, route.modelId, route.keyId, getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
           recordRateLimitHit(route.modelDbId);
@@ -1798,6 +1978,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         }
 
         const totalTokens = result.usage?.total_tokens ?? 0;
+        if (clientAborted) return;
         recordRequest(route.platform, route.modelId, route.keyId);
         recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
         recordSuccess(route.modelDbId);
@@ -1836,7 +2017,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           inputTokens: result.usage?.prompt_tokens ?? 0,
           outputTokens: result.usage?.completion_tokens ?? 0,
         });
-        logRequest(route.platform, route.modelId, route.keyId, 'success', result.usage?.prompt_tokens ?? 0, result.usage?.completion_tokens ?? 0, Date.now() - start, null, null, pinnedModelId);
+        logRequest(route.platform, route.modelId, route.keyId, 'success', result.usage?.prompt_tokens ?? 0, result.usage?.completion_tokens ?? 0, Date.now() - start, null, null, pinnedModelId, clientTag);
         return;
       }
     } catch (err: any) {
@@ -1851,7 +2032,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         latencyMs: latency,
         error: safeError,
       });
-      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId);
+      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId, clientTag);
 
       if (isRetryableError(err)) {
         // Model-level 404 (removed/deprecated upstream): rule the whole model

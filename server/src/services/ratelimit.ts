@@ -302,6 +302,13 @@ export function getNextCooldownDuration(platform: string, modelId: string, keyId
 // Short cooldown for a transient (per-minute) 429 — recovers within ~one window.
 const TRANSIENT_COOLDOWN_MS = 90 * 1000;
 
+// No-limit free providers (cloudflare/ollama/nvidia/hf/mistral/...) emit 429 on
+// transient RPM jitter, not real daily exhaustion. Cap their bench at 10min so a
+// burst of 429s under heavy load (e.g. distill_card batch) never escalates to a
+// 24h death penalty that cascades 429s to high-volume consumers. Bounded
+// protective cooldown instead — still reduces hammering vs the 90s loop.
+const NO_LIMIT_COOLDOWN_CAP_MS = 10 * 60 * 1000;
+
 // Long cooldown for a 402 Payment Required (provider/key out of credits). Unlike
 // a 429, this won't clear on the next minute/day window — it needs a top-up or
 // billing reset. Bench the model+key for a full day so the router fails over to
@@ -320,9 +327,9 @@ export const MODEL_FORBIDDEN_COOLDOWN_MS = DAY;
 // When RPD/TPD limits are NULL (provider's published daily quota is unknown or
 // not yet seeded — common for ollama, cloudflare, nvidia, huggingface, mistral,
 // kilo, llm7, pollinations), we cannot check a counter against a cap. Fall back
-// to a hit-count heuristic: after 2+ 429s within this rolling window, treat as
-// "effectively daily-exhausted" and enter the standard escalation ladder at
-// the same step the documented-RPD path would. Without this, these providers
+// to a hit-count heuristic: after 2+ 429s within this rolling window, bench at
+// NO_LIMIT_COOLDOWN_CAP_MS (10min) — bounded, so transient RPM jitter on free
+// providers never escalates to a 24h death penalty. Without this, these providers
 // stay stuck at TRANSIENT_COOLDOWN_MS forever even when every request is a
 // 429 (observed in production: ollama 130× 429s in 1h with all 90s cooldowns
 // expired before the next request). Cheaper than waiting for the operator to
@@ -398,13 +405,20 @@ export function getCooldownDurationForLimit(
     heuristicallyExhausted =
       recentHitCount(platform, modelId, keyId, now) >= NULL_LIMIT_HIT_THRESHOLD;
   }
-  const base = (rpdExhausted || tpdExhausted || heuristicallyExhausted)
+  // Real published quota (RPD/TPD) exhaustion escalates via the standard ladder
+  // up to 24h — that is correct and unchanged. No-limit free providers (cloudflare
+  // et al.) 429 on transient jitter: bench at the 10min cap, never the 24h ladder.
+  const base = (rpdExhausted || tpdExhausted)
     ? getNextCooldownDuration(platform, modelId, keyId)
-    : TRANSIENT_COOLDOWN_MS;
+    : heuristicallyExhausted
+      ? NO_LIMIT_COOLDOWN_CAP_MS
+      : TRANSIENT_COOLDOWN_MS;
   // Honor an upstream Retry-After as a floor: never bench shorter than our own
-  // heuristic, but extend (capped at a day) when the provider explicitly asks
-  // to wait longer than we otherwise would.
-  if (retryAfterMs != null && retryAfterMs > base) return Math.min(retryAfterMs, DAY);
+  // heuristic, and respect the provider's explicit signal up to a day. Only the
+  // no-signal heuristic path is capped at NO_LIMIT_COOLDOWN_CAP_MS (see above).
+  if (retryAfterMs != null && retryAfterMs > base) {
+    return Math.min(retryAfterMs, DAY);
+  }
   return base;
 }
 
@@ -445,6 +459,28 @@ function clearPersistedCooldown(platform: string, modelId: string, keyId: number
          AND key_id = ?
     `).run(platform, modelId, keyId);
   });
+}
+
+// ── Proactive startup cleanup ────────────────────────────────────────────────
+// The lazy cleanup inside isOnCooldown only fires when a request reaches that
+// exact (platform, model, key). If *every* model is cooldown-blocked, the
+// router returns "routing exhausted" before any request can trigger the lazy
+// path — leaving stale DB rows forever. This one-time scan at boot removes
+// every expired row so a clean restart always has a fresh slate.
+export function cleanupExpiredCooldowns(): number {
+  const now = Date.now();
+  let deleted = 0;
+  withDb(db => {
+    const result = db.prepare(`
+      DELETE FROM rate_limit_cooldowns
+       WHERE expires_at_ms <= ?
+    `).run(now);
+    deleted = result.changes ?? 0;
+  });
+  // Memory cooldowns are always empty at startup (process restarted), but
+  // clear them in case this is called later (e.g. tests).
+  cooldowns.clear();
+  return deleted;
 }
 
 export function setCooldown(platform: string, modelId: string, keyId: number, durationMs = 60_000) {

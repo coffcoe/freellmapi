@@ -423,6 +423,44 @@ const GLOBAL_SORT_ALIASES: Record<string, string> = {
   balanced: 'balanced',
 };
 
+/**
+ * Quota-aware filtering (P0-3): drop models sitting on a provider quota pool
+ * we have OBSERVED as exhausted (provider_quota_state.remaining_value = 0).
+ *
+ * Granularity is (platform, key_id) — the same level the quota table records,
+ * so we never punish a working pool just because a sibling pool on the same
+ * platform is empty (e.g. openrouter::account vs openrouter::free).
+ *
+ * Surgical by design: only removes what we KNOW is dead, so it cannot hurt
+ * working models. If filtering would empty the whole chain (a profile made
+ * entirely of exhausted models), we fall back to the unfiltered chain to
+ * avoid a hard "no models available" error.
+ */
+function filterExhaustedQuota(db: Database, chain: ChainRow[]): ChainRow[] {
+  let rows: { platform: string; key_id: number | null }[] = [];
+  try {
+    // Only treat a (platform,key_id) as exhausted when remaining_value = 0 AND
+    // the quota has NOT reset yet. Rows whose reset_at is in the past are stale
+    // observations from a previous window — keeping them would permanently block
+    // a pool even after upstream quota replenishes, causing "all models exhausted"
+    // until an operator manually truncates the table.
+    rows = db.prepare(
+      `SELECT platform, key_id FROM provider_quota_state
+        WHERE remaining_value = 0
+          AND (reset_at IS NULL OR reset_at > datetime('now'))`
+    ).all() as { platform: string; key_id: number | null }[];
+  } catch {
+    return chain; // table missing — skip filtering rather than crash the router
+  }
+  if (rows.length === 0) return chain;
+
+  const exhausted = new Set<string>();
+  for (const r of rows) exhausted.add(`${r.platform}::${r.key_id}`);
+
+  const filtered = chain.filter(c => !exhausted.has(`${c.platform}::${c.key_id}`));
+  return filtered.length > 0 ? filtered : chain;
+}
+
 function getActiveChain(db: Database): ChainRow[] {
   const activeProfileSetting = db.prepare("SELECT value FROM settings WHERE key = 'active_profile_id'").get() as { value: string } | undefined;
   if (activeProfileSetting) {
@@ -439,10 +477,10 @@ function getActiveChain(db: Database): ChainRow[] {
       ORDER BY pm.priority ASC
     `).all(profileId) as ChainRow[];
     
-    if (chain.length > 0) return chain;
+    if (chain.length > 0) return filterExhaustedQuota(db, chain);
   }
 
-  return db.prepare(`
+  return filterExhaustedQuota(db, db.prepare(`
     SELECT fc.model_db_id, fc.priority, fc.enabled,
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.size_label, m.monthly_token_budget,
@@ -451,14 +489,14 @@ function getActiveChain(db: Database): ChainRow[] {
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id AND m.enabled = 1
     ORDER BY fc.priority ASC
-  `).all() as ChainRow[];
+  `).all() as ChainRow[]);
 }
 
 function getChainByProfileName(db: Database, name: string): ChainRow[] | null {
   const profile = db.prepare("SELECT id FROM profiles WHERE LOWER(name) = ?").get(name.toLowerCase()) as { id: number } | undefined;
   if (!profile) return null;
 
-  return db.prepare(`
+  return filterExhaustedQuota(db, db.prepare(`
     SELECT pm.model_db_id, pm.priority, pm.enabled,
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.size_label, m.monthly_token_budget,
@@ -468,7 +506,7 @@ function getChainByProfileName(db: Database, name: string): ChainRow[] | null {
     JOIN models m ON m.id = pm.model_db_id AND m.enabled = 1
     WHERE pm.profile_id = ?
     ORDER BY pm.priority ASC
-  `).all(profile.id) as ChainRow[];
+  `).all(profile.id) as ChainRow[]);
 }
 
 function getChainByGlobalSort(db: Database, globalAxis: string): ChainRow[] {
@@ -491,7 +529,7 @@ function getChainByGlobalSort(db: Database, globalAxis: string): ChainRow[] {
   };
   const strat = strategyMap[globalAxis] || 'balanced';
   
-  return orderChain(allEnabled, strat);
+  return filterExhaustedQuota(db, orderChain(allEnabled, strat));
 }
 
 export function resolveRoutingChain(modelString: string | undefined): ResolvedChain {
@@ -560,8 +598,15 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
   }
   const provider = getProvider(entry.platform as Platform)!;
 
+  // Keyless providers (kilo, pollinations) use a sentinel key that is never
+  // meant to be "healthy" in the traditional sense — it exists only so routing
+  // has a key to rotate across. Include 'error' status for them so the sentinel
+  // isn't filtered out before the keyless skip-decrypt path above can use it.
+  const keyWhere = provider.keyless
+    ? "enabled = 1"
+    : "enabled = 1 AND status IN ('healthy', 'unknown')";
   const keys = db.prepare(
-    "SELECT * FROM api_keys WHERE platform = ? AND enabled = 1 AND status IN ('healthy', 'unknown')"
+    `SELECT * FROM api_keys WHERE platform = ? AND ${keyWhere}`
   ).all(entry.platform) as KeyRow[];
   if (keys.length === 0) {
     diag?.push(`${label}: no enabled+healthy key for platform`);
@@ -600,13 +645,20 @@ function selectKeyForModel(entry: ChainRow, estimatedTokens: number, skipKeys?: 
     if (!canUseTokens(entry.platform, entry.model_id, key.id, estimatedTokens, limits)) { note('tpm/tpd-limit'); continue; }
 
     let decryptedKey: string;
-    try {
-      decryptedKey = decrypt(key.encrypted_key, key.iv, key.auth_tag);
-    } catch {
-      db.prepare("UPDATE api_keys SET status = 'error', last_checked_at = datetime('now') WHERE id = ?")
-        .run(key.id);
-      note('decrypt-error');
-      continue;
+    // Keyless providers (kilo, pollinations anon tier) omit the Authorization
+    // header entirely, so the stored encrypted_key is a sentinel — decrypting
+    // it would fail and wrongly bench the key. Skip decryption for them.
+    if (provider.keyless) {
+      decryptedKey = '';
+    } else {
+      try {
+        decryptedKey = decrypt(key.encrypted_key, key.iv, key.auth_tag);
+      } catch {
+        db.prepare("UPDATE api_keys SET status = 'error', last_checked_at = datetime('now') WHERE id = ?")
+          .run(key.id);
+        note('decrypt-error');
+        continue;
+      }
     }
 
     const resolvedProvider = entry.platform === 'custom'
@@ -829,13 +881,43 @@ export function resolveFusionCandidate(modelId: string): FusionCandidate | null 
   return null;
 }
 
+// Input token threshold above which the auto-router avoids high-value free
+// models (context grading, P1-b). 20k tokens is well past the size where a
+// request is "cheap"; routing those onto scarce premium models wastes their
+// limited daily quota.
+const HIGH_VALUE_INPUT_THRESHOLD = 20000;
+
+// Drop is_high_value=1 models from the chain. Returns the filtered chain; if
+// filtering would empty it, returns the original so large-context requests can
+// still be served by whatever is available.
+function filterHighValueIfLarge(db: Database, chain: ChainRow[]): ChainRow[] {
+  const hv = new Set<number>(
+    (db.prepare('SELECT id FROM models WHERE is_high_value = 1').all() as { id: number }[]).map(r => r.id),
+  );
+  if (hv.size === 0) return chain;
+  const filtered = chain.filter(e => !hv.has(e.model_db_id));
+  return filtered.length > 0 ? filtered : chain;
+}
+
 export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, requireTools = false, skipModels?: Set<number>, prefetchedChain?: ChainRow[]): RouteResult {
   const db = getDb();
 
   const strategy = getRoutingStrategy();
   if (strategy !== 'priority') refreshStatsCache(db);
 
-  const chain = prefetchedChain ?? getActiveChain(db).filter(e => e.enabled);
+  let chain = prefetchedChain ?? getActiveChain(db).filter(e => e.enabled);
+
+  // Context grading (P1-b): very large inputs should not burn the scarce
+  // high-value free models (Frontier/Large tier with tight upstream quotas).
+  // Drop is_high_value=1 models from the auto chain when the estimated input
+  // exceeds the threshold — but only if that still leaves models to serve; if it
+  // would empty the chain we keep the originals (same fallback discipline as
+  // filterExhaustedQuota). A sticky/pinned model injected below is never
+  // filtered, so explicit user pins are always honored.
+  if (estimatedTokens > HIGH_VALUE_INPUT_THRESHOLD) {
+    const graded = filterHighValueIfLarge(db, chain);
+    if (graded.length > 0) chain = graded;
+  }
 
   const sortedChain = orderChain(chain, strategy);
 

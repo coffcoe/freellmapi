@@ -20,7 +20,10 @@ export async function checkKeyHealth(keyId: number): Promise<KeyStatus> {
   if (!provider) return 'error';
 
   try {
-    const apiKey = decrypt(row.encrypted_key, row.iv, row.auth_tag);
+    // Keyless providers (kilo, pollinations anon tier) store a sentinel encrypted
+    // key that is not meant to be decrypted — pass an empty string to validateKey,
+    // which will skip the Authorization header via authHeader().
+    const apiKey = provider.keyless ? '' : decrypt(row.encrypted_key, row.iv, row.auth_tag);
     const isValid = await provider.validateKey(apiKey, {
       platform: row.platform as Platform,
       keyId,

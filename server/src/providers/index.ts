@@ -52,10 +52,15 @@ register(new OpenAICompatProvider({
 }));
 
 // OpenRouter - OpenAI-compatible with extra headers
+// validateUrl: /models is PUBLIC on OpenRouter (returns 200 even with a garbage
+// key), which made every health check vacuously "healthy" — key 30 returned
+// 401 "User not found" on real completions for weeks while status stayed
+// healthy (verified 2026-07-29). /api/v1/key requires auth (401 on bad keys).
 register(new OpenAICompatProvider({
   platform: 'openrouter',
   name: 'OpenRouter',
   baseUrl: 'https://openrouter.ai/api/v1',
+  validateUrl: 'https://openrouter.ai/api/v1/key',
   extraHeaders: {
     'HTTP-Referer': 'http://localhost:3001',
     'X-Title': 'FreeLLMAPI',
@@ -198,7 +203,7 @@ register(new OpenAICompatProvider({
 register(new OpenAICompatProvider({
   platform: 'agnes',
   name: 'Agnes AI',
-  baseUrl: 'https://apihub.agnes-ai.com/v1',
+  baseUrl: 'https://apihub.agnes-ai.cn/v1',
 }));
 
 // Chutes was evaluated for V11 and dropped: probe with a free-tier key
@@ -277,6 +282,24 @@ register(new OpenAICompatProvider({
 // auto-configures and works anonymously (key 0000000000, lowest queue
 // priority); a registered aihorde.net key raises priority. See issue #345.
 register(new AIHordeProvider());
+
+// Cline.bot — OpenAI-compatible gateway offering 1M context free models.
+// Free tier requires registration at app.cline.bot (no card required).
+// Models: minimax-m3, mimo-v2.5, deepseek-v4-flash.
+register(new OpenAICompatProvider({
+  platform: 'cline',
+  name: 'Cline.bot',
+  baseUrl: 'https://api.cline.bot/api/v1',
+}));
+
+// ModelScope (魔搭社区) — OpenAI-compatible inference API.
+// Free tier: 2000 requests/day (no card), requires Alibaba Cloud account + real-name verification.
+// API: https://api-inference.modelscope.cn/v1
+register(new OpenAICompatProvider({
+  platform: 'modelscope',
+  name: 'ModelScope',
+  baseUrl: 'https://api-inference.modelscope.cn/v1',
+}));
 
 // Placeholder so getProvider('custom')/hasProvider('custom')/getAllProviders()
 // behave — but the real instance is built per-key by resolveProvider(), since

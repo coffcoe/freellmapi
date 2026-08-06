@@ -169,10 +169,21 @@ export function applyCatalog(db: DatabaseType.Database, catalog: Catalog): NonNu
   const counts = { updated: 0, inserted: 0, removed: 0, skippedUnknownPlatform: 0, quirks: 0 };
 
   const selectModel = db.prepare('SELECT id, enabled FROM models WHERE platform = ? AND model_id = ?');
+  // NOTE: raw_capabilities / capability_sources are LOCAL-ONLY fields populated
+  // by the capability collector. They are intentionally excluded from both the
+  // UPDATE and INSERT statements above so that upstream catalog sync never
+  // overwrites locally-curated capability data.
+  //
+  // NOTE (rpd_limit 治本, #P2-b): rpd_limit is intentionally EXCLUDED from the
+  // UPDATE below. The catalog ships rpd_limit=null for most platforms (e.g.
+  // nvidia/cloudflare); applying it would clobber the locally-managed per-model
+  // daily caps that P0 set (FLA-RPD). New models still receive the catalog
+  // default via the INSERT statement. The durable daily gate is the
+  // platform-level PROVIDER_DAILY_REQUEST_CAP_* env (catalog-immune).
   const updateModel = db.prepare(`
     UPDATE models SET
       display_name = @displayName, intelligence_rank = @intelligenceRank, speed_rank = @speedRank,
-      size_label = @sizeLabel, rpm_limit = @rpm, rpd_limit = @rpd, tpm_limit = @tpm, tpd_limit = @tpd,
+      size_label = @sizeLabel, rpm_limit = @rpm, tpm_limit = @tpm, tpd_limit = @tpd,
       monthly_token_budget = @monthlyTokenBudget, context_window = @contextWindow,
       supports_vision = @supportsVision, supports_tools = @supportsTools,
       enabled = @enabled

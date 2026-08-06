@@ -82,6 +82,10 @@ The problem is that stacking them by hand is painful: seventeen different SDKs, 
 
 Plus a **custom** provider — point chat, embedding, image, or audio models at any OpenAI-compatible endpoint (llama.cpp, LM Studio, vLLM, a local Ollama, or a remote gateway) from the Keys page.
 
+## Free tier reference
+
+For a detailed breakdown of free tiers across all supported platforms — including signup steps, base URLs, rate limits, and expiry warnings — see the [free tier reference handbook](docs/free-tier-reference.md). That document is derived from the latest knowledge-card scan and is updated when policies change.
+
 ## Features
 
 - **OpenAI-compatible** — `POST /v1/chat/completions` and `GET /v1/models` work with the official OpenAI SDKs and any OpenAI-compatible client (LangChain, LlamaIndex, Continue, Hermes, etc.). Just change `base_url`.
@@ -574,6 +578,13 @@ Request volume, success rate, tokens in and out, average latency, and per-provid
 - **Health service** (`server/src/services/health.ts`) — periodic probe keeps key status fresh.
 - **Dashboard** (`client/`) — React + Vite + shadcn/ui admin surface.
 - **Storage** — SQLite (`better-sqlite3`) with AES-256-GCM envelope encryption for keys.
+
+## Design Principles for Agent Builders
+
+If you're building an AI agent on top of FreeLLMAPI, keep these principles in mind:
+
+- **Tools on-demand, disabled by default if not configured.** A tool or skill that is loaded but not fully configured (missing API key, uninstalled dependency, unverified endpoint) will waste tokens every turn as the agent attempts to call it, fails, and retries. Only enable what you have verified to work. This mirrors the Hermes Agent community's finding: 62 built-in skills + 21 tools can consume 14K tokens (82% of context) on a fresh install if left fully enabled. The fix is not "use a bigger context window" — it's "don't load what you don't need."
+- **Context handoff is a last resort, not a feature.** Compaction and handoff exist because the upstream model ran out of room. The real win is preventing the context from growing in the first place: cache tool results, compress trajectories early, and prefer cheap models for simple sub-tasks.
 
 ## Context Handoff
 

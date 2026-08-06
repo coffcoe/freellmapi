@@ -12,6 +12,7 @@ import { fallbackRouter } from './routes/fallback.js';
 import { profilesRouter } from './routes/profiles.js';
 import { embeddingsRouter } from './routes/embeddings.js';
 import { mediaRouter } from './routes/media.js';
+import { configRouter } from './routes/config.js';
 import { analyticsRouter } from './routes/analytics.js';
 import { healthRouter } from './routes/health.js';
 import { settingsRouter } from './routes/settings.js';
@@ -102,6 +103,10 @@ export function createApp(config?: Config) {
   app.use('/api/fallback', requireAuth, fallbackRouter);
   app.use('/api/embeddings', requireAuth, embeddingsRouter);
   app.use('/api/media', requireAuth, mediaRouter);
+  // Mount config back on both authenticated and public paths
+  // /api/config requires dashboard login; /v1/config uses unified API key
+  app.use('/api/config', requireAuth, configRouter);
+  app.use('/v1/config', configRouter);
   app.use('/api/analytics', requireAuth, analyticsRouter);
   app.use('/api/health', requireAuth, healthRouter);
   app.use('/api/settings', requireAuth, settingsRouter);

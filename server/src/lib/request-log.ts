@@ -53,14 +53,18 @@ export function logRequest(
   // analytics split pinned vs auto traffic and detect failover overrides
   // (requested_model set but != model_id).
   requestedModel: string | null = null,
+  // Calling client/app identifier (from the x-client-tag request header), or
+  // null when the client does not self-identify. Used to attribute auto-traffic
+  // to its source during quota investigations (P2-a).
+  clientTag: string | null = null,
 ) {
   try {
     const db = getDb();
     const tx = db.transaction(() => {
       const insert = db.prepare(`
-        INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, ttfb_ms, requested_model)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error, ttfbMs, requestedModel);
+        INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, ttfb_ms, requested_model, client_tag)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error, ttfbMs, requestedModel, clientTag);
 
       const createdAt = db.prepare(`SELECT created_at FROM requests WHERE id = ?`).get(insert.lastInsertRowid) as { created_at: string } | undefined;
       const hour = hourKey(createdAt?.created_at ?? new Date().toISOString().slice(0, 19).replace('T', ' '));
@@ -88,7 +92,46 @@ export function logRequest(
     tx();
 
     pruneRequestAnalytics({ db });
+
+    // Fire-and-forget POST to local token tracker (port 3003).
+    // Only for successful completions with actual token data; errors and
+    // zero-token entries are skipped. Non-blocking — never slows the caller.
+    if (status === 'success' && (inputTokens > 0 || outputTokens > 0)) {
+      notifyTracker(platform, modelId, inputTokens, outputTokens);
+    }
   } catch (e) {
     console.error('Failed to log request:', e);
   }
+}
+
+/**
+ * Fire-and-forget POST to the local tracker.py Flask server.
+ * Deliberately non-blocking: we do not await the fetch, and a 300ms
+ * timeout caps the overhead. If the tracker is not running, the request
+ * silently fails after 300ms with zero impact on the proxy.
+ */
+function notifyTracker(
+  platform: string,
+  modelId: string,
+  inputTokens: number,
+  outputTokens: number,
+): void {
+  const url = 'http://localhost:3003/api/log';
+  const body = JSON.stringify({
+    platform,
+    model: modelId,
+    prompt_tokens: inputTokens,
+    completion_tokens: outputTokens,
+  });
+
+  // Fire-and-forget via AbortController with a 300ms timeout.
+  // Promise is explicitly un-awaited — the caller never blocks.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 300);
+  fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+    signal: controller.signal,
+  }).catch(() => {}).finally(() => clearTimeout(timer));
 }

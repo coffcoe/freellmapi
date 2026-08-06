@@ -15,6 +15,12 @@ export interface NormalizedModel {
   enabled: number;
   contextWindow: number | null;
   intel: number;
+  category: string | null;
+  lastVerifiedAt: string | null;
+  probeStatus: number;
+  rateLimit: string;
+  tier: string;
+  requiresCreditCard: boolean;
 }
 
 export interface ModelListing {
@@ -41,16 +47,28 @@ export function buildModelListing(): ModelListing {
   if (isUnifyEnabled()) {
     // Unify ON: one entry per logical model group. Pull per-row availability +
     // context keyed by db id, then aggregate over each group's members.
-    type AvailRow = { id: number; platform: string; intelligence_rank: number; context_window: number | null; enabled: number; available: number };
+    type AvailRow = { id: number; platform: string; intelligence_rank: number; context_window: number | null; enabled: number; available: number; category: string | null; last_verified_at: string | null; probe_status: number; rpm_limit: number | null; rpd_limit: number | null; tpm_limit: number | null; tpd_limit: number | null; paid_input_per_m: number | null; paid_output_per_m: number | null };
     const rows = db.prepare(`
       SELECT m.id, m.platform, m.intelligence_rank, m.context_window,
-             m.enabled AS enabled, ${availableExpr} AS available
+             m.enabled AS enabled, ${availableExpr} AS available,
+             m.category, m.last_verified_at, m.probe_status,
+             m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit,
+             m.paid_input_per_m, m.paid_output_per_m
       FROM models m
     `).all() as AvailRow[];
     const byId = new Map(rows.map(r => [r.id, r]));
     allListed = getModelGroups().map(g => {
       const infos = g.members.map(m => byId.get(m.model_db_id)).filter(Boolean) as AvailRow[];
       const ctxs = infos.map(i => i.context_window).filter((c): c is number => c != null);
+      const rep = infos[0]; // use first representative for category/tier/rateLimit
+      const rateLimit = [
+        rep?.rpm_limit ? `${rep.rpm_limit} RPM` : null,
+        rep?.rpd_limit ? `${rep.rpd_limit} RPD` : null,
+        rep?.tpm_limit ? `${rep.tpm_limit} TPM` : null,
+        rep?.tpd_limit ? `${rep.tpd_limit} TPD` : null,
+      ].filter(Boolean).join(' / ') || 'unknown';
+      const tier = rep?.paid_input_per_m != null || rep?.paid_output_per_m != null ? 'paid' : 'free';
+      const requiresCreditCard = rep?.platform === 'nvidia' || rep?.platform === 'groq' || rep?.platform === 'mistral';
       return {
         id: g.canonicalId,
         name: g.groupLabel,
@@ -59,17 +77,29 @@ export function buildModelListing(): ModelListing {
         enabled: infos.some(i => i.enabled === 1) ? 1 : 0,
         contextWindow: ctxs.length ? Math.max(...ctxs) : null,
         intel: infos.length ? Math.min(...infos.map(i => i.intelligence_rank)) : Number.MAX_SAFE_INTEGER,
+        category: rep?.category ?? 'chat',
+        lastVerifiedAt: rep?.last_verified_at ?? null,
+        probeStatus: rep?.probe_status ?? 0,
+        rateLimit,
+        tier,
+        requiresCreditCard,
       };
     });
   } else {
     // Unify OFF: one entry per model_id (dedup picks the available, smartest
     // representative row).
     const models = db.prepare(`
-      SELECT platform, model_id, display_name, context_window, enabled, available, intelligence_rank, id
+      SELECT platform, model_id, display_name, context_window, enabled, available, intelligence_rank, id,
+             category, last_verified_at, probe_status,
+             rpm_limit, rpd_limit, tpm_limit, tpd_limit,
+             paid_input_per_m, paid_output_per_m
       FROM (
         SELECT m.platform, m.model_id, m.display_name, m.context_window, m.intelligence_rank, m.id,
                m.enabled AS enabled,
                ${availableExpr} AS available,
+               m.category, m.last_verified_at, m.probe_status,
+               m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit,
+               m.paid_input_per_m, m.paid_output_per_m,
                ROW_NUMBER() OVER (
                  PARTITION BY m.model_id
                  ORDER BY ${availableExpr} DESC, m.intelligence_rank ASC, m.id ASC
@@ -77,12 +107,28 @@ export function buildModelListing(): ModelListing {
         FROM models m
       )
       WHERE rn = 1
-    `).all() as (ModelListRow & { intelligence_rank: number; id: number })[];
-    allListed = models.map(m => ({
-      id: m.model_id, name: m.display_name, ownedBy: m.platform,
-      available: m.available, enabled: m.enabled, contextWindow: m.context_window,
-      intel: m.intelligence_rank,
-    }));
+    `).all() as (ModelListRow & { intelligence_rank: number; id: number; category: string | null; last_verified_at: string | null; probe_status: number; rpm_limit: number | null; rpd_limit: number | null; tpm_limit: number | null; tpd_limit: number | null; paid_input_per_m: number | null; paid_output_per_m: number | null })[];
+    allListed = models.map(m => {
+      const rateLimit = [
+        m.rpm_limit ? `${m.rpm_limit} RPM` : null,
+        m.rpd_limit ? `${m.rpd_limit} RPD` : null,
+        m.tpm_limit ? `${m.tpm_limit} TPM` : null,
+        m.tpd_limit ? `${m.tpd_limit} TPD` : null,
+      ].filter(Boolean).join(' / ') || 'unknown';
+      const tier = m.paid_input_per_m != null || m.paid_output_per_m != null ? 'paid' : 'free';
+      const requiresCreditCard = m.platform === 'nvidia' || m.platform === 'groq' || m.platform === 'mistral';
+      return {
+        id: m.model_id, name: m.display_name, ownedBy: m.platform,
+        available: m.available, enabled: m.enabled, contextWindow: m.context_window,
+        intel: m.intelligence_rank,
+        category: m.category ?? 'chat',
+        lastVerifiedAt: m.last_verified_at ?? null,
+        probeStatus: m.probe_status ?? 0,
+        rateLimit,
+        tier,
+        requiresCreditCard,
+      };
+    });
   }
 
   // Stable order: usable first, then enabled, then smartest, then name.
