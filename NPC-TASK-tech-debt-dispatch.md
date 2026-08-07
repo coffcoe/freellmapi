@@ -39,7 +39,10 @@
 | **TD-026** | **`models.tags` 三格式并存（写侧）** | **P1** | **NPC** | 数据层 + catalog 写侧 |
 | **TD-027** | **`models.category` 覆盖不足** | **P2** | **NPC** | 数据层 |
 
-**派给 NPC 的共 6 项**：TD-012a、TD-012b、TD-013（仅分析）、TD-014a、TD-022、TD-026、TD-027。
+**派给 NPC 的共 7 项**：TD-012a、TD-012b、TD-013（仅分析）、TD-014a、TD-022、TD-026、TD-027。
+
+> 另有 **1 项独立复核任务**（不在上表内）：`router.ts` +141 行事后复核，见 `NPC-REVIEW-scene-routing-router.md`。
+> 故 **NPC 侧当前待办合计 8 项** = 技术债 7 项 + 复核 1 项。
 
 ---
 
