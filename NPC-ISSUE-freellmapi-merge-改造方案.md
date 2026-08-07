@@ -171,3 +171,114 @@
 - `server/src/lib/fallback-loop.ts`（上游新文件，已存在于 upstream/main）
 - `server/src/routes/anthropic.ts`（我们的版本，for 循环）
 - `server/src/routes/proxy.ts`（我们的版本，for 循环）
+
+---
+
+## 7. 既有规划与未竟事项（必须一并考虑）
+
+> 以下是我们对 FreeLLMAPI 的**历史规划、未竟事项、已知风险**。你的改造方案必须评估这些事项在 merge 后的可行性，**不能只解决语法冲突，还要回答"merge 后这些规划是否还能继续推进"**。
+
+### 7.1 中期演进：LiteLLM 混合架构（ADR-002 后续行动）
+
+- **来源**：`architecture-overview/adr/ADR-002-freellmapi-resilience-architecture.md`（已采纳，2026-07-10）
+- **现状**：当前保留自研入口，仅做声明式固化（主模型 + auto 回退链）。
+- **未竟事项**：
+  - [ ] （可选中期）把 FreeLLMAPI 多提供商接入/回退层借 LiteLLM 轮子，入口不变
+  - [ ] （可选）把 invalid/error 状态 key 从 fallback 彻底降级（当前留作休眠兜底）
+- **对你的方案的影响**：
+  - 如果上游已引入类似 LiteLLM 的抽象层，评估是否值得**直接采用上游方案**而非继续自研。
+  - 如果上游没有，评估我们的自研接入/回退层与上游 `runFallbackLoop` 的**兼容性**。
+
+### 7.2 Phase 2 Pipeline 集成（LL-PHASE2-001）
+
+- **来源**：`shared/lessons-learned/LL-PHASE2-001-free-llmapi-integration-2026-08-01.md`
+- **需求**：Phase 2 "反思 QA" Pipeline 需要调用 FreeLLMAPI，涉及 vault 凭证管理（API Key + 主密码）。
+- **现状**：seedling，待实现。vault 集成因 openssl 缺失暂时用 Node.js 脚本绕过。
+- **对你的方案的影响**：
+  - merge 后 API 路由是否有 breaking change？Phase 2 Pipeline 的调用方式是否受影响？
+  - 如果上游引入了新的认证/调用方式，评估是否简化 Phase 2 集成。
+
+### 7.3 catalog-sync 恢复决策（FLA-QUOTA-WATCH）
+
+- **来源**：`_active-tasks.md` FLA-QUOTA-WATCH
+- **现状**：`catalog-sync.ts` UPDATE 已移除 `rpd_limit`（#P2-b），rebuild 生效。`automation-1784880302906`（模型同步）现可安全恢复，但**恢复为领航员决策，未自动执行**。
+- **对你的方案的影响**：
+  - merge 后 `catalog-sync.ts` 是否有进一步改动？是否会影响我们的 `rpd_limit` 持久化策略？
+  - 上游是否引入了新的 catalog 同步机制？如果有，评估是否替换我们的修复。
+
+### 7.4 Ostrom 本地自治率限（ Tragedy of Commons 解决方案）
+
+- **来源**：`shared/discussions/agent-grey-fox/2026-08-06-book-to-skill-phase1-执行报告.md`
+- **观点**：FreeLLMAPI quota/token pool 是典型 Tragedy of Commons，解决方案不是统一排队争抢，而是**每个 agent 自带 fallback provider + rate limit**（本地自治）。
+- **对你的方案的影响**：
+  - 评估上游的 `runFallbackLoop` + `clientGone` + in-flight leases 是否已实现"本地自治率限"？
+  - 如果没有，我们的改造是否应保留/增强本地自治能力？
+
+### 7.5 skillopt 试点（freellmapi 评测集）
+
+- **来源**：`_active-tasks.md` B 任务
+- **现状**：skillopt skill 已建，freellmapi 评测集就绪（7/8 条），**试点优化待领航员确认**。
+- **对你的方案的影响**：
+  - merge 后是否需要更新评测集？
+  - 上游新功能（如 in-flight leases、cooldown-probe）是否应纳入评测集？
+
+### 7.6 设备验证（LL-INFRA-002-6）
+
+- **来源**：`_active-tasks.md` LL-INFRA-002-6
+- **现状**：验证所有设备调用 FreeLLMAPI 正常，**转信天翁恢复后**执行。
+- **对你的方案的影响**：
+  - merge 后如果路由逻辑大变，设备验证清单是否需要更新？
+
+---
+
+## 8. 最终交付格式
+
+```markdown
+# MERGE-REFACTOR-PLAN.md
+
+## 摘要
+- 改造文件数：X
+- 预计冲突面：从 20 文件降到 Y 文件
+- 核心定制保全率：Z%
+- **既有规划兼容性**：A/B/C/D/E/F 各项在 merge 后的可行性评估
+
+## 逐文件方案
+
+### 1. anthropic.ts
+- 改造前：for 循环（L393-L631）
+- 改造后：runFallbackLoop + dispatch 回调
+- 保留定制：xxx
+- 删除代码：xxx
+- 新增代码：xxx
+- 风险点：xxx
+- **对既有规划的影响**：xxx（如 Phase 2 Pipeline 集成是否受影响）
+
+### 2. proxy.ts
+...
+
+### 3. router.ts / ratelimit.ts / health.ts
+...
+
+### 4. 既有规划兼容性矩阵
+
+| 规划项 | 来源 | 当前状态 | merge 后影响 | 建议 |
+|--------|------|----------|-------------|------|
+| LiteLLM 混合架构 | ADR-002 | 可选中期 | 兼容/冲突/ superseded | 继续/调整/放弃 |
+| Phase 2 Pipeline 集成 | LL-PHASE2-001 | seedling | 需调整/无需调整 | 继续/等待 |
+| catalog-sync 恢复 | FLA-QUOTA-WATCH | 待决策 | 需验证/无需调整 | 恢复前验证 |
+| Ostrom 本地自治率限 | 2026-08-06 讨论 | 规划中 | 上游已支持/需自研 | 采用上游/保留自研 |
+| skillopt 试点 | _active-tasks B | 待领航员确认 | 需更新评测集/无需调整 | 更新/维持 |
+| 设备验证 | LL-INFRA-002-6 | 转信天翁后 | 需更新清单/无需调整 | 更新/维持 |
+
+## 实施步骤
+1. ...
+2. ...
+3. ...
+
+## 验证清单
+- [ ] tsc --noEmit 零错误
+- [ ] curl localhost:3001/health 返回 200
+- [ ] /v1/chat/completions 冒烟测试通过
+- [ ] 9 项核心定制 grep 验证存活
+- [ ] 既有规划兼容性矩阵逐项确认
+```
