@@ -231,7 +231,126 @@
 
 ---
 
-## 8. 最终交付格式
+## 8. 新增：上游 `runFallbackLoop` 对 LiteLLM 混合架构的替代分析（P0 决策依据）
+
+> **背景**：ADR-002 规划了"中期把 FreeLLMAPI 接入/回退层借 LiteLLM 轮子"的自研 hybrid 架构。现在上游已引入 926 行的 `fallback-loop.ts` + `runFallbackLoop`，需评估是否值得直接采用上游方案。
+
+### 8.1 上游 `runFallbackLoop` 核心能力清单
+
+| 能力 | 上游实现 | 我们现有实现 | 差异分析 |
+|------|----------|--------------|----------|
+| 统一 retry/fallback loop | ✅ `runFallbackLoop(candidates, dispatch)` | ❌ 每个路由各自 `for (let attempt = 0; ...)` | **上游更统一**，消除重复 |
+| in-flight leases | ✅ 防止并发风暴 | ❌ 无 | **上游独有**，解决高并发下的级联失败 |
+| cooldown-probe recovery | ✅ provider 冷却后自动探测恢复 | ⚠️ 仅 `setCooldown` + 定时 catalog-sync | **上游更主动** |
+| callback dispatch | ✅ `logFailure`, `onFatal`, `onRoutingExhausted`, `onExhausted` | ⚠️ 散落在各路由的 `recordRateLimitHit`, `setCooldown`, `learnLimitFromError` | **上游更结构化** |
+| client abort detection | ✅ `clientGone/clientAbort` | ✅ `clientAborted` + `res.on('close')` | **等价**，上游已覆盖 |
+| provider-specific pre-processing | ❌ 无 | ✅ `truncateMessagesForGithub`, `inferClientTag` | **我们必须保留** |
+| quota exhaustion filter | ❌ 无（仅 `onRoutingExhausted` 回调） | ✅ `filterExhaustedQuota`（精确 `(platform,key_id)` 维度） | **我们的更精细**，需作为 pre-check 保留 |
+| high-value model protection | ❌ 无 | ✅ `filterHighValueIfLarge`（大请求保护稀缺模型） | **我们必须保留** |
+| unbounded provider cooldown cap | ❌ 无（上游可能用固定 cooldown） | ✅ `NO_LIMIT_COOLDOWN_CAP_MS = 10min` | **需注入上游 cooldown 逻辑** |
+
+### 8.2 对 LiteLLM 混合架构的评估
+
+**结论：上游 `runFallbackLoop` **已足够好**，可以**直接替代** ADR-002 规划的 LiteLLM 混合架构。**
+
+**理由**：
+1. **统一抽象层已存在**：上游提供了完整的 retry/fallback 基础设施，不需要额外引入 LiteLLM 作为依赖。
+2. **in-flight leases + cooldown-probe**：这两个特性已经解决了我们规划中"本地自治率限"的核心需求（Ostrom 方案），不需要自研。
+3. **callback-based 扩展点充足**：`logFailure`/`onFatal`/`onRoutingExhausted` 提供了足够的钩子注入我们的定制逻辑。
+4. **减少外部依赖**：避免引入 LiteLLM 这个额外的依赖和抽象层，降低维护成本。
+
+**代价**：
+1. 需要重构 `anthropic.ts` / `proxy.ts` 的循环逻辑为 `runFallbackLoop` 风格。
+2. 需要将我们的 9 项定制适配到 upstream 的 callback/pre-check 模型中。
+3. 需要修改 upstream 的 cooldown 逻辑以支持 `NO_LIMIT_COOLDOWN_CAP_MS`。
+
+### 8.3 改造后架构对比
+
+```
+改造前（当前）：
+  anthropic.ts: for 循环 → router → provider
+  proxy.ts: for 循环 → router → provider
+  (各路由各自实现 retry/fallback)
+
+改造后（采用上游 runFallbackLoop）：
+  anthropic.ts: runFallbackLoop(candidates, dispatch) → router → provider
+  proxy.ts: runFallbackLoop(candidates, dispatch) → router → provider
+  (统一抽象，定制逻辑通过 callbacks/pre-checks 注入)
+
+LiteLLM 混合架构（已废弃）：
+  anthropic.ts → LiteLLM Router → provider
+  proxy.ts → LiteLLM Router → provider
+  (多一层抽象，无必要)
+```
+
+### 8.4 对既有规划的影响汇总
+
+| 规划项 | 来源 | 当前状态 | merge 后影响 | 建议 |
+|--------|------|----------|-------------|------|
+| **LiteLLM 混合架构** | ADR-002 | 可选中期 | **Superseded**（上游已提供等价能力） | **放弃**，直接采用上游 `runFallbackLoop` |
+| Phase 2 Pipeline 集成 | LL-PHASE2-001 | seedling | API 路由不变（`/v1/chat/completions` 等），**无需调整** | 继续推进 |
+| catalog-sync 恢复 | FLA-QUOTA-WATCH | 待决策 | `catalog-sync.ts` 上游改动不影响我们的 `rpd_limit` 治本修复 | 恢复前验证即可 |
+| Ostrom 本地自治率限 | 2026-08-06 讨论 | 规划中 | **上游已支持**（in-flight leases + cooldown-probe），无需自研 | 采用上游方案 |
+| skillopt 试点 | _active-tasks B | 待领航员确认 | 需将 upstream 新功能（in-flight leases、cooldown-probe）纳入评测集 | 更新评测集 |
+| 设备验证 | LL-INFRA-002-6 | 转信天翁后 | 路由逻辑大变，**需更新验证清单** | 更新清单后执行 |
+
+---
+
+## 9. 任务拆分策略（最终方案）
+
+> **基于 8.4 分析，采用"拆分任务"策略，而非让 NPC 全权处理。**
+
+### 9.1 任务分配
+
+| 承接方 | 文件 | 工作内容 | 理由 |
+|--------|------|----------|------|
+| **CNB NPC** | `guardrails.ts` / `settings.ts` / `router.ts` / `ratelimit.ts` | 合入上游改动，保留我们的定制（`filterExhaustedQuota`、`NO_LIMIT_COOLDOWN_CAP_MS`、`is_high_value`、`clientAborted` 映射） | 这些文件逻辑相对独立，冲突较少，NPC 可以处理 |
+| **灰狐（本地）** | `anthropic.ts` / `proxy.ts` | 重构为 `runFallbackLoop` + dispatch 回调风格，保留 `truncateMessagesForGithub`、`clientTag`、`rescueInlineToolCalls`、`repairToolArguments`、`sendError`/`sendExhaustion` | 核心路由逻辑，需要精细控制，避免破坏现有功能 |
+| **灰狐（本地）** | 整体验证 | tsc 编译、冒烟测试、9 项定制 grep 验证、既有规划兼容性逐项确认 | 必须本地验证，不能外包 |
+
+### 9.2 NPC 任务边界（ guardrails.ts / settings.ts / router.ts / ratelimit.ts ）
+
+**NPC 必须做的**：
+1. 分析上游 `router.ts` / `ratelimit.ts` / `health.ts` 的新功能（in-flight leases、cooldown-probe recovery）
+2. 评估我们的定制（`filterExhaustedQuota`、`NO_LIMIT_COOLDOWN_CAP_MS`、`is_high_value`）与上游新逻辑的兼容性
+3. 给出保留我们定制的具体 diff 策略（如：保留我们的函数，合入上游的新辅助函数）
+4. 输出 `MERGE-REFACTOR-PLAN.md` 的 §3 部分（router.ts / ratelimit.ts / health.ts 方案）
+
+**NPC 不能做的**：
+1. 不能修改 `anthropic.ts` / `proxy.ts`（灰狐处理）
+2. 不能删除任何我们的定制函数
+3. 不能直接 push 代码
+
+### 9.3 灰狐任务边界（anthropic.ts / proxy.ts）
+
+**灰狐必须做的**：
+1. 将 `anthropic.ts` 的 `for` 循环改造成 `runFallbackLoop` + dispatch 回调
+2. 将 `proxy.ts` 的两个路由（`/chat/completions`、`/completions`）改造成 `runFallbackLoop`
+3. 保留并适配以下定制：
+   - `clientAborted` → 映射到 upstream `clientGone/clientAbort`
+   - `truncateMessagesForGithub` → 保留在 dispatch 前
+   - `inferClientTag` → 保留
+   - `rescueInlineToolCalls` / `repairToolArguments` → 保留在 dispatch 回调中
+   - `sendError` / `sendExhaustion` → 映射到 upstream `onFatal` / `onRoutingExhausted`
+4. 整体验证（tsc、冒烟测试、grep 验证）
+
+### 9.4 实施顺序
+
+```
+Week 1:
+  Day 1-2: CNB NPC 完成 guardrails.ts/settings.ts/router.ts/ratelimit.ts 方案
+  Day 3-4: 灰狐 review NPC 方案，提出修改意见
+  Day 5: NPC 根据意见修改方案，最终确认
+
+Week 2:
+  Day 1-3: 灰狐实施 anthropic.ts/proxy.ts 重构（本地 branch，不依赖 NPC）
+  Day 4: 灰狐合并 NPC 的 router.ts/ratelimit.ts 改动
+  Day 5: 整体验证（tsc + 冒烟测试 + grep 验证 + 既有规划兼容性确认）
+```
+
+---
+
+## 10. 最终交付格式（更新）
 
 ```markdown
 # MERGE-REFACTOR-PLAN.md
@@ -241,10 +360,11 @@
 - 预计冲突面：从 20 文件降到 Y 文件
 - 核心定制保全率：Z%
 - **既有规划兼容性**：A/B/C/D/E/F 各项在 merge 后的可行性评估
+- **LiteLLM 替代结论**：采用上游 `runFallbackLoop`，放弃 LiteLLM 混合架构
 
 ## 逐文件方案
 
-### 1. anthropic.ts
+### 1. anthropic.ts（灰狐处理）
 - 改造前：for 循环（L393-L631）
 - 改造后：runFallbackLoop + dispatch 回调
 - 保留定制：xxx
@@ -253,22 +373,22 @@
 - 风险点：xxx
 - **对既有规划的影响**：xxx（如 Phase 2 Pipeline 集成是否受影响）
 
-### 2. proxy.ts
+### 2. proxy.ts（灰狐处理）
 ...
 
-### 3. router.ts / ratelimit.ts / health.ts
+### 3. router.ts / ratelimit.ts / health.ts（NPC 处理）
 ...
 
 ### 4. 既有规划兼容性矩阵
 
 | 规划项 | 来源 | 当前状态 | merge 后影响 | 建议 |
 |--------|------|----------|-------------|------|
-| LiteLLM 混合架构 | ADR-002 | 可选中期 | 兼容/冲突/ superseded | 继续/调整/放弃 |
-| Phase 2 Pipeline 集成 | LL-PHASE2-001 | seedling | 需调整/无需调整 | 继续/等待 |
-| catalog-sync 恢复 | FLA-QUOTA-WATCH | 待决策 | 需验证/无需调整 | 恢复前验证 |
-| Ostrom 本地自治率限 | 2026-08-06 讨论 | 规划中 | 上游已支持/需自研 | 采用上游/保留自研 |
-| skillopt 试点 | _active-tasks B | 待领航员确认 | 需更新评测集/无需调整 | 更新/维持 |
-| 设备验证 | LL-INFRA-002-6 | 转信天翁后 | 需更新清单/无需调整 | 更新/维持 |
+| LiteLLM 混合架构 | ADR-002 | 可选中期 | Superseded | 放弃，采用上游 runFallbackLoop |
+| Phase 2 Pipeline 集成 | LL-PHASE2-001 | seedling | 无需调整 | 继续 |
+| catalog-sync 恢复 | FLA-QUOTA-WATCH | 待决策 | 无需调整 | 恢复前验证 |
+| Ostrom 本地自治率限 | 2026-08-06 讨论 | 规划中 | 上游已支持 | 采用上游 |
+| skillopt 试点 | _active-tasks B | 待领航员确认 | 需更新评测集 | 更新 |
+| 设备验证 | LL-INFRA-002-6 | 转信天翁后 | 需更新清单 | 更新 |
 
 ## 实施步骤
 1. ...
@@ -281,4 +401,27 @@
 - [ ] /v1/chat/completions 冒烟测试通过
 - [ ] 9 项核心定制 grep 验证存活
 - [ ] 既有规划兼容性矩阵逐项确认
+- [ ] LiteLLM 替代方案确认（runFallbackLoop 功能覆盖评估）
 ```
+
+---
+
+## 11. guardrails
+
+- **不要直接 push 代码**，只出方案文档（`MERGE-REFACTOR-PLAN.md`）。
+- **不要删除**任何我们的定制函数，即使你认为"上游已有等价实现"。
+- **不要动** `CUSTOM-PATCHES.md`。
+- 如果某个定制与上游新逻辑**确实冲突**，明确写出冲突点和**两种兼容方案**，让我们决策。
+- 如果某个上游新功能（如 in-flight leases）与我们现有逻辑**不兼容**，给出 fallback 方案。
+- **NPC 只处理 guardrails.ts/settings.ts/router.ts/ratelimit.ts**，**不要碰 anthropic.ts/proxy.ts**（灰狐处理）。
+
+---
+
+## 12. 参考文件
+
+- `CUSTOM-PATCHES.md`（必须读）
+- `server/src/lib/fallback-loop.ts`（上游新文件，已存在于 upstream/main）
+- `server/src/routes/anthropic.ts`（我们的版本，for 循环）
+- `server/src/routes/proxy.ts`（我们的版本，for 循环）
+
+---
