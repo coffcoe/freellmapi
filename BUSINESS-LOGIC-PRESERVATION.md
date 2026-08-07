@@ -52,7 +52,7 @@
 
 ---
 
-## 3. 唯一缺口：场景路由丢失（P0 · 待回填）
+## 3. 唯一缺口：场景路由丢失（P0 · ✅ 已回填 2026-08-07）
 
 ### 3.1 旧逻辑（来源：`f01cdc3` `proxy.ts` L295-466、L1433-1466）
 - `detectCategoryScene(messages, hasTools)`：从消息内容推断场景 `agent / vision / coding / long-context / reasoning / speed`。
@@ -76,6 +76,62 @@
    - 单测覆盖 6 类场景识别 + `score += 2` 偏置生效；
    - `tsc --noEmit` EXIT 0；
    - 回归：高价值模型在 large 请求仍被 `filterHighValueIfLarge` 剔除，场景偏好不与之冲突。
+
+### 3.4 落地实况（[执行层] · 2026-08-07）
+
+**形式变化**：检测（纯函数）与评分（DB 感知）彻底分离，偏置折叠进 `orderChain` 既有排序，而非在 `routeRequest` 之前预排序 chain。
+
+| 文件 | 角色 |
+|------|------|
+| `server/src/lib/scene.ts`（新增） | 纯检测：`detectCategoryScene` / `detectSceneTags` / `detectScene` / `normalizeNetworkTier` / `isEmptyScene`。零 DB、零 req 依赖 |
+| `server/src/services/router.ts` | `parseModelTags` / `loadSceneAttrs` / `sceneBiasScore` + `orderChain` 双分支注入；`routeRequest` 新增可选尾参 `scene?: SceneSignal` |
+| `server/src/routes/proxy.ts` | `/completions` 与 `/chat/completions` 两处接入，**仅 auto 路由**（`isAutoModel`）生效 |
+| `server/src/db/migrations/20260807_000001_scene_routing_columns.ts`（新增） | 补声明 `models.network_tier` / `models.tags` |
+| `server/src/__tests__/services/scene-routing.test.ts`（新增） | 30 例，全绿 |
+
+**功能保全**：三层权重与旧版一致 —— L1 `network_tier` +4 ／ L2 `category` +2 ／ L3 每个命中 tag +1。
+
+**回填过程中发现并修复的 4 个既有缺陷**（旧实现即已存在，非本次引入）：
+
+| # | 缺陷 | 后果 | 处置 |
+|---|------|------|------|
+| B-1 | priority 分支为**升序**（小者优先），旧回填草案用 `+ bias` | 命中场景的模型反被**降权**，偏好方向完全颠倒 | 改为 `- bias`；变异测试（翻回 `+`）确认 3 个用例转红 |
+| B-2 | bandit `combineScore ∈ [0,1]`，直接 `+2` | 软偏好变**硬覆盖**，并压过 `rateLimit` 限流护栏，可能持续路由到被限流模型 | 引入 `SCENE_BIAS_UNIT = 0.02`，总上限 ≈0.2，够破近似平局、不够翻盘健康度 |
+| B-3 | 中文线索被包在 `/\b(长文档｜论文…)\b/` 内 | JS `\b` 只对 `[A-Za-z0-9_]` 生效，**整条中文识别静默失效** | 中文线索改 `includes()`，单测含 6 条中文回归 |
+| B-4 | `models.tags` 存在 3 种互斥格式（JSON 数组／裸 CSV／对象数组），旧代码 `JSON.parse` + catch→`[]` | 147 行中约 90% 的 tags 静默不参与评分，L3 层近乎死层 | `parseModelTags` 容错三格式；单测覆盖 |
+
+**新增边界**：场景偏好**仅对 auto 路由生效**。pin 指定模型或 unified group 是客户端显式选择，重排会违背其意图。
+
+**验收结果**：`tsc --noEmit` EXIT 0；`scene-routing.test.ts` 30/30 通过；变异测试证明用例有鉴别力（非空跑）。
+
+**全量回归对比**（隔离"既有失败"与"本次引入"）：
+
+| 指标 | 基线 `3f5a7cf`（stash 后干净树） | 含本次改动 | 判定 |
+|------|------------------------------|-----------|------|
+| 失败用例 | 48 | 48 | 持平，**零新增回归** |
+| 失败文件 | 14 | 14 | 持平 |
+| 通过用例 | 1372 | 1402 | +30（= 本次新增测试数） |
+| 总用例 | 1420 | 1450 | +30 |
+
+48 项既有失败归属 **TD-012**（merge 后未跑集成测试遗留），分布见 `TECH-DEBT-INVENTORY.md`；其中 `roundtrip.test.ts` 2 例的根因已定位为 `2b4a73c` 注册迁移时未同步测试期望 + 两个迁移 `down()` 未实现，已拆为 TD-012a / TD-012b 派发。
+
+### 3.5 协作边界说明（[执行层] · 诚实标注）
+
+`NPC-ISSUE-freellmapi-merge-改造方案.md` §9.1 约定：`router.ts` 归 **CNB NPC**，`proxy.ts` / `anthropic.ts` 归灰狐。
+
+本次回填**违反了该边界** —— `router.ts` 被灰狐改动 +141 行（场景评分三层逻辑、`parseModelTags`、`loadSceneAttrs`、`orderChain` 双分支注入）。
+
+| 文件 | 行数 | 约定归属 | 判定 |
+|------|------|---------|------|
+| `server/src/services/router.ts` | +141 | **CNB NPC** | ❌ 越界 |
+| `server/src/routes/proxy.ts` | +22 | 灰狐 | ✅ 本分 |
+| `server/src/lib/scene.ts`（新增） | — | 分工表未覆盖 | ⚠️ 灰色 |
+
+**根因**：跨会话接力时，上一轮会话摘要未保留 §9.1 的任务边界表，接力方只依据摘要行动、未回读分工文档。
+
+**处置**（领航员 2026-08-07 裁定）：代码照常合入，但 `router.ts` 部分**必须经 NPC 事后复核**才算闭环 → `NPC-REVIEW-scene-routing-router.md`。剩余技术债按 §9.1 边界重新分派 → `NPC-TASK-tech-debt-dispatch.md`。
+
+**流程教训（固化）**：会话摘要会丢失协作边界。跨会话接力的**第一步必须回读任务分工文档**，不能只信摘要。
 
 ---
 

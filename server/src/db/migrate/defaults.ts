@@ -17,6 +17,7 @@ import * as modelSourceProvenance from '../migrations/20260726_000003_model_sour
 import * as mediaModelMeta from '../migrations/20260726_000004_media_model_meta.js';
 import * as requestServedModel from '../migrations/20260726_000005_request_served_model.js';
 import * as attemptErrorSummary from '../migrations/20260726_000006_attempt_error_summary.js';
+import * as sceneRoutingColumns from '../migrations/20260807_000001_scene_routing_columns.js';
 
 export interface MigrationModule {
   up(db: Db): void;
@@ -46,6 +47,7 @@ export const MODEL_SOURCE_PROVENANCE_FILENAME = '20260726_000003_model_source_pr
 export const MEDIA_MODEL_META_FILENAME = '20260726_000004_media_model_meta.ts';
 export const REQUEST_SERVED_MODEL_FILENAME = '20260726_000005_request_served_model.ts';
 export const ATTEMPT_ERROR_SUMMARY_FILENAME = '20260726_000006_attempt_error_summary.ts';
+export const SCENE_ROUTING_COLUMNS_FILENAME = '20260807_000001_scene_routing_columns.ts';
 
 export const DEFAULT_MIGRATIONS: readonly DefaultMigration[] = [
   { filename: LEGACY_BASELINE_FILENAME, module: legacyBaseline },
@@ -66,4 +68,5 @@ export const DEFAULT_MIGRATIONS: readonly DefaultMigration[] = [
   { filename: MEDIA_MODEL_META_FILENAME, module: mediaModelMeta },
   { filename: REQUEST_SERVED_MODEL_FILENAME, module: requestServedModel },
   { filename: ATTEMPT_ERROR_SUMMARY_FILENAME, module: attemptErrorSummary },
+  { filename: SCENE_ROUTING_COLUMNS_FILENAME, module: sceneRoutingColumns },
 ];
