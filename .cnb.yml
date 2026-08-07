@@ -1,0 +1,15 @@
+# CNB NPC API-触发胶水（freellmapi 版 · 需 push）
+# 与 .cnb.yml 唯一区别：sandbox: false -> 流水线内 CNB_TOKEN 有效，NPC 可 push npc/* 分支。
+# 配套触发时务必传 npc.workMode: true（写权限 scope），否则即便 sandbox:false 也缺写权。
+# 仅 freellmapi Batch1（TD-012a/012b/027 直改代码）使用；其余工作流用 .cnb.yml（sandbox:true）。
+
+api_trigger_npc:
+  - docker:
+      image: cnbcool/default-npc:latest
+    sandbox: false
+    stages:
+      - name: npc go
+        type: npc:go
+        options:
+          systemPrompt: $systemPrompt
+          userPrompt: $userPrompt
