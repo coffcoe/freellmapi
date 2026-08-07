@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
 import { connectDb } from '../../../db/index.js';
+import { DEFAULT_MIGRATIONS } from '../../../db/migrate/defaults.js';
 import { getMigrationStatuses, runMigrations } from '../../../db/migrate/runner.js';
 import { up as runLegacyBaseline } from '../../../db/migrations/20260101_000000_legacy_baseline.js';
 
@@ -9,6 +10,9 @@ const CUSTOM_PROVIDER_MODALITIES_FILENAME = '20260627_000001_custom_provider_mod
 const CATALOG_MODEL_STATE_FILENAME = '20260627_000002_catalog_model_state.ts';
 const REQUEST_AGGREGATES_FILENAME = '20260628_120000_request_aggregates.ts';
 const GITHUB_GPT41_CONTEXT_FILENAME = '20260630_000001_github_gpt41_context.ts';
+const ADD_CATEGORY_TO_MODELS_FILENAME = '20260701_000001_add_category_to_models.ts';
+const ADD_PROBE_FIELDS_FILENAME = '20260701_000002_add_probe_fields.ts';
+const QUOTA_GUARD_COLUMNS_FILENAME = '20260802_000000_quota_guard_columns.ts';
 const REQUEST_CLIENT_INFO_FILENAME = '20260706_000001_request_client_info.ts';
 const CUSTOM_MODEL_TOOL_SUPPORT_FILENAME = '20260706_000002_custom_model_tool_support.ts';
 const PROFILE_CHAIN_BACKFILL_FILENAME = '20260714_000001_profile_chain_backfill.ts';
@@ -19,6 +23,40 @@ const MODEL_SOURCE_PROVENANCE_FILENAME = '20260726_000003_model_source_provenanc
 const MEDIA_MODEL_META_FILENAME = '20260726_000004_media_model_meta.ts';
 const REQUEST_SERVED_MODEL_FILENAME = '20260726_000005_request_served_model.ts';
 const ATTEMPT_ERROR_SUMMARY_FILENAME = '20260726_000006_attempt_error_summary.ts';
+const SCENE_ROUTING_COLUMNS_FILENAME = '20260807_000001_scene_routing_columns.ts';
+
+/**
+ * Hardcoded canonical list of applied-migration filenames, in the exact order
+ * DEFAULT_MIGRATIONS declares them (TD-012a).
+ *
+ * This literal is deliberately kept as a NON-derived anchor so the test is not
+ * tautological (comparing a list to itself always passes). The drift-guard test
+ * below re-derives the same order from DEFAULT_MIGRATIONS and fails loudly if
+ * the two ever fall out of sync — i.e. the exact bug this test previously hid
+ * (commit 2b4a73c registered migrations but never updated this expectation)
+ * now surfaces as a hard failure instead of a silent no-op.
+ */
+const EXPECTED_MIGRATION_FILENAMES = [
+  LEGACY_BASELINE_FILENAME,
+  CUSTOM_PROVIDER_MODALITIES_FILENAME,
+  CATALOG_MODEL_STATE_FILENAME,
+  REQUEST_AGGREGATES_FILENAME,
+  GITHUB_GPT41_CONTEXT_FILENAME,
+  ADD_CATEGORY_TO_MODELS_FILENAME,
+  ADD_PROBE_FIELDS_FILENAME,
+  QUOTA_GUARD_COLUMNS_FILENAME,
+  REQUEST_CLIENT_INFO_FILENAME,
+  CUSTOM_MODEL_TOOL_SUPPORT_FILENAME,
+  PROFILE_CHAIN_BACKFILL_FILENAME,
+  KEY_HEALTH_ERROR_FILENAME,
+  COOLDOWN_PROBE_PROVENANCE_FILENAME,
+  REQUEST_ATTEMPTS_FILENAME,
+  MODEL_SOURCE_PROVENANCE_FILENAME,
+  MEDIA_MODEL_META_FILENAME,
+  REQUEST_SERVED_MODEL_FILENAME,
+  ATTEMPT_ERROR_SUMMARY_FILENAME,
+  SCENE_ROUTING_COLUMNS_FILENAME,
+];
 
 interface SchemaRow {
   type: string;
@@ -68,26 +106,20 @@ describe('migration round trip', () => {
       await runMigrations(db, 'up');
 
       expect(getEnabledZenDeadPromoCount(db)).toBe(0);
-      expect(getAppliedMigrationNames(db)).toEqual([
-        LEGACY_BASELINE_FILENAME,
-        CUSTOM_PROVIDER_MODALITIES_FILENAME,
-        CATALOG_MODEL_STATE_FILENAME,
-        REQUEST_AGGREGATES_FILENAME,
-        GITHUB_GPT41_CONTEXT_FILENAME,
-        REQUEST_CLIENT_INFO_FILENAME,
-        CUSTOM_MODEL_TOOL_SUPPORT_FILENAME,
-        PROFILE_CHAIN_BACKFILL_FILENAME,
-        KEY_HEALTH_ERROR_FILENAME,
-        COOLDOWN_PROBE_PROVENANCE_FILENAME,
-        REQUEST_ATTEMPTS_FILENAME,
-        MODEL_SOURCE_PROVENANCE_FILENAME,
-        MEDIA_MODEL_META_FILENAME,
-        REQUEST_SERVED_MODEL_FILENAME,
-        ATTEMPT_ERROR_SUMMARY_FILENAME,
-      ]);
+      expect(getAppliedMigrationNames(db)).toEqual(EXPECTED_MIGRATION_FILENAMES);
     } finally {
       db.close();
     }
+  });
+
+  it('hardcoded expectation stays in sync with DEFAULT_MIGRATIONS (TD-012a drift guard)', () => {
+    // Derived order: any migration registered in DEFAULT_MIGRATIONS that is not
+    // mirrored in the hardcoded EXPECTED_MIGRATION_FILENAMES (or a reorder of
+    // the latter) fails this guard. This turns the exact regression behind
+    // commit 2b4a73c — registering migrations without updating the roundtrip
+    // expectation — into a hard, self-explanatory failure.
+    const derived = DEFAULT_MIGRATIONS.map(migration => migration.filename);
+    expect(EXPECTED_MIGRATION_FILENAMES).toEqual(derived);
   });
 
   it('runs all migrations up, down to baseline, then up to the same schema', async () => {
