@@ -143,7 +143,22 @@
 |--------|----|------|
 | **CNB NPC** | TD-012a / TD-012b / TD-013（仅分析）/ TD-014a / TD-022 / TD-026 / TD-027 | 归属 `router.ts` / `ratelimit.ts` / `guardrails.ts` / `settings.ts` / `db/migrate*` / 数据层 |
 | **灰狐（本地）** | TD-010 / TD-014b / TD-020 / TD-021 / TD-023 / TD-024 + **整体验证** | 归属 `proxy.ts` / `anthropic.ts` / `app.ts` / 文档台账 / web2kb；验证不外包 |
-| **NPC 事后复核** | TD-001 的 `router.ts` 部分（+141 行，灰狐越界所改） | 见 `NPC-REVIEW-scene-routing-router.md` |
+| **NPC 事后复核** | TD-001 的 `router.ts` 部分（+141 行） | 见 `NPC-REVIEW-scene-routing-router.md` |
+
+### NPC 代码权限批次（2026-08-08 领航员裁定放开）
+
+原「NPC 只出方案不改代码」限制已解除（立法前提「NPC 不熟悉本仓」已消失），改为**分级放开**：
+
+| 批次 | 任务 | 权限 | 解锁条件 |
+|------|------|------|---------|
+| 🟢 Batch 1 | TD-012a / TD-012b / TD-027 | **可直接改代码** | 已解锁 |
+| 🟡 Batch 2 | TD-026 / TD-022 | 可改代码 | Batch 1 合并且全量测试基线归零 |
+| 🔴 Batch 3 | TD-014a | 暂只出方案 | 等 `router.ts` 复核结论 + 领航员裁定 |
+| 🔵 常设 | TD-013 | 不改代码 | 口径裁定权归领航员，性质使然 |
+
+交付走 `npc/<任务号>` 分支，**不直推 `merge-upstream`**；灰狐跑全量回归后合并（§9.1「整体验证不外包」不变）。
+
+**分级理由**：① 当前 48 例既有失败使测试基线不可信，红底之上无法归因新回归，故先放解基线的任务；② `router.ts` 刚 +141 行未复核，叠加千行级拆分风险不可控。
 
 派单文档：`NPC-TASK-tech-debt-dispatch.md`、`NPC-REVIEW-scene-routing-router.md`。
 

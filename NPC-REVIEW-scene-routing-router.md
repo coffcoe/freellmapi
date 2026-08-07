@@ -175,6 +175,8 @@ const sceneAttrs = scene && !isEmptyScene(scene) ? loadSceneAttrs(db, chain) : u
 ## 5. guardrails（严格遵守）
 
 - **不要改任何代码**，只出 `NPC-REVIEW-scene-routing-router-REPLY.md`。
+
+  > 📌 **澄清**：2026-08-08 起你在技术债任务上**已获得改代码权限**（见 `NPC-TASK-tech-debt-dispatch.md` §0.0）。但**本文件是复核任务，不适用** —— 复核的价值在于独立视角，改手与审手同一人就失去意义。你的结论会交领航员裁定后，再决定由谁改。
 - **不要碰** `server/src/routes/proxy.ts`、`server/src/routes/anthropic.ts`、`server/src/lib/scene.ts` —— 归灰狐（§9.1）。
 - **不要动** `CUSTOM-PATCHES.md`。
 - 若认为某处必须改，写出**具体 diff 建议 + 两种方案**，由领航员裁定，不要直接改。
