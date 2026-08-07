@@ -1,4 +1,4 @@
-import type Database from 'better-sqlite3';
+import type { Db } from '../db/types.js';
 
 export type CatalogModelKind = 'chat' | 'media';
 
@@ -15,6 +15,7 @@ export interface ModelOverridePatch {
   contextWindow?: number | null;
   supportsVision?: boolean;
   supportsTools?: boolean;
+  enabled?: boolean;
 }
 
 type StoredOverrides = Partial<ModelOverridePatch>;
@@ -32,6 +33,7 @@ const OVERRIDE_COLUMNS: Record<keyof ModelOverridePatch, string> = {
   contextWindow: 'context_window',
   supportsVision: 'supports_vision',
   supportsTools: 'supports_tools',
+  enabled: 'enabled',
 };
 
 function parseOverrides(raw: string | undefined): StoredOverrides {
@@ -45,7 +47,7 @@ function parseOverrides(raw: string | undefined): StoredOverrides {
 }
 
 function toDbValue(key: keyof ModelOverridePatch, value: unknown): unknown {
-  if (key === 'supportsVision' || key === 'supportsTools') return value ? 1 : 0;
+  if (key === 'supportsVision' || key === 'supportsTools' || key === 'enabled') return value ? 1 : 0;
   return value;
 }
 
@@ -59,12 +61,16 @@ function cleanPatch(patch: ModelOverridePatch): StoredOverrides {
   return cleaned;
 }
 
-export function isCatalogManagedModel(row: { platform: string; key_id?: number | null }): boolean {
+export function isCatalogManagedModel(row: { platform: string; key_id?: number | null; source?: string }): boolean {
+  // `source` is the authoritative provenance (models.source, 'catalog'|'user');
+  // callers that select it get an exact answer. The platform/key_id fallback
+  // covers callers that don't have the column in hand.
+  if (row.source === 'user') return false;
   return row.platform !== 'custom' && row.key_id == null;
 }
 
 export function isCatalogModelTombstoned(
-  db: Database.Database,
+  db: Db,
   kind: CatalogModelKind,
   platform: string,
   modelId: string,
@@ -75,7 +81,7 @@ export function isCatalogModelTombstoned(
 }
 
 export function recordCatalogModelTombstone(
-  db: Database.Database,
+  db: Db,
   kind: CatalogModelKind,
   platform: string,
   modelId: string,
@@ -91,7 +97,7 @@ export function recordCatalogModelTombstone(
 }
 
 export function clearCatalogModelTombstone(
-  db: Database.Database,
+  db: Db,
   kind: CatalogModelKind,
   platform: string,
   modelId: string,
@@ -101,7 +107,7 @@ export function clearCatalogModelTombstone(
 }
 
 export function upsertModelOverrides(
-  db: Database.Database,
+  db: Db,
   platform: string,
   modelId: string,
   patch: ModelOverridePatch,
@@ -122,7 +128,7 @@ export function upsertModelOverrides(
 }
 
 export function getModelOverrides(
-  db: Database.Database,
+  db: Db,
   platform: string,
   modelId: string,
 ): StoredOverrides {
@@ -133,12 +139,12 @@ export function getModelOverrides(
 }
 
 export function applyModelOverrides(
-  db: Database.Database,
+  db: Db,
   platform: string,
   modelId: string,
 ): boolean {
   const overrides = getModelOverrides(db, platform, modelId);
-  const keys = Object.keys(overrides) as Array<keyof ModelOverridePatch>;
+  const keys = (Object.keys(overrides) as Array<keyof ModelOverridePatch>).filter(k => k in OVERRIDE_COLUMNS);
   if (keys.length === 0) return false;
 
   const assignments: string[] = [];
@@ -152,7 +158,7 @@ export function applyModelOverrides(
   return true;
 }
 
-export function applyAllModelOverrides(db: Database.Database): number {
+export function applyAllModelOverrides(db: Db): number {
   const rows = db.prepare('SELECT platform, model_id FROM model_overrides').all() as { platform: string; model_id: string }[];
   let applied = 0;
   for (const row of rows) {
@@ -161,13 +167,13 @@ export function applyAllModelOverrides(db: Database.Database): number {
   return applied;
 }
 
-export function deleteTombstonedCatalogModels(db: Database.Database): number {
+export function deleteTombstonedCatalogModels(db: Db): number {
   const chatRows = db.prepare(`
     SELECT m.id, m.platform, m.model_id
       FROM models m
       JOIN catalog_model_tombstones t
         ON t.kind = 'chat' AND t.platform = m.platform AND t.model_id = m.model_id
-     WHERE m.platform != 'custom' AND m.key_id IS NULL
+     WHERE m.platform != 'custom' AND m.key_id IS NULL AND m.source != 'user'
   `).all() as { id: number; platform: string; model_id: string }[];
   const mediaRows = db.prepare(`
     SELECT mm.id

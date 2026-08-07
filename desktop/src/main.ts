@@ -22,15 +22,29 @@ if (!app.requestSingleInstanceLock()) {
 } else {
   let resolvedPort = DEFAULT_PORT;
   let sessionToken = '';
-  // The dashboard owns the theme (its navbar toggle); the popover and the
-  // window vibrancy follow. Last choice persists in config; before the
-  // dashboard has ever reported, fall back to the system appearance —
-  // matching the dashboard's own prefers-color-scheme default.
-  let theme: 'dark' | 'light' =
-    (process.env.FREEAPI_THEME as 'dark' | 'light' | undefined) // dev-only screenshot override
+  // The dashboard owns the theme (its Settings dialog); the popover and the
+  // window vibrancy follow. The persisted choice may be 'system', in which
+  // case themeSource is handed back to the OS so the dashboard's
+  // prefers-color-scheme tracks live appearance changes; `theme` is always
+  // the resolved dark/light the popover snapshot needs.
+  let themeChoice: 'dark' | 'light' | 'system' =
+    (process.env.FREEAPI_THEME as 'dark' | 'light' | 'system' | undefined) // dev-only screenshot override
     ?? loadConfig().theme
-    ?? (nativeTheme.shouldUseDarkColors ? 'dark' : 'light');
-  nativeTheme.themeSource = theme;
+    ?? 'system';
+  nativeTheme.themeSource = themeChoice;
+  let theme: 'dark' | 'light' = themeChoice === 'system'
+    ? (nativeTheme.shouldUseDarkColors ? 'dark' : 'light')
+    : themeChoice;
+  // With a 'system' choice the OS can flip appearance while the dashboard
+  // window (and its reporting preload) is closed — track it here too.
+  nativeTheme.on('updated', async () => {
+    if (themeChoice !== 'system') return;
+    const next = nativeTheme.shouldUseDarkColors ? 'dark' : 'light';
+    if (next === theme) return;
+    theme = next;
+    const { getPopoverWindow } = await import('./popover.js');
+    getPopoverWindow()?.webContents.send('freeapi:refresh');
+  });
   // The dashboard also owns the language (its ⋯-menu selector); the native tray
   // menu and popover follow via the same mirror-and-persist pattern as the theme.
   let locale: NativeLocale = normalizeLocale(
@@ -82,6 +96,7 @@ if (!app.requestSingleInstanceLock()) {
       successRate: successRateToday(),
       hourly: hourlyRequests(),
       loginItem: app.getLoginItemSettings().openAtLogin,
+      version: app.getVersion(),
       theme,
       locale,
       // The popover renderer is a file:// page with no access to the desktop
@@ -89,13 +104,20 @@ if (!app.requestSingleInstanceLock()) {
       strings: nativeStrings(locale),
     };
   });
-  ipcMain.on('freeapi:theme-changed', async (_e, next: 'dark' | 'light') => {
-    if (next !== 'dark' && next !== 'light') return;
-    if (next === theme) return;
-    theme = next;
-    saveConfig({ ...loadConfig(), theme });
-    // Flips the vibrancy materials (popover glass + dashboard backdrop).
-    nativeTheme.themeSource = theme;
+  ipcMain.on('freeapi:theme-changed', async (_e, raw: unknown) => {
+    // Older preloads sent the bare resolved string; current ones send
+    // { resolved, choice } so a 'system' choice can reach nativeTheme.
+    const payload = typeof raw === 'string' ? { resolved: raw } : (raw ?? {}) as { resolved?: unknown; choice?: unknown };
+    const resolved = payload.resolved;
+    if (resolved !== 'dark' && resolved !== 'light') return;
+    const choice: 'dark' | 'light' | 'system' = payload.choice === 'system' ? 'system' : resolved;
+    if (resolved === theme && choice === themeChoice) return;
+    theme = resolved;
+    themeChoice = choice;
+    saveConfig({ ...loadConfig(), theme: themeChoice });
+    // Flips the vibrancy materials (popover glass + dashboard backdrop);
+    // 'system' delegates to the OS appearance.
+    nativeTheme.themeSource = themeChoice;
     const { getPopoverWindow } = await import('./popover.js');
     getPopoverWindow()?.webContents.send('freeapi:refresh');
   });
@@ -115,6 +137,34 @@ if (!app.requestSingleInstanceLock()) {
   ipcMain.handle('freeapi:set-login-item', (_e, open: boolean) => app.setLoginItemSettings({ openAtLogin: open }));
   ipcMain.handle('freeapi:quit', () => app.quit());
 
+  // Flip the LAN-access flag and relaunch so the server rebinds (127.0.0.1 ↔
+  // 0.0.0.0). Enabling shows a one-time warning: the API becomes reachable by
+  // anything that can route to this machine, guarded only by the unified key.
+  async function toggleLanAccess(): Promise<void> {
+    const current = loadConfig().lanAccess ?? false;
+    const enabling = !current;
+    if (enabling) {
+      const { response } = await dialog.showMessageBox({
+        type: 'warning',
+        buttons: ['Enable LAN access', 'Cancel'],
+        defaultId: 1,
+        cancelId: 1,
+        title: 'Allow LAN access',
+        message: 'Expose FreeLLMAPI to your local network?',
+        detail:
+          'The server will bind to 0.0.0.0 so other devices (Tailscale, VMs, ' +
+          'phones on your Wi-Fi) can reach it at http://<this-machine-ip>:' +
+          `${resolvedPort}/v1.\n\nThe API is protected only by your unified ` +
+          'API key. Only do this on a network you trust. The app will restart ' +
+          'to apply the change.',
+      });
+      if (response !== 0) return;
+    }
+    saveConfig({ ...loadConfig(), lanAccess: enabling });
+    app.relaunch();
+    app.quit();
+  }
+
   app.whenReady().then(async () => {
     if (process.platform === 'darwin') app.dock?.hide();
 
@@ -128,18 +178,24 @@ if (!app.requestSingleInstanceLock()) {
       ? path.join(process.resourcesPath, 'client-dist')
       : path.join(repoRoot, 'client/dist');
 
+    // LAN access binds the embedded server to 0.0.0.0 so Tailscale / VMs / other
+    // devices can reach it (#442, #418). Off by default — 127.0.0.1 keeps the
+    // API local-only. The bind host is fixed at listen() time, so the tray
+    // toggle persists the flag and relaunches.
+    const host = cfg.lanAccess ? '0.0.0.0' : '127.0.0.1';
+
     try {
       const { port } = await startServer({
         dbPath,
         clientDist,
-        host: '127.0.0.1',
+        host,
         preferredPort: cfg.port ?? DEFAULT_PORT,
       });
       resolvedPort = port;
       saveConfig({ ...cfg, port });
       sessionToken = ensureSessionToken();
-      const tray = buildTray(port, sessionToken, () => locale);
-      console.log(`[desktop] FreeLLMAPI running on http://127.0.0.1:${port}`);
+      const tray = buildTray(port, sessionToken, () => locale, () => loadConfig().lanAccess ?? false, toggleLanAccess);
+      console.log(`[desktop] FreeLLMAPI running on http://${host}:${port}${cfg.lanAccess ? ' (LAN access enabled)' : ''}`);
 
       // Dev-only UI verification: FREEAPI_SHOT=1 opens the popover and the
       // dashboard, captures both to /tmp, and quits. FREEAPI_SHOT=hold opens

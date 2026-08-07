@@ -32,6 +32,18 @@ export const PREFIX_MAP: Record<string, string> = {
   ROUTEWAY_: 'routeway',
   BAZAARLINK_: 'bazaarlink',
   AINATIVE_: 'ainative',
+  AION_: 'aion',
+  AIONLABS_: 'aion',
+  AION_LABS_: 'aion',
+  REQUESTY_: 'requesty',
+  NAVY_: 'navy',
+  NAVYAI_: 'navy',
+  API_NAVY_: 'navy',
+  NARA_: 'nara',
+  NARAROUTER_: 'nara',
+  BYNARA_: 'nara',
+  SEALION_: 'sealion',
+  SEA_LION_: 'sealion',
   AIHORDE_: 'aihorde',
 };
 
@@ -45,6 +57,18 @@ export const AUTH_JSON_PROVIDER_MAP: Record<string, string> = {
   nvidia: 'nvidia',
   'opencode-zen': 'opencode',
   opencode: 'opencode',
+  aion: 'aion',
+  'aion-labs': 'aion',
+  aionlabs: 'aion',
+  requesty: 'requesty',
+  navy: 'navy',
+  navyai: 'navy',
+  'api-navy': 'navy',
+  nara: 'nara',
+  bynara: 'nara',
+  'nara-router': 'nara',
+  sealion: 'sealion',
+  'sea-lion': 'sealion',
 };
 
 export function detectPlatform(prefix: string): string | null {
@@ -188,6 +212,86 @@ export function parseJson(content: string): Array<{ key: string; value: string }
     .map(([key, value]) => ({ key, value }));
 }
 
+/**
+ * Parse the FreeLLMAPI export JSON format:
+ * { version: 1, exportedAt, source, keys: [{ platform, key, label, baseUrl? }] }
+ * Returns key-value pairs compatible with toParsedKeys().
+ */
+export function parseExportJson(content: string): ParseResult | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    return null;
+  }
+
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    return null;
+  }
+
+  const obj = parsed as Record<string, unknown>;
+  if (!('keys' in obj) || !Array.isArray(obj.keys)) {
+    return null;
+  }
+
+  // Validate it looks like our export format (has version + keys array of objects)
+  const keys = obj.keys as unknown[];
+  if (keys.length > 0 && typeof keys[0] === 'object' && keys[0] !== null && 'platform' in (keys[0] as any) && 'key' in (keys[0] as any)) {
+    const result: ParseResult = { keys: [], skipped: [] };
+    for (const entry of keys) {
+      if (typeof entry !== 'object' || entry === null) continue;
+      const row = entry as Record<string, unknown>;
+      const platform = typeof row.platform === 'string' ? row.platform : null;
+      const keyValue = typeof row.key === 'string' ? row.key : '';
+      const label = typeof row.label === 'string' ? row.label : platform ?? 'imported';
+
+      if (!keyValue.trim()) {
+        result.skipped.push(`${label}: empty key value`);
+        continue;
+      }
+
+      const prefix = platform
+        ? (Object.entries(PREFIX_MAP).find(([, v]) => v === platform)?.[0] ?? `${platform.toUpperCase()}_`)
+        : '';
+      result.keys.push({ rawKey: `${label}=${keyValue}`, prefix, platform });
+    }
+    return result;
+  }
+
+  return null;
+}
+
+/**
+ * Parse CSV format: platform,key,label (with optional header row).
+ */
+export function parseCsv(content: string): Array<{ key: string; value: string }> {
+  const lines = content.split('\n').filter(l => l.trim());
+  if (lines.length === 0) return [];
+
+  const result: Array<{ key: string; value: string }> = [];
+
+  // Skip header row if it looks like a CSV header
+  const startIdx = lines[0]!.toLowerCase().startsWith('platform,') ? 1 : 0;
+
+  for (let i = startIdx; i < lines.length; i++) {
+    const line = lines[i]!;
+    // Simple CSV parsing: split on comma, strip quotes
+    const match = line.match(/^"?([^"]*?)"?,"?([^"]*?)"?(?:,"?([^"]*?)"?)?$/);
+    if (!match) continue;
+
+    const platform = (match[1] ?? '').trim();
+    const key = (match[2] ?? '').trim();
+    const label = (match[3] ?? '').trim() || platform;
+
+    if (!key || !platform) continue;
+
+    const envKey = `${platform.toUpperCase()}_KEY`;
+    result.push({ key: envKey, value: key });
+  }
+
+  return result;
+}
+
 export function parseAuthJson(content: string): ParseResult {
   let parsed: unknown;
   try {
@@ -301,6 +405,11 @@ export function parseKeysFromFile(content: string, filename: string): ParseResul
   const ext = filename.includes('.') ? filename.slice(filename.lastIndexOf('.')).toLowerCase() : '';
   if (ext === '.json' || ext === '.jsonc') {
     const clean = stripTrailingCommas(stripJsoncComments(text));
+
+    // Check for FreeLLMAPI export format first (version + keys array)
+    const exportResult = parseExportJson(clean);
+    if (exportResult) return exportResult;
+
     let parsed: unknown;
     try {
       parsed = JSON.parse(clean);
@@ -311,6 +420,10 @@ export function parseKeysFromFile(content: string, filename: string): ParseResul
       return parseAuthJson(clean);
     }
     return toParsedKeys(parseJson(clean));
+  }
+
+  if (ext === '.csv') {
+    return toParsedKeys(parseCsv(text));
   }
 
   return toParsedKeys(parseDotEnv(text));

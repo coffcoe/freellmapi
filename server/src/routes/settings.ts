@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { getUnifiedApiKey, regenerateUnifiedKey, getSetting, setSetting } from '../db/index.js';
-import { getRequestMaxTokensBudget, getMaxConsecutiveUpstreamFails, SETTING_REQUEST_MAX_TOKENS_BUDGET, SETTING_MAX_CONSECUTIVE_UPSTREAM_FAILS } from '../lib/guardrails.js';
+import { getRequestMaxTokensBudget, getMaxConsecutiveUpstreamFails, SETTING_REQUEST_MAX_TOKENS_BUDGET, SETTING_MAX_CONSECUTIVE_UPSTREAM_FAILS, REQUEST_MAX_TOKENS_BUDGET_SETTING, MAX_CONSECUTIVE_UPSTREAM_FAILS_SETTING } from '../lib/guardrails.js';
 import { applyProxyUrl, applyProxyEnabled, applyProxyBypass, isProxyActive, getProxyUrl, isProxyEnabled, getProxyBypassPlatforms } from '../lib/proxy.js';
 import { getSavedFusionConfig, setSavedFusionConfig, savedFusionConfigSchema, getFusionMaxK } from '../services/fusion.js';
 import { isUnifyEnabled, setUnifyEnabled, getUnifyOverrides, setUnifyOverrides, unifyOverridesSchema } from '../services/model-groups.js';
@@ -72,6 +72,41 @@ settingsRouter.put('/anthropic-map', (req: Request, res: Response) => {
       : (err?.message ?? 'invalid');
     res.status(400).json({ error: { message: `Invalid anthropic model map: ${detail}`, type: 'invalid_request_error' } });
   }
+});
+
+// Get the request guardrails (per-request token budget + failover circuit
+// breaker). Both default to 0 = disabled; see lib/guardrails.ts.
+settingsRouter.get('/guardrails', (_req: Request, res: Response) => {
+  res.json({
+    requestMaxTokensBudget: getRequestMaxTokensBudget(),
+    maxConsecutiveUpstreamFails: getMaxConsecutiveUpstreamFails(),
+  });
+});
+
+const guardrailsPutSchema = z.object({
+  requestMaxTokensBudget: z.number().int().min(0).optional(),
+  maxConsecutiveUpstreamFails: z.number().int().min(0).optional(),
+});
+
+// Update the guardrails. Partial: send just the knob you want to change.
+// Takes effect on the next request — no restart needed. 0 disables a knob.
+settingsRouter.put('/guardrails', (req: Request, res: Response) => {
+  const parsed = guardrailsPutSchema.safeParse(req.body);
+  if (!parsed.success) {
+    const detail = parsed.error.errors.map(e => (e.path.length ? `${e.path.join('.')}: ${e.message}` : e.message)).slice(0, 5).join(', ');
+    res.status(400).json({ error: { message: `Invalid guardrail settings: ${detail}`, type: 'invalid_request_error' } });
+    return;
+  }
+  if (parsed.data.requestMaxTokensBudget !== undefined) {
+    setSetting(REQUEST_MAX_TOKENS_BUDGET_SETTING, String(parsed.data.requestMaxTokensBudget));
+  }
+  if (parsed.data.maxConsecutiveUpstreamFails !== undefined) {
+    setSetting(MAX_CONSECUTIVE_UPSTREAM_FAILS_SETTING, String(parsed.data.maxConsecutiveUpstreamFails));
+  }
+  res.json({
+    requestMaxTokensBudget: getRequestMaxTokensBudget(),
+    maxConsecutiveUpstreamFails: getMaxConsecutiveUpstreamFails(),
+  });
 });
 
 // Get the unified API key

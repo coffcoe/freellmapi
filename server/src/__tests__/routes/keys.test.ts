@@ -103,6 +103,33 @@ describe('Keys API', () => {
     expect(body[0].platform).toBe('groq');
   });
 
+  it('POST /api/keys warns when the platform has no catalog models yet (#438)', async () => {
+    const db = getDb();
+    // Simulate the Agnes case: a registered platform whose models aren't in
+    // this install's catalog tier. Force it by disabling every agnes row (a
+    // fresh migrated DB already has zero agnes models, but be explicit).
+    db.prepare("UPDATE models SET enabled = 0 WHERE platform = 'agnes'").run();
+
+    const { status, body } = await request(app, 'POST', '/api/keys', {
+      platform: 'agnes',
+      key: 'agnes_test_key_123456',
+    });
+    expect(status).toBe(201);
+    expect(body.modelsAvailable).toBe(0);
+    expect(body.notice).toBeTruthy();
+    expect(body.notice).toMatch(/no agnes models/i);
+  });
+
+  it('POST /api/keys does not warn when the platform has catalog models', async () => {
+    const { status, body } = await request(app, 'POST', '/api/keys', {
+      platform: 'groq',
+      key: 'gsk_test123456789',
+    });
+    expect(status).toBe(201);
+    expect(body.modelsAvailable).toBeGreaterThan(0);
+    expect(body.notice ?? null).toBeNull();
+  });
+
   it('POST /api/keys rejects invalid platform', async () => {
     const { status } = await request(app, 'POST', '/api/keys', {
       platform: 'invalid_platform',
@@ -218,11 +245,12 @@ describe('Keys API', () => {
 
       expect(status).toBe(200);
       expect(body.keys).toEqual([
-        { keyName: 'GROQ_API_KEY', keyValue: 'gsk_test123', detectedPlatform: 'groq', prefix: 'GROQ_' },
-        { keyName: 'ANTHROPIC_API_KEY', keyValue: 'sk-ant-test', detectedPlatform: null, prefix: 'ANTHROPIC_' },
-        { keyName: 'MISTRAL_API_KEY', keyValue: 'mist_test456', detectedPlatform: 'mistral', prefix: 'MISTRAL_' },
+        { keyName: 'GROQ_API_KEY', keyValue: 'gsk_test123', detectedPlatform: 'groq', prefix: 'GROQ_', isDuplicate: false },
+        { keyName: 'ANTHROPIC_API_KEY', keyValue: 'sk-ant-test', detectedPlatform: null, prefix: 'ANTHROPIC_', isDuplicate: false },
+        { keyName: 'MISTRAL_API_KEY', keyValue: 'mist_test456', detectedPlatform: 'mistral', prefix: 'MISTRAL_', isDuplicate: false },
       ]);
       expect(body.total).toBe(3);
+      expect(body.duplicates).toBe(0);
     });
 
     it('imports selected preview rows', async () => {

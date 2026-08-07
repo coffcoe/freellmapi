@@ -1,19 +1,31 @@
 import './env.js';
 import { createApp } from './app.js';
 import { initDb, getDb, getSetting } from './db/index.js';
-import { startHealthChecker } from './services/health.js';
-import { applyProxyUrl, applyProxyEnabled, applyProxyBypass } from './lib/proxy.js';
+import { startHealthChecker, checkAllKeys } from './services/health.js';
+import { applyProxyUrl, applyProxyEnabled, applyProxyBypass, flushProxyCache } from './lib/proxy.js';
+import { startWakeDetect } from './lib/wake-detect.js';
 import { startCatalogSync } from './services/catalog-sync.js';
+import { startCooldownProbe } from './services/cooldown-probe.js';
 import { installProcessSafetyNet } from './lib/process-safety-net.js';
 import { NodeScheduler } from './lib/scheduler.js';
 import { loadConfig } from './lib/config.js';
 import { applyDeclarativeConfigFromEnv } from './services/declarative-config.js';
 import { restoreDbBackupIfNeeded, startDbBackupPump } from './lib/db-backup.js';
 import { cleanupExpiredCooldowns } from './services/ratelimit.js';
+import { userCount } from './services/auth.js';
+import { generateSetupCode } from './lib/setup-code.js';
+import { warnOnEnvDrift } from './lib/env-drift.js';
+import { installLogRedaction } from './lib/log-redaction.js';
+
+// Before any other statement runs, so no provider key can reach stdout — users
+// paste server output into bug reports. Module scope, not inside main(), so it
+// is active for the whole process lifetime including startup logging.
+installLogRedaction();
 
 async function main() {
   const config = loadConfig();
   const { port: PORT, host: HOST } = config;
+  warnOnEnvDrift();
 
   // Install first so a late provider socket reset (undici HTTP/2 error with no
   // listener) can't take the proxy down. Genuine bugs still exit 1.
@@ -39,6 +51,13 @@ async function main() {
     console.log(`[startup] Cleaned ${cleared} expired rate-limit cooldown(s)`);
   }
 
+  // First-run hardening: when the dashboard is still unclaimed, mint a one-time
+  // setup code and log it. A loopback browser can finish setup without it; a
+  // remote caller must supply it (see routes/auth.ts). Regenerated each boot.
+  if (userCount() === 0) {
+    generateSetupCode();
+  }
+
   // Load the persisted proxy settings from the DB (env var wins if set).
   // Must happen after initDb so the settings table is ready.
   applyProxyUrl(getSetting('proxy_url') ?? '');
@@ -53,7 +72,27 @@ async function main() {
     console.log(`Proxy endpoint: http://${display}:${PORT}/v1/chat/completions`);
     startHealthChecker(scheduler);
     startCatalogSync(scheduler);
+    startCooldownProbe(scheduler);
     startDbBackupPump(getDb(), scheduler, config.dbPath ?? undefined);
+
+    // Post-sleep recovery: while the host was suspended (laptop lid, VM
+    // pause) timers and keep-alive sockets froze, so the first requests after
+    // wake used to hit dead pooled connections and pre-sleep key statuses
+    // until the 5-minute health cycle caught up. On a detected wake (>30s
+    // wall-clock drift, or SIGCONT/SIGUSR1/2), drop the proxy dispatcher's
+    // pooled sockets and re-probe every key immediately.
+    startWakeDetect({
+      async onWake(event) {
+        const idle = Math.round(event.idleMs / 1000);
+        console.log(`[wake] resumed after ~${idle}s (${event.reason}${event.signal ? `:${event.signal}` : ''}) — flushing stale sockets, re-probing keys`);
+        flushProxyCache();
+        try {
+          await checkAllKeys();
+        } catch (err: any) {
+          console.error(`[wake] post-wake key re-probe failed: ${err?.message ?? err}`);
+        }
+      },
+    });
   };
 
   const server = app.listen(Number(PORT), HOST, onReady(HOST));

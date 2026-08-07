@@ -1,4 +1,5 @@
 import express from 'express';
+import compression from 'compression';
 import cors from 'cors';
 import helmet from 'helmet';
 import path from 'path';
@@ -17,7 +18,10 @@ import { analyticsRouter } from './routes/analytics.js';
 import { healthRouter } from './routes/health.js';
 import { settingsRouter } from './routes/settings.js';
 import { premiumRouter } from './routes/premium.js';
+import { cacheRouter } from './routes/cache.js';
 import { authRouter } from './routes/auth.js';
+import { docsRouter } from './routes/docs.js';
+import { mcpRouter } from './routes/mcp.js';
 import { requireAuth } from './middleware/requireAuth.js';
 import { createProxyRateLimiter } from './middleware/rateLimit.js';
 import { proxyAuth } from './middleware/proxyAuth.js';
@@ -27,6 +31,7 @@ import { messageNormalizer } from './middleware/messageNormalizer.js';
 import { tokenEstimator } from './middleware/tokenEstimator.js';
 import { capabilityGate } from './middleware/capabilityGate.js';
 import { errorHandler } from './middleware/errorHandler.js';
+import { clientContextMiddleware } from './lib/client-context.js';
 import type { Config } from './lib/config.js';
 import { loadConfig } from './lib/config.js';
 
@@ -66,6 +71,19 @@ function buildProxyMiddlewareChain(): Array<express.RequestHandler> {
   return mws;
 }
 
+// A build asset is safe to cache forever+immutable when its URL is
+// content-addressed. Vite parks every hashed chunk (JS, CSS, fonts, images)
+// under assets/, so that directory is the reliable signal; the -<hash>.<ext>
+// suffix is a belt-and-braces fallback for any hashed file emitted elsewhere.
+// index.html and other unhashed entries deliberately fall through to no-cache.
+const HASHED_ASSET_RE = /-[A-Za-z0-9_-]{6,}\.[A-Za-z0-9]+$/;
+function isImmutableAsset(filePath: string): boolean {
+  return (
+    filePath.includes(`${path.sep}assets${path.sep}`) ||
+    HASHED_ASSET_RE.test(path.basename(filePath))
+  );
+}
+
 export function createApp(config?: Config) {
   const cfg = config ?? loadConfig();
   const app = express();
@@ -91,6 +109,10 @@ export function createApp(config?: Config) {
   // mid-conversation with an opaque 413. (#200)
   app.use(express.json({ limit: '10mb' }));
 
+  // Caller identity (IP + User-Agent) for request analytics, carried in
+  // AsyncLocalStorage so logRequest() can read it from any depth.
+  app.use(clientContextMiddleware);
+
   // Dashboard auth (#35): /api/auth/{status,setup,login} bootstrap without a
   // session; everything else under /api/* requires a logged-in dashboard user.
   // The /v1 proxy keeps its own unified-API-key auth and is NOT gated here.
@@ -111,6 +133,13 @@ export function createApp(config?: Config) {
   app.use('/api/health', requireAuth, healthRouter);
   app.use('/api/settings', requireAuth, settingsRouter);
   app.use('/api/premium', requireAuth, premiumRouter);
+  app.use('/api/cache', requireAuth, cacheRouter);
+
+  // Static, unauthenticated API reference: GET /v1/docs (viewer) and
+  // GET /v1/openapi.json (spec). Mounted before the rate limiter so the docs
+  // are always reachable and don't draw down a caller's request budget. It only
+  // owns those two paths; everything else falls through to the routers below.
+  app.use('/v1', docsRouter);
 
   // Per-IP rate limiting (#35 item #6) runs first so it throttles
   // unauthenticated brute-force / flood attempts before any routing work.
@@ -141,6 +170,14 @@ export function createApp(config?: Config) {
   // OpenAI Responses API shim (Codex CLI requires wire_api="responses"; see #96)
   app.use('/v1', responsesRouter);
 
+  // MCP server (Model Context Protocol over stateless Streamable HTTP):
+  // gateway introspection tools for MCP-speaking agents. Unified-key auth,
+  // like /v1 — NOT behind the dashboard session gate. Same per-IP limiter as
+  // /v1 (its own bucket): both surfaces guard the same unified key, so an
+  // unauthenticated brute-force must not get a free throttle-less oracle here.
+  app.use('/mcp', createProxyRateLimiter(cfg.proxyRateLimitRpm));
+  app.use('/mcp', mcpRouter);
+
   // Health check
   app.get('/api/ping', (_req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -158,14 +195,39 @@ export function createApp(config?: Config) {
     const clientDist = cfg.clientDist
       ? path.resolve(cfg.clientDist)
       : path.resolve(__dirname, '../../client/dist');
-    app.use(express.static(clientDist));
+    // Gzip the dashboard bundle (1+ MB uncompressed). Mounted HERE — after
+    // every API/proxy router and the error handler — so it only wraps the
+    // static-file / SPA-fallback responses below it. The /v1 and /api handlers
+    // end their responses upstream and never fall through to this middleware,
+    // so nothing (crucially the /v1/chat/completions SSE streams) gets buffered
+    // or re-encoded by compression.
+    app.use(compression());
+    app.use(express.static(clientDist, {
+      // Vite emits content-hashed build assets under assets/ (index-<hash>.js,
+      // chunk-<hash>.js, *.css, fonts…). The URL changes whenever the bytes do,
+      // so cache them for a year and mark them immutable. index.html and other
+      // unhashed root entries must stay revalidated (no-cache) so a redeploy
+      // propagates the new asset URLs immediately.
+      setHeaders(res, filePath) {
+        res.setHeader(
+          'Cache-Control',
+          isImmutableAsset(filePath)
+            ? 'public, max-age=31536000, immutable'
+            : 'no-cache',
+        );
+      },
+    }));
     // SPA fallback — serve index.html for non-API routes
     app.use((req, res, next) => {
       if (req.path.startsWith('/api/') || req.path.startsWith('/v1/')) {
         next();
         return;
       }
-      res.sendFile(path.join(clientDist, 'index.html'));
+      // Same no-cache policy as the statically-served index.html: SPA deep
+      // links must revalidate so a redeploy propagates new asset URLs.
+      res.sendFile(path.join(clientDist, 'index.html'), {
+        headers: { 'Cache-Control': 'no-cache' },
+      });
     });
   }
 

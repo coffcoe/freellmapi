@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { ExternalLink, RefreshCw, Sparkles } from 'lucide-react'
 import { apiFetch } from '@/lib/api'
 import { PageHeader } from '@/components/page-header'
@@ -7,33 +7,10 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
+import { FieldError } from '@/components/ui/field-error'
+import { CardSkeleton } from '@/components/ui/skeleton'
+import { usePremium } from '@/hooks/use-premium'
 import { useI18n } from '@/i18n'
-
-interface LicenseStatus {
-  valid: boolean
-  plan: 'annual' | 'lifetime' | null
-  status: string | null
-  expiresAt: string | null
-  cancelAtPeriodEnd?: boolean
-  reason?: string
-  checkedAtMs: number
-}
-
-interface CatalogSyncState {
-  baseUrl: string
-  appliedVersion: string | null
-  appliedTier: string | null
-  lastSyncMs: number | null
-  lastError: string | null
-}
-
-interface PremiumStatus {
-  hasKey: boolean
-  maskedKey: string | null
-  license: LicenseStatus | null
-  catalog: CatalogSyncState
-  siteUrl: string
-}
 
 function fmtWhen(ms: number | null): string | null {
   if (!ms) return null
@@ -49,11 +26,9 @@ export default function PremiumPage() {
   const { t } = useI18n()
   const queryClient = useQueryClient()
   const [keyInput, setKeyInput] = useState('')
+  const [activateAttempted, setActivateAttempted] = useState(false)
 
-  const { data, isLoading } = useQuery<PremiumStatus>({
-    queryKey: ['premium'],
-    queryFn: () => apiFetch('/api/premium'),
-  })
+  const { data, isLoading, licensed } = usePremium()
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ['premium'] })
@@ -62,6 +37,7 @@ export default function PremiumPage() {
   }
 
   const activate = useMutation({
+    meta: { silenceToast: true },
     mutationFn: (key: string) =>
       apiFetch('/api/premium/key', { method: 'POST', body: JSON.stringify({ key }) }),
     onSuccess: () => {
@@ -81,6 +57,7 @@ export default function PremiumPage() {
   })
 
   const openPortal = useMutation({
+    meta: { silenceToast: true },
     mutationFn: () => apiFetch<{ url: string }>('/api/premium/portal', { method: 'POST' }),
     onSuccess: ({ url }) => {
       window.open(url, '_blank', 'noopener')
@@ -91,15 +68,16 @@ export default function PremiumPage() {
     return (
       <div>
         <PageHeader title={t('premium.title')} description={t('premium.description')} />
-        <p className="text-sm text-muted-foreground">{t('premium.loading')}</p>
+        <div className="space-y-6">
+          <CardSkeleton />
+          <CardSkeleton />
+        </div>
       </div>
     )
   }
 
   const { hasKey, maskedKey, license, catalog, siteUrl } = data
   const live = catalog.appliedTier === 'live'
-  const licensed = hasKey && license?.valid
-
   return (
     <div>
       <PageHeader
@@ -199,7 +177,12 @@ export default function PremiumPage() {
                 className="flex flex-wrap items-end gap-3"
                 onSubmit={(e) => {
                   e.preventDefault()
-                  if (keyInput.trim()) activate.mutate(keyInput.trim())
+                  if (!keyInput.trim()) {
+                    setActivateAttempted(true)
+                    return
+                  }
+                  setActivateAttempted(false)
+                  activate.mutate(keyInput.trim())
                 }}
               >
                 <div className="space-y-1.5 flex-1 min-w-[260px]">
@@ -210,9 +193,11 @@ export default function PremiumPage() {
                     placeholder="fla_XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"
                     className="font-mono text-xs"
                     autoComplete="off"
+                    aria-invalid={activateAttempted && !keyInput.trim()}
                   />
+                  {activateAttempted && !keyInput.trim() && <FieldError error={t('validation.required')} />}
                 </div>
-                <Button type="submit" size="sm" disabled={!keyInput.trim() || activate.isPending}>
+                <Button type="submit" size="sm" disabled={activate.isPending}>
                   {activate.isPending ? t('premium.activating') : t('premium.activate')}
                 </Button>
               </form>
