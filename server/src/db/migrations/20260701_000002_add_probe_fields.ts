@@ -35,8 +35,19 @@ export function up(db: Db): void {
 }
 
 export function down(db: Db): void {
-  // SQLite doesn't support DROP COLUMN directly, we need to recreate table
-  // For simplicity, we'll just drop the table and columns if needed in a real scenario
-  // But for this migration, we'll note that downgrade is complex and not implemented
-  throw new Error('Downgrade not implemented for this migration');
+  // SQLite >= 3.35 supports DROP COLUMN (bundled engine is 3.53.1). Both
+  // `last_verified_at` and `probe_status` are plain, unindexed columns, so
+  // they can be dropped directly. The probe_logs table is dropped first
+  // (including its two indexes) because the columns reference nothing but the
+  // table itself. All steps are PRAGMA / IF EXISTS guarded so re-running the
+  // down is a safe no-op (idempotent).
+  db.exec('DROP TABLE IF EXISTS probe_logs;');
+
+  const cols = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
+  if (cols.some(c => c.name === 'last_verified_at')) {
+    db.exec('ALTER TABLE models DROP COLUMN last_verified_at;');
+  }
+  if (cols.some(c => c.name === 'probe_status')) {
+    db.exec('ALTER TABLE models DROP COLUMN probe_status;');
+  }
 }
