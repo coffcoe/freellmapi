@@ -15,9 +15,7 @@ import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
-import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError } from '../lib/error-classify.js';
-import { getRequestMaxTokensBudget, getMaxConsecutiveUpstreamFails, newBreaker, recordUpstreamFailure, exceedsTokenBudget } from '../lib/guardrails.js';
-
+import { isClientAbortError, newClientAbortError } from '../lib/error-classify.js';
 import { logRequest } from '../lib/request-log.js';
 import { extractApiToken, timingSafeStringEqual, getStickyModel, setStickyModel } from './proxy.js';
 import { runFallbackLoop, newFallbackState, recordUpstreamSuccess, type ExhaustionBody, setFallbackHeaders, setExhaustionHeaders, type AttemptRecord } from '../lib/fallback-loop.js';
@@ -476,32 +474,27 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
   let preferredModel = resolved.preferredModelDbId;
   if (preferredModel == null) preferredModel = getStickyModel(messages, sessionId);
 
-  // ── 策略 24 护栏：单请求 token 预算天花板（反 Goodhart） ──
-  const budget = getRequestMaxTokensBudget();
-  if (exceedsTokenBudget(estimatedTotal, budget)) {
-    sendError(res, 413, 'invalid_request_error', `Request estimated ${estimatedTotal} tokens exceeds request_max_tokens_budget (${budget}). Reduce input or max_tokens.`);
-    return;
-  }
-
-  // ── 策略 24 护栏：连续上游失败断路器 ──
-  const breaker = newBreaker();
-
-  const skipKeys = new Set<string>();
-  const skipModels = new Set<number>();
-  let lastError: any = null;
-
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    let route: RouteResult;
-    try {
-      route = routeRequest(estimatedTotal, skipKeys.size > 0 ? skipKeys : undefined, preferredModel, hasImage, wantsTools, skipModels.size > 0 ? skipModels : undefined);
-    } catch (err: any) {
-      if (lastError) {
-        sendError(res, 429, 'rate_limit_error', `All models rate-limited. Last error: ${sanitizeProviderErrorMessage(lastError.message)}`);
-      } else {
-        sendError(res, err?.status ?? 503, 'api_error', err?.message ?? 'No model available to route this request');
-      }
-      return;
-
+  // Thin adapter over the shared fallback loop (lib/fallback-loop.ts): the
+  // cooldown/skip/penalty/exhaustion machinery is shared, only the Anthropic
+  // request/stream translation lives here. This converged three drifts on this
+  // surface: it now honors a provider Retry-After and day-benches a 403 (via the
+  // shared cooldown), returns a shared exhaustion body (a 400 invalid_request
+  // when every provider rejected the request, not always a 429), and applies the
+  // inline tool-call dialect rescue that the OpenAI/Responses surfaces carry.
+  const state = newFallbackState();
+  const attemptLog: AttemptRecord[] = [];
+  // Client-disconnect fan-out: the flag stops the loop before the NEXT
+  // attempt; the AbortController (threaded to the provider as
+  // CompletionOptions.signal) additionally cancels the IN-FLIGHT upstream
+  // fetch and any body/stream read, so tokens stop burning and the in-flight
+  // lease frees immediately. 'close' also fires on normal completion —
+  // writableEnded distinguishes a real disconnect.
+  let clientGone = false;
+  const clientAbort = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      clientGone = true;
+      clientAbort.abort(newClientAbortError());
     }
   });
   const dispatchOptions = { ...completionOptions, signal: clientAbort.signal };
@@ -597,40 +590,24 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
       setFallbackHeaders(res, attempt, attemptLog);
       logRequest(route.platform, route.modelId, route.keyId, 'success', promptTokens, completionTokens, Date.now() - start, null, null, pinnedModelId);
       res.json(anthropicResponse);
-      return;
-    } catch (err: any) {
-      const safeError = sanitizeProviderErrorMessage(err.message);
-      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, safeError, null, pinnedModelId);
-
-      // A stream that already sent its `message_start` cannot fail over — the
-      // helper finished the SSE response itself. Bubble back without retrying.
-      if (err instanceof StreamAlreadyStarted) return;
-
-      if (isRetryableError(err)) {
-        if (isModelNotFoundError(err) || isModelAccessForbiddenError(err)) skipModels.add(route.modelDbId);
-        skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-        setCooldown(route.platform, route.modelId, route.keyId, cooldownFor(route, err));
-        recordRateLimitHit(route.modelDbId);
-        learnLimitFromError(route.modelDbId, err);
-        recordUpstreamFailure(breaker);
-        lastError = err;
-        if (breaker.tripped) break;
-        continue;
-      }
-
-      sendError(res, 502, 'api_error', `Provider error (${route.displayName}): ${safeError}`);
-      return;
-    }
-  }
-
-  // ── 策略 24 护栏：连续上游失败断路器跳闸优先于普通耗尽 ──
-  if (breaker.tripped) {
-    const limit = getMaxConsecutiveUpstreamFails();
-    sendError(res, 503, 'circuit_breaker', `Circuit breaker tripped after ${limit} consecutive upstream failures. The model pool appears unhealthy — aborting failover to avoid burning quota/latency on doomed attempts.`);
-    return;
-  }
-  sendError(res, 429, 'rate_limit_error', `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${sanitizeProviderErrorMessage(lastError?.message)}`);
-
+      return 'done';
+    },
+    logFailure: (route, err) => {
+      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, sanitizeProviderErrorMessage(err.message), null, pinnedModelId);
+    },
+    onFatal: (route, err, attempt) => {
+      setFallbackHeaders(res, attempt, attemptLog);
+      sendError(res, 502, 'api_error', `Provider error (${route.displayName}): ${sanitizeProviderErrorMessage(err.message)}`);
+    },
+    onRoutingExhausted: (lastError, routeErr, exhaustion, info) => {
+      setFallbackHeaders(res, info.attempts.length, info.attempts);
+      sendExhaustion(res, exhaustion);
+    },
+    onExhausted: (exhaustion, info) => {
+      setFallbackHeaders(res, info.attempts.length, info.attempts);
+      sendExhaustion(res, exhaustion);
+    },
+  });
 });
 
 // Thrown by streamCompletion once the SSE response is underway, so the outer

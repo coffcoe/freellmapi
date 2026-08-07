@@ -1,4 +1,4 @@
-import type Database from 'better-sqlite3';
+import type { Db } from '../../db/types.js';
 
 /**
  * Quota-guard schema columns (2026-08-02).
@@ -14,7 +14,7 @@ import type Database from 'better-sqlite3';
  * Both are added defensively (guarded by PRAGMA table_info) so the migration
  * is idempotent and safe to re-run.
  */
-export function up(db: Database.Database): void {
+export function up(db: Db): void {
   const modelColumns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
   if (!modelColumns.some(col => col.name === 'is_high_value')) {
     db.prepare('ALTER TABLE models ADD COLUMN is_high_value INTEGER NOT NULL DEFAULT 0').run();
@@ -27,7 +27,7 @@ export function up(db: Database.Database): void {
   }
 }
 
-export function down(db: Database.Database): void {
+export function down(db: Db): void {
   // SQLite supports DROP COLUMN from 3.35.0; the bundled engine is newer.
   const modelColumns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
   if (modelColumns.some(col => col.name === 'is_high_value')) {

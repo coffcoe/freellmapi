@@ -1,17 +1,11 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { getUnifiedApiKey, regenerateUnifiedKey, getSetting, setSetting } from '../db/index.js';
-import { getRequestMaxTokensBudget, getMaxConsecutiveUpstreamFails, SETTING_REQUEST_MAX_TOKENS_BUDGET, SETTING_MAX_CONSECUTIVE_UPSTREAM_FAILS } from '../lib/guardrails.js';
+import { getRequestMaxTokensBudget, getMaxConsecutiveUpstreamFails, SETTING_REQUEST_MAX_TOKENS_BUDGET, SETTING_MAX_CONSECUTIVE_UPSTREAM_FAILS, REQUEST_MAX_TOKENS_BUDGET_SETTING, MAX_CONSECUTIVE_UPSTREAM_FAILS_SETTING } from '../lib/guardrails.js';
 import { applyProxyUrl, applyProxyEnabled, applyProxyBypass, isProxyActive, getProxyUrl, isProxyEnabled, getProxyBypassPlatforms } from '../lib/proxy.js';
 import { getSavedFusionConfig, setSavedFusionConfig, savedFusionConfigSchema, getFusionMaxK } from '../services/fusion.js';
 import { isUnifyEnabled, setUnifyEnabled, getUnifyOverrides, setUnifyOverrides, unifyOverridesSchema } from '../services/model-groups.js';
 import { getClaudeModelMap, setClaudeModelMap } from '../services/anthropic-map.js';
-import {
-  getRequestMaxTokensBudget,
-  getMaxConsecutiveUpstreamFails,
-  REQUEST_MAX_TOKENS_BUDGET_SETTING,
-  MAX_CONSECUTIVE_UPSTREAM_FAILS_SETTING,
-} from '../lib/guardrails.js';
 import { z } from 'zod';
 
 export const settingsRouter = Router();

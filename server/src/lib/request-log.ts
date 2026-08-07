@@ -55,15 +55,18 @@ export function logRequest(
   // analytics split pinned vs auto traffic and detect failover overrides
   // (requested_model set but != model_id).
   requestedModel: string | null = null,
-  // Calling client/app identifier (from the x-client-tag request header), or
-  // null when the client does not self-identify. Used to attribute auto-traffic
-  // to its source during quota investigations (P2-a).
-  clientTag: string | null = null,
   // The model the UPSTREAM claims it served, ONLY when it genuinely differs
   // from the routed model_id after cosmetic normalization (#534 — see
   // lib/served-model.ts). NULL when it matches or the provider reported
   // nothing usable, so the column stays empty in the healthy case.
+  // Kept at position 11 to stay wire-compatible with upstream callers that
+  // pass servedModel as the 11th argument.
   servedModel: string | null = null,
+  // Calling client/app identifier (from the x-client-tag request header), or
+  // null when the client does not self-identify. Used to attribute auto-traffic
+  // to its source during quota investigations (P2-a). Local fork extension —
+  // appended LAST so it never shifts upstream's positional arguments.
+  clientTag: string | null = null,
 ) {
   try {
     const db = getDb();

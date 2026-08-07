@@ -143,3 +143,29 @@ export function recordUpstreamFailure(state: BreakerState): boolean {
 export function resetBreaker(_state: BreakerState): void {
   // no-op: upstream pattern is per-request state, not reusable
 }
+
+/** @deprecated Use the inline check `estimatedTotal > budget` instead. Kept for
+ *  local fork compatibility. */
+export function exceedsTokenBudget(estimatedTotal: number, budget: number): boolean {
+  return budget > 0 && estimatedTotal > budget;
+}
+
+// Legacy type for local fork code that checks `breaker.tripped` directly.
+export interface CircuitBreakerState {
+  consecutive: number;
+  tripped: boolean;
+}
+
+/** @deprecated Use `newBreaker()` instead. Kept for local fork compatibility. */
+export function newBreakerLegacy(): CircuitBreakerState {
+  return { consecutive: 0, tripped: false };
+}
+
+/** @deprecated Use `recordBreakerFailure` instead. Mutates `tripped` in place.
+ *  Kept for local fork compatibility. */
+export function recordUpstreamFailureLegacy(state: CircuitBreakerState): void {
+  const limit = getMaxConsecutiveUpstreamFails();
+  if (limit <= 0) return;
+  state.consecutive += 1;
+  if (state.consecutive >= limit) state.tripped = true;
+}

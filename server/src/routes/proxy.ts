@@ -27,7 +27,6 @@ import type { Platform } from '@freellmapi/shared/types.js';
 import { inferQuotaPoolKey, type QuotaObservationContext } from '../services/provider-quota.js';
 import { isUnifyEnabled, getModelGroups, resolveRequestedIdToMembers } from '../services/model-groups.js';
 import { buildModelListing } from '../services/model-listing.js';
-import { getRequestMaxTokensBudget, getMaxConsecutiveUpstreamFails, newBreaker, recordUpstreamFailure, exceedsTokenBudget } from '../lib/guardrails.js';
 
 export const proxyRouter = Router();
 
@@ -134,27 +133,6 @@ export function traceRouteEvent(
 // it and importing it back from a route would be a cycle). Re-exported here for
 // existing importers (routes/responses.ts, proxy-retry.test.ts historically).
 export { exhaustedRetryError };
-
-// ── client_tag（P2-a）：调用方自标识，用于 auto 流量溯源 ──
-// Priority: x-client-tag header > x-app-tag header > auto-inferred from connection
-function inferClientTag(req: Request): string | null {
-  const explicit =
-    (typeof req.headers['x-client-tag'] === 'string' && req.headers['x-client-tag']) ||
-    (typeof req.headers['x-app-tag'] === 'string' && req.headers['x-app-tag']);
-  if (explicit) return explicit;
-
-  const ip = req.socket.remoteAddress || 'unknown';
-  const isLoopback = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
-
-  if (isLoopback) {
-    // Distinguish local apps by user-agent token
-    const rawUa = typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : '';
-    const appToken = rawUa.split(' ')[0].toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 32);
-    return `loopback-${appToken || 'unknown'}`;
-  }
-
-  return `remote-${ip}`;
-}
 
 // Sticky sessions: track which model served each "session"
 // Key: hash of first user message → model_db_id
@@ -286,110 +264,72 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
         // Non-standard but additive: OpenAI clients ignore unknown fields.
         available: m.available === 1,
         unavailable_reason: m.available === 1 ? null : (m.enabled === 1 ? 'no_key' : 'disabled'),
-        // Enhanced fields (Non-standard, additive)
+        // OpenRouter's field name; agents use it to pick knobs per model. For
+        // a unify group this is the intersection over member platforms — a
+        // param is only advertised when every platform the router might pick
+        // honors it.
+        supported_parameters: supportedParametersForPlatforms(m.platforms, { tools: m.supportsTools }),
+        // Enhanced fields (Non-standard, additive) — local fork enrichment.
         category: m.category,
         last_verified_at: m.lastVerifiedAt,
         probe_status: m.probeStatus === 1,
         rate_limit: m.rateLimit,
         tier: m.tier,
         requires_credit_card: m.requiresCreditCard,
-        // OpenRouter's field name; agents use it to pick knobs per model. For
-        // a unify group this is the intersection over member platforms — a
-        // param is only advertised when every platform the router might pick
-        // honors it.
-        supported_parameters: supportedParametersForPlatforms(m.platforms, { tools: m.supportsTools }),
       })),
     ],
   });
 });
 
-/** Detect the best category scene from request content for soft routing preference. */
-function detectCategoryScene(messages: any[], hasTools: boolean): string | null {
-  // 1. Agent / tool-use intent: explicit tool call or agentic keywords
-  if (hasTools) return 'agent';
-  for (const msg of messages) {
-    if (!msg.content) continue;
-    const blocks = Array.isArray(msg.content) ? msg.content : [msg.content];
-    for (const part of blocks) {
-      if (typeof part === 'object' && part !== null) {
-        if (part.type === 'image_url' || part.type === 'image') return 'vision';
-        if (part.type === 'input_audio') return 'audio';
-      }
-      const text: string = typeof part === 'string' ? part : (part?.text ?? '');
-      if (!text) continue;
-      const t = text.toLowerCase();
-
-      // 2. Coding / 代码 (highest priority after multimodal)
-      if (/\b(write|implement|refactor|debug|fix)\b/.test(t) && /\b(code|function|class|method|module)\b/.test(t) ||
-          t.includes('编程') || t.includes('写代码') || t.includes('实现算法') || t.includes('重构')) return 'coding';
-
-      // 3. Long-context / 长文档论文
-      if (/\b(long document|paper|thesis|dissertation|book| manuscript)\b/.test(t) ||
-          /\b(长文档|论文|学位论文|书籍|手稿|上下文|上下文窗口|100k|200k|1m)\b/.test(t)) return 'long-context';
-
-      // 4. Agent / 自主Agent
-      if (/\b(agent|autonomous|self-driving|tool use|function call)\b/.test(t) ||
-          t.includes('自主') || t.includes('Agent') || t.includes('工具调用') || t.includes('智能体')) return 'agent';
-
-      // 5. Reasoning / 推理
-      if (/\b(reason about|analyze|deduce|why.*happen|explain.*mechanism)\b/.test(t) ||
-          t.includes('推理') || t.includes('逻辑分析')) return 'reasoning';
-
-      // 6. Speed / 低延迟 (explicit latency requirement)
-      if (/\b(fast|low latency|realtime|real-time|quick|speedy)\b/.test(t) ||
-          t.includes('快速') || t.includes('低延迟') || t.includes('实时') || t.includes('快')) return 'speed';
-
-      // 7. Compliance / 国内合规 (data sovereignty)
-      if (/\b(china|domestic|compliant|data residency|sovereignty)\b/.test(t) ||
-          t.includes('国内') || t.includes('合规') || t.includes('数据不出境') || t.includes('境内')) return 'compliance';
-    }
-  }
-  return null;
-}
-
-/** Map detectCategoryScene output to actual DB category values. */
-function sceneToCategory(scene: string): string | null {
-  const map: Record<string, string> = {
-    'coding': 'coding',
-    'vision': 'vision',
-    'audio': 'audio',
-    'reasoning': 'reasoning',
-    'agent': 'function-calling',
-  };
-  return map[scene] || null;
-}
-
-/** Detect L3 scene tags from request content (free-tier, long-context, low-latency, compliance). */
-function detectSceneTags(messages: any[]): string[] {
-  const tags: string[] = [];
-  for (const msg of messages) {
-    if (!msg.content) continue;
-    const blocks = Array.isArray(msg.content) ? msg.content : [msg.content];
-    for (const part of blocks) {
-      const text: string = typeof part === 'string' ? part : (part?.text ?? '');
-      if (!text) continue;
-      const t = text.toLowerCase();
-      if (/\b(fast|low latency|realtime|real-time|quick|speedy)\b/.test(t) ||
-          t.includes('快速') || t.includes('低延迟') || t.includes('实时') || t.includes('快')) {
-        tags.push('low-latency');
-      }
-      if (/\b(long document|paper|thesis|dissertation|book| manuscript|100k|200k|1m)\b/.test(t) ||
-          t.includes('长文档') || t.includes('论文') || t.includes('上下文窗口') || t.includes('上下文')) {
-        tags.push('long-context');
-      }
-      if (/\b(china|domestic|compliant|data residency|sovereignty)\b/.test(t) ||
-          t.includes('国内') || t.includes('合规') || t.includes('数据不出境')) {
-        tags.push('compliance');
-      }
-      if (/\b(free|free tier)\b/.test(t) || t.includes('免费')) {
-        tags.push('free-tier');
-      }
-    }
-  }
-  return [...new Set(tags)];
-}
 
 const MAX_RETRIES = 20;
+
+// ── github 专属请求尺寸护栏（P0 收尾）──
+// github 上游硬限：输入 ≤ 8000 tokens（超限返回 413 "Request body too large"）、
+// max_tokens 亦受限（超限返回 400 "max_tokens too large"）。模型本身活着，
+// 故请求发给上游前截断输入消息，消灭 97% 的错误。
+const GITHUB_MAX_INPUT_TOKENS = 7500;   // 留 500 token 余量（上游硬限 8000）
+
+function estimateMessageTokensForGithub(m: ChatMessage): number {
+  return Math.ceil(contentToString(m.content).length / 4);
+}
+
+// 从最旧的非 system/tool 消息开始丢弃，保留 system + 最近对话，直至 ≤ 阈值。
+function truncateMessagesForGithub(msgs: ChatMessage[]): ChatMessage[] {
+  const total = msgs.reduce((s, m) => s + estimateMessageTokensForGithub(m), 0);
+  if (total <= GITHUB_MAX_INPUT_TOKENS) return msgs;
+  const keep = msgs.slice();
+  let cur = total;
+  for (let i = 0; i < keep.length && cur > GITHUB_MAX_INPUT_TOKENS; i++) {
+    const role = keep[i].role;
+    if (role === 'system' || role === 'tool') continue; // 不丢系统/工具消息，避免破坏结构
+    if (keep.length <= 1) break;
+    cur -= estimateMessageTokensForGithub(keep[i]);
+    keep.splice(i, 1);
+    i--; // 删除后回退索引
+  }
+  return keep;
+}
+
+// ── client_tag（P2-a）：调用方自标识，用于 auto 流量溯源 ──
+// Priority: x-client-tag header > x-app-tag header > auto-inferred from connection
+function inferClientTag(req: Request): string | null {
+  const explicit =
+    (typeof req.headers['x-client-tag'] === 'string' && req.headers['x-client-tag']) ||
+    (typeof req.headers['x-app-tag'] === 'string' && req.headers['x-app-tag']);
+  if (explicit) return explicit;
+
+  const ip = req.socket.remoteAddress || 'unknown';
+  const isLoopback = ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+
+  if (isLoopback) {
+    const rawUa = typeof req.headers['user-agent'] === 'string' ? req.headers['user-agent'] : '';
+    const appToken = rawUa.split(' ')[0].toLowerCase().replace(/[^a-z0-9-]/g, '-').slice(0, 32);
+    return `loopback-${appToken || 'unknown'}`;
+  }
+
+  return `remote-${ip}`;
+}
 
 // Echo-tolerant tool calls: agents replay OUR responses back as history, and
 // not all of them preserve the strict OpenAI shape. `type` may be dropped
@@ -506,34 +446,6 @@ const toolChoiceSchema = z.union([
 ]);
 
 const stopSchema = z.union([z.string(), z.array(z.string()).min(1).max(64)]);
-
-// ── github 专属请求尺寸护栏（动作① / P0 收尾）──
-// github 上游硬限：输入 ≤ 8000 tokens（超限返回 413 "Request body too large"）、
-// max_tokens 亦受限（超限返回 400 "max_tokens too large"）。模型本身活着，
-// 故请求发给上游前截断输入消息 + 封顶 max_tokens，消灭 97% 的错误。
-const GITHUB_MAX_INPUT_TOKENS = 7500;   // 留 500 token 余量（上游硬限 8000）
-const GITHUB_MAX_OUTPUT_TOKENS = 4096;  // 保守封顶，避免 400 max_tokens too large
-
-function estimateMessageTokensForGithub(m: ChatMessage): number {
-  return Math.ceil(contentToString(m.content).length / 4);
-}
-
-// 从最旧的非 system/tool 消息开始丢弃，保留 system + 最近对话，直至 ≤ 阈值。
-function truncateMessagesForGithub(msgs: ChatMessage[]): ChatMessage[] {
-  const total = msgs.reduce((s, m) => s + estimateMessageTokensForGithub(m), 0);
-  if (total <= GITHUB_MAX_INPUT_TOKENS) return msgs;
-  const keep = msgs.slice();
-  let cur = total;
-  for (let i = 0; i < keep.length && cur > GITHUB_MAX_INPUT_TOKENS; i++) {
-    const role = keep[i].role;
-    if (role === 'system' || role === 'tool') continue; // 不丢系统/工具消息，避免破坏结构
-    if (keep.length <= 1) break;
-    cur -= estimateMessageTokensForGithub(keep[i]);
-    keep.splice(i, 1);
-    i--; // 删除后回退索引
-  }
-  return keep;
-}
 
 function providerSafeStop(stop: string | string[] | undefined): string | string[] | undefined {
   if (!Array.isArray(stop)) return stop;
@@ -903,17 +815,8 @@ function legacyCompletionChunk(route: RouteResult, chunk: any, text: string) {
 proxyRouter.post('/completions', async (req: Request, res: Response) => {
   const start = Date.now();
   const requestGroupId = getRequestGroupId(req);
-
-  // ── abort 熔断（P1-c）：客户端断开即停上游调用 / 跳出 failover ──
-  // res 'close' fires on both normal completion (writableFinished=true) and client
-  // abort (writableFinished=false). Only treat the latter as abort so we don't
-  // bail out of a request we already finished serving.
-  let clientAborted = false;
-  res.on('close', () => { if (!res.writableFinished) clientAborted = true; });
-
-  // ── client_tag（P2-a）：调用方自标识，用于 auto 流量溯源 ──
-  const clientTag = inferClientTag(req);
   res.setHeader('X-Request-ID', requestGroupId);
+  const clientTag = inferClientTag(req);
 
   const token = extractApiToken(req);
   const unifiedKey = getUnifiedApiKey();
@@ -1016,60 +919,20 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
   }
 
   const pinnedModelId = requestedModel && !isAutoModel(requestedModel) ? requestedModel : null;
-
-  // ── 策略 24 护栏：单请求 token 预算天花板（反 Goodhart） ──
-  const budget = getRequestMaxTokensBudget();
-  if (exceedsTokenBudget(estimatedTotal, budget)) {
-    res.status(413).json({
-      error: {
-        message: `Request estimated ${estimatedTotal} tokens exceeds request_max_tokens_budget (${budget}). Reduce input or max_tokens.`,
-        type: 'invalid_request_error',
-      },
-    });
-    return;
-  }
-
-  // ── 策略 24 护栏：连续上游失败断路器 ──
-  const breaker = newBreaker();
-
-  const skipKeys = new Set<string>();
-  const skipModels = new Set<number>();
-  let lastError: any = null;
-
-  for (let attempt = 0; attempt < MAX_RETRIES; attempt++) {
-    let route: RouteResult;
-    try {
-      route = routeRequest(
-        estimatedTotal,
-        skipKeys.size > 0 ? skipKeys : undefined,
-        preferredModel,
-        false,
-        false,
-        skipModels.size > 0 ? skipModels : undefined,
-        groupChain ?? resolvedChain?.chain,
-      );
-    } catch (err: any) {
-      if (lastError) {
-        const error = exhaustedRetryError(lastError);
-        res.status(error.status).json({
-          error: {
-            message: error.message,
-            type: error.type,
-          },
-        });
-      } else {
-        const disposition: string[] = Array.isArray(err.diagnostics) ? err.diagnostics : [];
-        console.warn(
-          `[Proxy] legacy completions routing exhausted (no upstream tried) req=${shortRequestId(requestGroupId)} ` +
-          `requested=${requestedModelLabel} candidates=${disposition.length}` +
-          (disposition.length ? `:\n  ${disposition.join('\n  ')}` : ''),
-        );
-        res.status(err.status ?? 503).json({
-          error: { message: err.message, type: 'routing_error' },
-        });
-      }
-      return;
-
+  const state = newFallbackState();
+  const attemptLog: AttemptRecord[] = [];
+  // Client-disconnect fan-out: the flag stops the loop before the NEXT
+  // attempt; the AbortController (threaded to the provider as
+  // CompletionOptions.signal) additionally cancels the IN-FLIGHT upstream
+  // fetch and any body/stream read, so tokens stop burning and the in-flight
+  // lease frees immediately. 'close' also fires on normal completion —
+  // writableEnded distinguishes a real disconnect.
+  let clientGone = false;
+  const clientAbort = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      clientGone = true;
+      clientAbort.abort(newClientAbortError());
     }
   });
 
@@ -1130,10 +993,9 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
             quotaContextForRoute(route, 'chat/completions'),
           );
 
-        for await (const chunk of gen) {
-          if (clientAborted) break;
-          const text = streamChunkText(chunk);
-
+          for await (const chunk of gen) {
+            if (clientGone) break; // client hung up: stop pulling; reader.cancel() aborts upstream
+            const text = streamChunkText(chunk);
             if (text.length > 0) sawText = true;
             const finish = (chunk as any)?.choices?.[0]?.finish_reason;
             if (finish) upstreamFinish = finish;
@@ -1149,10 +1011,14 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
             res.write(`data: ${JSON.stringify(frame)}\n\n`);
           }
 
-          if (clientAborted) {
-            // 客户端已断开：不记账、不 failover，直接收尾（socket 已关闭）
-            try { res.end(); } catch { /* socket gone */ }
-            return;
+          // Disconnect before the commit point: the break above fired with no
+          // text seen, which is indistinguishable from an empty completion
+          // below — but it is CLIENT behavior, not a provider failure. Without
+          // this check every Ctrl-C during a reasoning model's TTFB window
+          // benched the healthy model+key for 90s and logged a provider error.
+          if (clientGone && !headerSent && !sawText) {
+            console.log(`[Proxy] client disconnected before first token from ${route.displayName} — dropping attempt without benching`);
+            return 'committed';
           }
 
           if (!sawText) {
@@ -1180,9 +1046,8 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
             inputTokens: estimatedInputTokens,
             outputTokens: totalOutputTokens,
           });
-          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId, clientTag);
-          return;
-
+          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId);
+          return 'done';
         } catch (streamErr: any) {
           // Client abort mid-stream: the pump's own `if (clientGone) break`
           // can lose the race against the fetch-signal rejection, so the
@@ -1204,60 +1069,11 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
               latencyMs: Date.now() - start,
               error: sanitizeProviderErrorMessage(streamErr.message),
             });
-            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message), ttfbMs, pinnedModelId, clientTag);
-            return;
+            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message), ttfbMs, pinnedModelId, null, clientTag);
+            return 'committed';
           }
           throw streamErr;
         }
-      } else {
-        const result = await route.provider.chatCompletion(
-          route.apiKey,
-          messages,
-          route.modelId,
-          { temperature, max_tokens, top_p, stop },
-          quotaContextForRoute(route, 'chat/completions'),
-        );
-
-        const text = completionTextFromChat(result);
-        if (!text) {
-          throw new Error(`empty completion from ${route.displayName}`);
-        }
-
-        const totalTokens = result.usage?.total_tokens ?? 0;
-        if (clientAborted) return;
-        recordRequest(route.platform, route.modelId, route.keyId);
-        recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
-        recordSuccess(route.modelDbId);
-
-        res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
-        if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
-        res.json({
-          id: completionIdFromChat(result.id),
-          object: 'text_completion',
-          created: result.created ?? Math.floor(Date.now() / 1000),
-          model: route.modelId,
-          choices: [{
-            text,
-            index: result.choices?.[0]?.index ?? 0,
-            logprobs: null,
-            finish_reason: result.choices?.[0]?.finish_reason ?? 'stop',
-          }],
-          usage: result.usage,
-        });
-
-        traceRouteEvent('Proxy', {
-          event: 'ok',
-          requestId: requestGroupId,
-          attempt,
-          platform: route.platform,
-          model: route.modelId,
-          latencyMs: Date.now() - start,
-          inputTokens: result.usage?.prompt_tokens ?? 0,
-          outputTokens: result.usage?.completion_tokens ?? 0,
-        });
-        logRequest(route.platform, route.modelId, route.keyId, 'success', result.usage?.prompt_tokens ?? 0, result.usage?.completion_tokens ?? 0, Date.now() - start, null, null, pinnedModelId, clientTag);
-        return;
-
       }
 
       const result = await route.provider.chatCompletion(
@@ -1327,60 +1143,36 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
         latencyMs: latency,
         error: safeError,
       });
-      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId, clientTag);
-
-      if (isRetryableError(err)) {
-        if (isModelNotFoundError(err) || isModelAccessForbiddenError(err)) skipModels.add(route.modelDbId);
-        skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-        setCooldown(
-          route.platform,
-          route.modelId,
-          route.keyId,
-          isPaymentRequiredError(err)
-            ? PAYMENT_REQUIRED_COOLDOWN_MS
-            : isModelAccessForbiddenError(err)
-            ? MODEL_FORBIDDEN_COOLDOWN_MS
-            : getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, {
-                rpd: route.rpdLimit,
-                tpd: route.tpdLimit,
-              }, err.retryAfterMs),
-        );
-        recordRateLimitHit(route.modelDbId);
-        learnLimitFromError(route.modelDbId, err);
-        recordUpstreamFailure(breaker);
-        lastError = err;
-        if (breaker.tripped) break;
-        continue;
-      }
-
-
+      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId, null, clientTag);
+    },
+    onFatal: (route, err, attempt) => {
+      setFallbackHeaders(res, attempt, attemptLog);
       res.status(502).json({
         error: {
           message: `Provider error (${route.displayName}): ${sanitizeProviderErrorMessage(err.message)}`,
           type: 'provider_error',
         },
       });
-      return;
-    }
-  }
-
-  // ── 策略 24 护栏：连续上游失败断路器跳闸优先于普通耗尽 ──
-  if (breaker.tripped) {
-    const limit = getMaxConsecutiveUpstreamFails();
-    res.status(503).json({
-      error: {
-        message: `Circuit breaker tripped after ${limit} consecutive upstream failures. The model pool appears unhealthy — aborting failover to avoid burning quota/latency on doomed attempts.`,
-        type: 'circuit_breaker',
-      },
-    });
-    return;
-  }
-  const error = exhaustedRetryError(lastError, MAX_RETRIES);
-  res.status(error.status).json({
-    error: {
-      message: error.message,
-      type: error.type,
-
+    },
+    onRoutingExhausted: (lastError, routeErr, exhaustion, info) => {
+      if (!lastError) {
+        // Synchronous exhaustion: the router rejected every candidate before
+        // any upstream was tried — log the per-candidate disposition.
+        const disposition: string[] = Array.isArray(routeErr.diagnostics) ? routeErr.diagnostics : [];
+        console.warn(
+          `[Proxy] legacy completions routing exhausted (no upstream tried) req=${shortRequestId(requestGroupId)} ` +
+          `requested=${requestedModelLabel} candidates=${disposition.length}` +
+          (disposition.length ? `:\n  ${disposition.join('\n  ')}` : ''),
+        );
+      }
+      setFallbackHeaders(res, info.attempts.length, info.attempts);
+      setExhaustionHeaders(res, exhaustion);
+      res.status(exhaustion.status).json({ error: exhaustionErrorPayload(exhaustion) });
+    },
+    onExhausted: (exhaustion, info) => {
+      setFallbackHeaders(res, info.attempts.length, info.attempts);
+      setExhaustionHeaders(res, exhaustion);
+      res.status(exhaustion.status).json({ error: exhaustionErrorPayload(exhaustion) });
     },
   });
 });
@@ -1388,14 +1180,8 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
 proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   const start = Date.now();
   const requestGroupId = getRequestGroupId(req);
-
-  // ── abort 熔断（P1-c）：客户端断开即停上游调用 / 跳出 failover ──
-  let clientAborted = false;
-  res.on('close', () => { if (!res.writableFinished) clientAborted = true; });
-
-  // ── client_tag（P2-a）：调用方自标识，用于 auto 流量溯源 ──
-  const clientTag = inferClientTag(req);
   res.setHeader('X-Request-ID', requestGroupId);
+  const clientTag = inferClientTag(req);
 
   // Authenticate with the unified API key for every proxy request, including
   // loopback callers. Browser pages can reach localhost, so socket locality is
@@ -1778,50 +1564,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   if (isAutoModel(requestedModel)) {
     resolvedChain = resolveRoutingChain(requestedModel);
     strategyKey = resolvedChain.strategyKey;
-
-    // Three-layer soft preference: L1 network_tier + L2 category + L3 tags.
-    // This is a "soft" preference — the full chain is still available as fallback.
-    const sceneCategory = detectCategoryScene(messages, wantsTools);
-    const sceneTags = detectSceneTags(messages);
-    const preferredNetworkTier = (req.headers['x-network-tier'] as string | undefined)?.toLowerCase();
-
-    if ((sceneCategory || sceneTags.length > 0 || preferredNetworkTier) && resolvedChain.chain.length > 0) {
-      const db = getDb();
-      const placeholders = resolvedChain.chain.map(() => '?').join(',');
-      const dbIds = resolvedChain.chain.map(e => e.model_db_id);
-      const modelRows = db.prepare(
-        `SELECT id, category, network_tier, tags FROM models WHERE id IN (${placeholders})`
-      ).all(...dbIds) as { id: number; category: string | null; network_tier: string | null; tags: string | null }[];
-
-      const catMap = new Map(modelRows.map(r => [r.id, r.category]));
-      const tierMap = new Map(modelRows.map(r => [r.id, r.network_tier]));
-      const tagsMap = new Map<number, string[]>();
-      for (const r of modelRows) {
-        try {
-          tagsMap.set(r.id, r.tags ? JSON.parse(r.tags) : []);
-        } catch {
-          tagsMap.set(r.id, []);
-        }
-      }
-
-      const sceneCat = sceneCategory ? sceneToCategory(sceneCategory) : null;
-
-      const boost = (e: ChainRow) => {
-        let score = 0;
-        // L1: network_tier match (highest weight)
-        if (preferredNetworkTier && tierMap.get(e.model_db_id) === preferredNetworkTier) score += 4;
-        // L2: category match
-        if (sceneCat && catMap.get(e.model_db_id) === sceneCat) score += 2;
-        // L3: tag match
-        const modelTags = tagsMap.get(e.model_db_id) || [];
-        for (const tag of sceneTags) {
-          if (modelTags.includes(tag)) score += 1;
-        }
-        return score;
-      };
-
-      resolvedChain.chain.sort((a, b) => boost(b) - boost(a));
-    }
   }
 
   // Context handoff only applies to auto-routed requests. Pinned-model requests
@@ -1922,29 +1664,28 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // traffic and failover overrides are visible.
   const pinnedModelId = requestedModel && !isAutoModel(requestedModel) ? requestedModel : null;
 
-  // ── 策略 24 护栏：单请求 token 预算天花板（反 Goodhart） ──
-  // budget<=0 表示不限制（默认）。若预估总 token（输入 + max_tokens）超限，
-  // 路由前硬拒（413），避免在已知超预算的请求上白烧 failover。
-  const budget = getRequestMaxTokensBudget();
-  if (exceedsTokenBudget(estimatedTotal, budget)) {
-    res.status(413).json({
-      error: {
-        message: `Request estimated ${estimatedTotal} tokens exceeds request_max_tokens_budget (${budget}). Reduce input or max_tokens.`,
-        type: 'invalid_request_error',
-      },
-    });
-    return;
-  }
-
-  // ── 策略 24 护栏：连续上游失败断路器 ──
-  // 阈值<=0 不启用（默认），保持原有 MAX_RETRIES 行为。
-  const breaker = newBreaker();
-
-  // Retry loop: on 429/rate limit, skip that model+key and try the next one
-  const skipKeys = new Set<string>();
-  const skipModels = new Set<number>();
-  let lastError: any = null;
-
+  // Retry loop: on 429/rate limit, skip that model+key and try the next one.
+  // The attempt iteration, cooldown/skip/penalty bookkeeping, and exhaustion
+  // rendering are the shared fallback loop (lib/fallback-loop.ts). What stays
+  // here is /chat/completions-specific: the response-cache MISS store, the
+  // context-handoff injection, group/unified-chain routing, and the OpenAI
+  // stream turn-integrity framing.
+  const state = newFallbackState();
+  const attemptLog: AttemptRecord[] = [];
+  // Client-disconnect fan-out: the flag stops the loop before the NEXT
+  // attempt; the AbortController (threaded to the provider as
+  // CompletionOptions.signal) additionally cancels the IN-FLIGHT upstream
+  // fetch and any body/stream read, so tokens stop burning and the in-flight
+  // lease frees immediately. 'close' also fires on normal completion —
+  // writableEnded distinguishes a real disconnect.
+  let clientGone = false;
+  const clientAbort = new AbortController();
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      clientGone = true;
+      clientAbort.abort(newClientAbortError());
+    }
+  });
 
   await runFallbackLoop({
     maxRetries: MAX_RETRIES,
@@ -1983,17 +1724,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       outboundMessages = handoff.messages;
       injectedHandoffTokens = handoff.injectedTokens;
     }
-
-    // ── github 专属请求尺寸护栏（动作①）──
-    // github 上游硬限输入 ≤ 8000 tokens（超限 413）/ max_tokens 受限（超限 400）。
-    // 模型本身活着，故请求前截断输入 + 封顶 max_tokens，消灭 97% 错误。
-    let githubCappedMaxTokens = max_tokens;
-    if (route.platform === 'github') {
-      outboundMessages = truncateMessagesForGithub(outboundMessages);
-      githubCappedMaxTokens = Math.min(max_tokens ?? GITHUB_MAX_OUTPUT_TOKENS, GITHUB_MAX_OUTPUT_TOKENS);
-    }
-
-    try {
 
       if (stream) {
         // — Stream turn-integrity (#231 audit) —
@@ -2053,20 +1783,25 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         });
         const writeChunk = (c: unknown) => res.write(`data: ${JSON.stringify(c)}\n\n`);
 
-        let truncated = false; // set when the streaming budget cap trips mid-stream
-
         try {
           const gen = route.provider.streamChatCompletion(
-            route.apiKey, outboundMessages, route.modelId,
-            { temperature, max_tokens: githubCappedMaxTokens, top_p, stop, tools, tool_choice, parallel_tool_calls },
-
+            route.apiKey, route.platform === 'github' ? truncateMessagesForGithub(outboundMessages) : outboundMessages, route.modelId,
+            { temperature, max_tokens, top_p, stop, tools, tool_choice, parallel_tool_calls, ...samplingParams, signal: clientAbort.signal },
             quotaContextForRoute(route, 'chat/completions'),
           );
 
           for await (const chunk of gen) {
-            if (clientAborted) break;
-            const anyChunk = chunk as Record<string, any>;
-
+            if (clientGone) break; // client hung up: stop pulling; reader.cancel() aborts upstream
+            // Provider metadata is not authoritative for the public gateway
+            // response. Some OpenAI-compatible providers (notably Reka) return
+            // the literal model name "default" even when a concrete model was
+            // requested. Normalize every streamed frame at the proxy boundary
+            // so clients consistently see the model that was actually routed.
+            const rawChunkModel = (chunk as Record<string, any>).model;
+            if (upstreamModel == null && typeof rawChunkModel === 'string' && rawChunkModel.length > 0) {
+              upstreamModel = rawChunkModel;
+            }
+            const anyChunk: Record<string, any> = { ...(chunk as Record<string, any>), model: route.modelId };
 
             // In-band upstream error frame (observed live: Groq emits
             // {"error":{...,"code":"tool_use_failed"}} inside a 200 SSE
@@ -2088,9 +1823,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
                 latencyMs: Date.now() - start,
                 error: sanitizeProviderErrorMessage(String(msg)),
               });
-              logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, `in-band error frame: ${sanitizeProviderErrorMessage(String(msg))}`, ttfbMs, pinnedModelId, clientTag);
-              return;
-
+              logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, `in-band error frame: ${sanitizeProviderErrorMessage(String(msg))}`, ttfbMs, pinnedModelId);
+              return 'committed';
             }
 
             if (anyChunk.id) lastMeta = { id: anyChunk.id, model: anyChunk.model, created: anyChunk.created };
@@ -2134,14 +1868,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
             totalOutputTokens += Math.ceil(text.length / 4);
 
-            // ── 策略 24 护栏：流内 token 预算提前截断（early stop） ──
-            // 累计输出 + 输入超预算即中止生成，避免单请求无限膨胀（与 413
-            // 预检互补：此处覆盖"边生成边超"的运行时场景）。
-            if (budget > 0 && estimatedInputTokens + injectedHandoffTokens + totalOutputTokens > budget) {
-              truncated = true;
-              break;
-            }
-
             if (mode === 'passthrough') {
               writeChunk({ ...anyChunk, choices: [{ ...choice, delta: { ...choice.delta, tool_calls: undefined }, finish_reason: null }] });
               continue;
@@ -2160,12 +1886,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
               heldText = '';
             }
             // else: still a strict prefix of a marker — keep holding.
-          }
-
-          if (clientAborted) {
-            // 客户端已断开：不记账、不 failover，直接收尾（socket 已关闭）
-            try { res.end(); } catch { /* socket gone */ }
-            return;
           }
 
           // — Stream ended cleanly (provider saw [DONE] or a finish_reason) —
@@ -2258,9 +1978,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             inputTokens: estimatedInputTokens + injectedHandoffTokens,
             outputTokens: totalOutputTokens,
           });
-          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens + injectedHandoffTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId, clientTag);
-          return;
-
+          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens + injectedHandoffTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId,
+            observeServedModel({ platform: route.platform, requestedModel: route.modelId, servedModel: upstreamModel }), clientTag);
+          return 'done';
         } catch (streamErr: any) {
           // Client abort mid-stream: the pump's own `if (clientGone) break`
           // can lose the race against the fetch-signal rejection, so the
@@ -2284,9 +2004,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
               latencyMs: Date.now() - start,
               error: sanitizeProviderErrorMessage(streamErr.message),
             });
-            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message), ttfbMs, pinnedModelId, clientTag);
-            return;
-
+            logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, totalOutputTokens, Date.now() - start, sanitizeProviderErrorMessage(streamErr.message), ttfbMs, pinnedModelId, null, clientTag);
+            return 'committed';
           }
           // Headers never sent — bubble to the shared loop, which cooldowns this
           // model+key and tries the next one. Covers upstream HTTP errors, in-band
@@ -2296,9 +2015,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         }
       } else {
         const result = await route.provider.chatCompletion(
-          route.apiKey, outboundMessages, route.modelId,
-          { temperature, max_tokens: githubCappedMaxTokens, top_p, stop, tools, tool_choice, parallel_tool_calls },
-
+          route.apiKey, route.platform === 'github' ? truncateMessagesForGithub(outboundMessages) : outboundMessages, route.modelId,
+          { temperature, max_tokens, top_p, stop, tools, tool_choice, parallel_tool_calls, ...samplingParams, signal: clientAbort.signal },
           quotaContextForRoute(route, 'chat/completions'),
         );
 
@@ -2323,22 +2041,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         const respMsg = result.choices?.[0]?.message;
         const respText = contentToString(respMsg?.content ?? '');
         if (!respText && (respMsg?.tool_calls?.length ?? 0) === 0) {
-          traceRouteEvent('Proxy', {
-            event: 'fail',
-            requestId: requestGroupId,
-            attempt,
-            platform: route.platform,
-            model: route.modelId,
-            latencyMs: Date.now() - start,
-            error: 'empty completion',
-          });
-          logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)', null, pinnedModelId, clientTag);
-          skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-          setCooldown(route.platform, route.modelId, route.keyId, getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }));
-          recordRateLimitHit(route.modelDbId);
-          lastError = new Error(`empty completion from ${route.displayName}`);
-          continue;
-
+          // finish_reason 'length' = the model spent the whole output budget on
+          // hidden reasoning before any visible text (observed live: 5 of 11
+          // hops in one chain). Still fail over, but skipBench tells the shared
+          // loop not to cooldown/penalize a healthy model for a truncated turn.
+          throw Object.assign(
+            new Error(`empty completion from ${route.displayName}`),
+            result.choices?.[0]?.finish_reason === 'length' ? { skipBench: true } : {},
+          );
         }
 
         // Inline tool-call dialect rescue (#231 audit): a tool-bearing
@@ -2365,12 +2075,45 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           }
         }
 
-        const totalTokens = result.usage?.total_tokens ?? 0;
-        if (clientAborted) return;
-        recordRequest(route.platform, route.modelId, route.keyId);
-        recordTokens(route.platform, route.modelId, route.keyId, totalTokens);
-        recordSuccess(route.modelDbId);
+        // Structured-output enforcement (#514 follow-up): the client asked for
+        // JSON; a model that answered in prose despite the forwarded
+        // response_format must not be returned as a "success". Heal the common
+        // almost-right shapes (fenced block, prose-wrapped JSON) in place;
+        // otherwise fail over. Deliberately AFTER the dialect rescue (matching
+        // responses.ts): an inline tool-call turn isn't JSON either, and
+        // gating it first burned a failover hop on turns the rescue converts.
+        // skipBench: the provider is healthy — the MODEL misbehaved — so no
+        // cooldown/penalty; skipModelForRequest: a sibling key would misbehave
+        // identically, so rule out the whole model for this request.
+        if (samplingParams.response_format && respText && (respMsg?.tool_calls?.length ?? 0) === 0) {
+          const enforced = enforceJsonContent(respText);
+          if (!enforced.ok) {
+            // finish_reason 'length' = the JSON was CUT OFF by max_tokens, not
+            // ignored — same failover (a terser model may fit the budget), but
+            // an honest error class/trail instead of "ignored response_format".
+            const truncated = result.choices?.[0]?.finish_reason === 'length';
+            throw Object.assign(
+              new Error(truncated
+                ? `truncated JSON from ${route.displayName} (finish_reason=length — raise max_tokens for this ${samplingParams.response_format.type} request)`
+                : `${route.displayName} ignored response_format (returned non-JSON despite ${samplingParams.response_format.type})`),
+              { skipBench: true, skipModelForRequest: true },
+            );
+          }
+          if (enforced.healed && respMsg) {
+            respMsg.content = enforced.content;
+          }
+        }
 
+        // Usage fallback: providers that omit `usage` used to be logged as 0
+        // tokens, silently undercounting analytics and the rate-limit ledger.
+        // Fall back to the same chars/4 estimate the streaming path uses (tool
+        // arguments included, mirroring the stream accounting).
+        const respToolArgChars = (respMsg?.tool_calls ?? []).reduce((n, tc) => n + (tc?.function?.arguments?.length ?? 0), 0);
+        const promptTokens = result.usage?.prompt_tokens ?? estimatedInputTokens;
+        const completionTokens = result.usage?.completion_tokens
+          ?? Math.ceil((contentToString(respMsg?.content ?? '').length + respToolArgChars) / 4);
+        const totalTokens = result.usage?.total_tokens ?? (promptTokens + completionTokens);
+        recordUpstreamSuccess(route, totalTokens);
         // Use stickyStrategyKey (not the global strategyKey) so a group-pinned
         // request writes its sticky entry under the SAME key the next turn reads
         // from (set to the requested model id at the top of the loop). Matches the
@@ -2423,9 +2166,9 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           inputTokens: promptTokens,
           outputTokens: completionTokens,
         });
-        logRequest(route.platform, route.modelId, route.keyId, 'success', result.usage?.prompt_tokens ?? 0, result.usage?.completion_tokens ?? 0, Date.now() - start, null, null, pinnedModelId, clientTag);
-        return;
-
+        logRequest(route.platform, route.modelId, route.keyId, 'success', promptTokens, completionTokens, Date.now() - start, null, null, pinnedModelId,
+          observeServedModel({ platform: route.platform, requestedModel: route.modelId, servedModel: upstreamModel }), clientTag);
+        return 'done';
       }
     },
     logFailure: (route, err, attempt) => {
@@ -2440,79 +2183,40 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         latencyMs: latency,
         error: safeError,
       });
-      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId, clientTag);
-
-      if (isRetryableError(err)) {
-        // Model-level 404 (removed/deprecated upstream): rule the whole model
-        // out for the rest of this request — its other keys would 404 the same
-        // way. The per-key cooldown below still applies, so cross-request
-        // behavior (#66/#76) is unchanged. (PR #111, credits @barbotkonv.)
-        // 404 (removed upstream) and 403 (model off-limits to this key's tier)
-        // both rule the model out: a sibling key on the same platform would
-        // fail it identically, so skip it for the rest of this request.
-        if (isModelNotFoundError(err) || isModelAccessForbiddenError(err)) skipModels.add(route.modelDbId);
-
-        // Put this model+key on cooldown and try the next one
-        const skipId = `${route.platform}:${route.modelId}:${route.keyId}`;
-        skipKeys.add(skipId);
-        setCooldown(
-          route.platform,
-          route.modelId,
-          route.keyId,
-          isPaymentRequiredError(err)
-            ? PAYMENT_REQUIRED_COOLDOWN_MS
-            // A 403 won't clear on the next window (it's a tier/subscription gate,
-            // not a transient limit), so bench this model+key for a day like a 402
-            // instead of re-trying it every request. See issue #256.
-            : isModelAccessForbiddenError(err)
-            ? MODEL_FORBIDDEN_COOLDOWN_MS
-            : getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, {
-                rpd: route.rpdLimit,
-                tpd: route.tpdLimit,
-              }, err.retryAfterMs),
-        );
-        recordRateLimitHit(route.modelDbId);
-        // Self-correct the catalog: if the provider reported its real ceiling in
-        // the error body (e.g. a Groq 413 "tokens per minute (TPM): Limit 30000"),
-        // persist it so the next request's pre-check fails over BEFORE the 413
-        // instead of re-discovering it. No-op for errors with no parseable limit.
-        learnLimitFromError(route.modelDbId, err);
-        recordUpstreamFailure(breaker);
-        lastError = err;
-        if (breaker.tripped) break;
-        continue;
-      }
-
-      // Non-retryable error (auth, 4xx, etc.): don't retry
-
+      logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, latency, safeError, null, pinnedModelId, null, clientTag);
+    },
+    onFatal: (route, err, attempt) => {
+      // Non-retryable error (bare 4xx, etc.): don't retry.
+      setFallbackHeaders(res, attempt, attemptLog);
       res.status(502).json({
         error: {
           message: `Provider error (${route.displayName}): ${sanitizeProviderErrorMessage(err.message)}`,
           type: 'provider_error',
         },
       });
-      return;
-    }
-  }
-
-  // Exhausted all retries
-  // ── 策略 24 护栏：连续上游失败断路器跳闸优先于普通耗尽 ──
-  if (breaker.tripped) {
-    const limit = getMaxConsecutiveUpstreamFails();
-    res.status(503).json({
-      error: {
-        message: `Circuit breaker tripped after ${limit} consecutive upstream failures. The model pool appears unhealthy — aborting failover to avoid burning quota/latency on doomed attempts.`,
-        type: 'circuit_breaker',
-      },
-    });
-    return;
-  }
-  const error = exhaustedRetryError(lastError, MAX_RETRIES);
-  res.status(error.status).json({
-    error: {
-      message: error.message,
-      type: error.type,
-
+    },
+    onRoutingExhausted: (lastError, routeErr, exhaustion, info) => {
+      // No more models available.
+      if (!lastError) {
+        // Synchronous exhaustion: the router rejected every candidate before any
+        // upstream was tried, so this is the ONLY place the per-model disposition
+        // is recorded. Without it the exhaustion status is opaque — you can't tell
+        // a genuinely dry pool from cooldowns/quota/context narrowing (issue _1).
+        const disposition: string[] = Array.isArray(routeErr.diagnostics) ? routeErr.diagnostics : [];
+        console.warn(
+          `[Proxy] routing exhausted (no upstream tried) req=${shortRequestId(requestGroupId)} ` +
+          `requested=${requestedModelLabel} candidates=${disposition.length}` +
+          (disposition.length ? `:\n  ${disposition.join('\n  ')}` : ''),
+        );
+      }
+      setFallbackHeaders(res, info.attempts.length, info.attempts);
+      setExhaustionHeaders(res, exhaustion);
+      res.status(exhaustion.status).json({ error: exhaustionErrorPayload(exhaustion) });
+    },
+    onExhausted: (exhaustion, info) => {
+      setFallbackHeaders(res, info.attempts.length, info.attempts);
+      setExhaustionHeaders(res, exhaustion);
+      res.status(exhaustion.status).json({ error: exhaustionErrorPayload(exhaustion) });
     },
   });
 });

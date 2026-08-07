@@ -1,6 +1,6 @@
-import type Database from 'better-sqlite3';
+import type { Db } from '../../db/types.js';
 
-export function up(db: Database.Database): void {
+export function up(db: Db): void {
   // PRAGMA guard: only add columns if they do not already exist.
   // Prevents "duplicate column" errors when this migration is re-run
   // (e.g. registered late after columns were already created on a live DB,
@@ -34,7 +34,7 @@ export function up(db: Database.Database): void {
   `);
 }
 
-export function down(db: Database.Database): void {
+export function down(db: Db): void {
   // SQLite doesn't support DROP COLUMN directly, we need to recreate table
   // For simplicity, we'll just drop the table and columns if needed in a real scenario
   // But for this migration, we'll note that downgrade is complex and not implemented

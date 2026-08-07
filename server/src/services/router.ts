@@ -604,7 +604,7 @@ const GLOBAL_SORT_ALIASES: Record<string, string> = {
  * entirely of exhausted models), we fall back to the unfiltered chain to
  * avoid a hard "no models available" error.
  */
-function filterExhaustedQuota(db: Database, chain: ChainRow[]): ChainRow[] {
+function filterExhaustedQuota(db: Db, chain: ChainRow[]): ChainRow[] {
   let rows: { platform: string; key_id: number | null }[] = [];
   try {
     // Only treat a (platform,key_id) as exhausted when remaining_value = 0 AND
@@ -629,7 +629,7 @@ function filterExhaustedQuota(db: Database, chain: ChainRow[]): ChainRow[] {
   return filtered.length > 0 ? filtered : chain;
 }
 
-function getActiveChain(db: Database): ChainRow[] {
+function getActiveChain(db: Db): ChainRow[] {
   const profileId = getActiveProfileId(db);
   if (profileId != null) {
     const chain = db.prepare(`
@@ -1175,7 +1175,7 @@ const HIGH_VALUE_INPUT_THRESHOLD = 20000;
 // Drop is_high_value=1 models from the chain. Returns the filtered chain; if
 // filtering would empty it, returns the original so large-context requests can
 // still be served by whatever is available.
-function filterHighValueIfLarge(db: Database, chain: ChainRow[]): ChainRow[] {
+function filterHighValueIfLarge(db: Db, chain: ChainRow[]): ChainRow[] {
   const hv = new Set<number>(
     (db.prepare('SELECT id FROM models WHERE is_high_value = 1').all() as { id: number }[]).map(r => r.id),
   );
