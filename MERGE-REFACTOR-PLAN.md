@@ -25,6 +25,31 @@
 
 ---
 
+## 执行范围与护栏（领航员授权，2026-08-07）
+
+> 本节记录领航员 `cnb.cAvcKH7bAEA` 在 **2026-08-07** 明确授权的执行边界，任何落地改动必须遵守：
+
+### 1. 产出与推送
+- 产出 `MERGE-REFACTOR-PLAN.md`（本文件）后**直接 push 到 `main`**，并把 commit hash 回帖。
+
+### 2. 代码改动边界（只限 5 个文件）
+| 可改动 | ❌ 不可触碰 |
+|---|---|
+| `router.ts` / `ratelimit.ts` / `guardrails.ts` / `settings.ts` / `responses.ts` | `anthropic.ts` / `proxy.ts` |
+
+- 仅当需要**落地本方案**时才涉及以上 5 文件的改动；`anthropic.ts` / `proxy.ts` 的结构性重构（`runFallbackLoop`）归灰狐负责，本 NPC 不碰。
+- 本文件（`MERGE-REFACTOR-PLAN.md`）**只做分析与方案，不修改任何业务代码**（除上文 5 文件授权外，其他业务文件一律不改）。
+- 不 push 到任何 github remote（`origin` 仅指 CNB 平台）；不自动 merge。
+
+### 3. 已授权文件的定制保全要求（落地时强制）
+- `router.ts`：保留 `filterExhaustedQuota`（×3 调用点）+ `filterHighValueIfLarge` / `is_high_value` 标记（`splice` 原地替换，避免引用破坏）。
+- `ratelimit.ts`：保留 `NO_LIMIT_COOLDOWN_CAP_MS=10min` 封顶，**单点合入上游 `getCooldownDecisionForLimit`**（方案 A，防上游启发式升 24h 阶梯）；`quotaSignal` 门保留。
+- `guardrails.ts`：直接采纳上游（上游注释确认 "Ported from e5024d53"），常量名需改引用；可选薄包装 `exceedsTokenBudget`。
+- `settings.ts`：合入上游改动，保留本地定制（如适用）。
+- `responses.ts`：随 `anthropic.ts` / `proxy.ts` 一并重构为 `runFallbackLoop`（由灰狐统一执行，NPC 只出方案不落地）。
+
+---
+
 ## 0. 基线事实（实测，先确认再动手）
 
 ### 0.1 版本差距
