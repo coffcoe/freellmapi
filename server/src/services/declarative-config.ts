@@ -1,10 +1,11 @@
 import fs from 'fs';
 import { z } from 'zod';
-import type Database from 'better-sqlite3';
+import type { Db } from '../db/types.js';
 import { getDb } from '../db/index.js';
 import { encrypt } from '../lib/crypto.js';
 import { resolveProvider } from '../providers/index.js';
 import { setCustomWeights, setRoutingStrategy } from './router.js';
+import { ensureModelInProfiles } from './profile-models.js';
 import {
   clearCatalogModelTombstone,
   isCatalogManagedModel,
@@ -94,6 +95,8 @@ export interface DeclarativeConfigResult {
   models: number;
   fallback: number;
   routing: boolean;
+  /** Per-entry problems that were degraded to a skip instead of failing the apply (#600). */
+  warnings: string[];
 }
 
 interface NormalizedCustomModel {
@@ -124,7 +127,26 @@ function encryptedKey(raw: string) {
   return { encrypted, iv, authTag };
 }
 
-function upsertApiKey(db: Database.Database, input: z.infer<typeof keySchema>): number {
+// Boot-time skip guard for `keys` entries (#600). When a platform stops being
+// keyless (pollinations lost `keyless: true` in #573), a legacy declarative
+// config still carries an entry with no `key` — applyDeclarativeConfigFromEnv()
+// runs in main(), so throwing here used to brick the whole install at startup.
+// Such entries degrade to a warning + skip; the rest of the config still
+// applies. Platform-specific remediation hints live here.
+const MISSING_KEY_HINTS: Record<string, string> = {
+  pollinations: 'pollinations now requires an API key — get one at enter.pollinations.ai',
+};
+
+function missingKeyWarning(input: z.infer<typeof keySchema>): string | null {
+  const platform = input.platform.trim();
+  if (platform === 'custom' || input.key?.trim()) return null;
+  const provider = resolveProvider(platform as never);
+  if (!provider || provider.keyless) return null;
+  const hint = MISSING_KEY_HINTS[platform] ?? `${platform} requires an API key — add "key" to this entry or remove it`;
+  return `${hint}; entry skipped`;
+}
+
+function upsertApiKey(db: Db, input: z.infer<typeof keySchema>): number {
   const platform = input.platform.trim();
   const enabled = input.enabled === false ? 0 : 1;
   const isCustom = platform === 'custom';
@@ -177,7 +199,7 @@ function normalizeModelEntry(entry: z.infer<typeof modelEntrySchema>): Normalize
   return { ...entry, modelId, displayName: entry.displayName?.trim() || modelId };
 }
 
-function ensureFallbackRow(db: Database.Database, modelDbId: number, enabled = true, updateExisting = true): void {
+function ensureFallbackRow(db: Db, modelDbId: number, enabled = true, updateExisting = true): void {
   const existing = db.prepare('SELECT 1 FROM fallback_config WHERE model_db_id = ?').get(modelDbId);
   if (existing) {
     if (updateExisting) {
@@ -188,9 +210,14 @@ function ensureFallbackRow(db: Database.Database, modelDbId: number, enabled = t
   const max = db.prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config').get() as { m: number };
   db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, ?)')
     .run(modelDbId, max.m + 1, enabled ? 1 : 0);
+  // A chain row alone is not enough to be routable: when a profile is active the
+  // router reads profile_models, so a declaratively-added model would be present
+  // in the dashboard yet never selected. routes/keys.ts does the same after its
+  // own fallback_config insert.
+  ensureModelInProfiles(db, modelDbId);
 }
 
-function registerCustomProvider(db: Database.Database, input: z.infer<typeof customProviderSchema>): number {
+function registerCustomProvider(db: Db, input: z.infer<typeof customProviderSchema>): number {
   const keyId = upsertApiKey(db, {
     platform: 'custom',
     key: input.apiKey,
@@ -205,8 +232,8 @@ function registerCustomProvider(db: Database.Database, input: z.infer<typeof cus
       INSERT INTO models
         (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
          rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
-         enabled, supports_vision, supports_tools, key_id)
-      VALUES ('custom', ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, 1, ?, ?, ?)
+         enabled, supports_vision, supports_tools, key_id, source)
+      VALUES ('custom', ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, ?, ?, 1, ?, ?, ?, 'user')
       ON CONFLICT(platform, model_id)
       DO UPDATE SET
         display_name = excluded.display_name,
@@ -250,20 +277,24 @@ function modelPatchFromInput(input: z.infer<typeof modelSchema>): ModelOverrideP
   return patch;
 }
 
-function upsertModel(db: Database.Database, input: z.infer<typeof modelSchema>): void {
+function upsertModel(db: Db, input: z.infer<typeof modelSchema>): void {
   const platform = input.platform.trim();
   const modelId = input.modelId.trim();
   clearCatalogModelTombstone(db, 'chat', platform, modelId);
-  const existing = db.prepare('SELECT id, platform, model_id, key_id FROM models WHERE platform = ? AND model_id = ?')
-    .get(platform, modelId) as { id: number; platform: string; model_id: string; key_id: number | null } | undefined;
+  const existing = db.prepare('SELECT id, platform, model_id, key_id, source FROM models WHERE platform = ? AND model_id = ?')
+    .get(platform, modelId) as { id: number; platform: string; model_id: string; key_id: number | null; source: string } | undefined;
 
   if (!existing) {
+    // A declaratively-created model is user-owned: catalog sync must never
+    // update or prune it (see applyCatalog). Patching an EXISTING catalog row
+    // below does NOT flip ownership — the row's existence is still catalog-
+    // managed and the edit is recorded as an override instead.
     db.prepare(`
       INSERT INTO models
         (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
          rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
-         enabled, supports_vision, supports_tools)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         enabled, supports_vision, supports_tools, source)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'user')
     `).run(
       platform,
       modelId,
@@ -302,6 +333,7 @@ function upsertModel(db: Database.Database, input: z.infer<typeof modelSchema>):
     contextWindow: 'context_window',
     supportsVision: 'supports_vision',
     supportsTools: 'supports_tools',
+    enabled: 'enabled',
   };
   for (const key of Object.keys(patch) as Array<keyof ModelOverridePatch>) {
     assignments.push(`${columnMap[key]} = ?`);
@@ -321,7 +353,7 @@ function upsertModel(db: Database.Database, input: z.infer<typeof modelSchema>):
   ensureFallbackRow(db, existing.id, input.fallbackEnabled ?? input.enabled !== false, input.fallbackEnabled !== undefined);
 }
 
-function applyFallback(db: Database.Database, entries: z.infer<typeof fallbackEntrySchema>[]): number {
+function applyFallback(db: Db, entries: z.infer<typeof fallbackEntrySchema>[]): number {
   const update = db.prepare('UPDATE fallback_config SET priority = ?, enabled = ? WHERE model_db_id = ?');
   let changed = 0;
   entries.forEach((entry, i) => {
@@ -350,10 +382,17 @@ export function applyDeclarativeConfig(input: unknown, source = 'inline'): Decla
     models: 0,
     fallback: 0,
     routing: false,
+    warnings: [],
   };
 
   const apply = db.transaction(() => {
     for (const key of parsed.data.keys ?? []) {
+      const warning = missingKeyWarning(key);
+      if (warning) {
+        result.warnings.push(warning);
+        console.warn(`[config] ${warning}`);
+        continue;
+      }
       upsertApiKey(db, key);
       result.keys++;
     }
@@ -380,12 +419,13 @@ export function applyDeclarativeConfig(input: unknown, source = 'inline'): Decla
 export function applyDeclarativeConfigFromEnv(): DeclarativeConfigResult {
   const loaded = readConfigFromEnv();
   if (!loaded) {
-    return { applied: false, keys: 0, customModels: 0, models: 0, fallback: 0, routing: false };
+    return { applied: false, keys: 0, customModels: 0, models: 0, fallback: 0, routing: false, warnings: [] };
   }
   const result = applyDeclarativeConfig(loaded.value, loaded.source);
   console.log(
     `[config] applied ${loaded.source}: ${result.keys} keys, ${result.customModels} custom models, ` +
-      `${result.models} model edits, ${result.fallback} fallback rows${result.routing ? ', routing' : ''}`,
+      `${result.models} model edits, ${result.fallback} fallback rows${result.routing ? ', routing' : ''}` +
+      `${result.warnings.length > 0 ? `, ${result.warnings.length} entries skipped` : ''}`,
   );
   return result;
 }

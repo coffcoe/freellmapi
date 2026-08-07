@@ -1,24 +1,26 @@
 import { useEffect, useState } from 'react'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { Link, useParams } from 'react-router-dom'
-import { ChevronLeft, Save, Trash2 } from 'lucide-react'
+import { ChevronLeft, Merge, Save, Split, Trash2 } from 'lucide-react'
 import { useI18n } from '@/i18n'
 import { apiFetch } from '@/lib/api'
 import { Button } from '@/components/ui/button'
+import { ConfirmButton } from '@/components/confirm-button'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { CopyButton } from '@/components/copy-button'
+import { TableSkeleton } from '@/components/ui/skeleton'
 import { Tooltip } from '@/components/tooltip'
 import { PageHeader } from '@/components/page-header'
 import { ModelsTabs } from '@/components/models-tabs'
+import { ModelTableHead, RowContent } from '@/components/model-table'
 import {
-  ModelTableHead,
-  RowContent,
   groupQuotaBadge,
+  providerLabel,
   type FallbackEntry,
   type RoutingData,
   type Row,
-} from './FallbackPage'
+} from '@/lib/routing'
 
 type ModelSettingsPatch = {
   displayName: string
@@ -26,6 +28,20 @@ type ModelSettingsPatch = {
   supportsVision: boolean
   supportsTools: boolean
   fallbackEnabled: boolean
+}
+
+// The persisted unify overrides (see server model-groups.ts). `splits` forces a
+// "platform:model_id" member out of its computed group into its own entry.
+type UnifyOverrides = {
+  merges: { into: string; keys: string[] }[]
+  splits: { member: string; groupKey?: string }[]
+}
+
+// What the per-provider split control should do for one member row.
+export type SplitAction = {
+  kind: 'split' | 'undo'
+  pending: boolean
+  onClick: () => void
 }
 
 // One model's own page: lists every provider that serves it (this model now
@@ -48,6 +64,10 @@ export default function ModelDetailPage() {
   const { data: keyData } = useQuery<{ apiKey: string }>({
     queryKey: ['unified-key'],
     queryFn: () => apiFetch('/api/settings/api-key'),
+  })
+  const { data: unify } = useQuery<{ enabled: boolean; overrides: UnifyOverrides }>({
+    queryKey: ['unify'],
+    queryFn: () => apiFetch('/api/settings/unify'),
   })
 
   // Toggling a provider persists immediately (no save bar on this page): send the
@@ -77,6 +97,46 @@ export default function ModelDetailPage() {
       queryClient.invalidateQueries({ queryKey: ['models'] })
     },
   })
+
+  // Split a provider's copy out of its unified model (or merge it back).
+  // PUT /api/settings/unify replaces the whole overrides object, so send the
+  // current merges untouched with the adjusted splits list.
+  const splitMutation = useMutation({
+    mutationFn: (splits: UnifyOverrides['splits']) =>
+      apiFetch('/api/settings/unify', {
+        method: 'PUT',
+        body: JSON.stringify({ overrides: { merges: unify?.overrides.merges ?? [], splits } }),
+      }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['unify'] })
+      queryClient.invalidateQueries({ queryKey: ['fallback'] })
+      queryClient.invalidateQueries({ queryKey: ['fallback', 'routing'] })
+      queryClient.invalidateQueries({ queryKey: ['models'] })
+    },
+  })
+
+  const splits = unify?.overrides.splits ?? []
+  const memberKey = (m: Row) => `${m.platform}:${m.modelId}`
+  // The split control for one provider row: offer "keep separate" while the
+  // model is merged with siblings, and "merge back" on a copy that was split
+  // out (it lives on its own page then, so the undo must live there too).
+  function splitActionFor(m: Row, memberCount: number): SplitAction | undefined {
+    if (!unify) return undefined
+    const isSplit = splits.some(s => s.member === memberKey(m))
+    if (isSplit) {
+      return {
+        kind: 'undo',
+        pending: splitMutation.isPending,
+        onClick: () => splitMutation.mutate(splits.filter(s => s.member !== memberKey(m))),
+      }
+    }
+    if (memberCount < 2) return undefined
+    return {
+      kind: 'split',
+      pending: splitMutation.isPending,
+      onClick: () => splitMutation.mutate([...splits, { member: memberKey(m) }]),
+    }
+  }
 
   const isManual = (routing?.strategy ?? 'balanced') === 'priority'
   const scoreById = new Map((routing?.scores ?? []).map(s => [s.modelDbId, s]))
@@ -126,7 +186,7 @@ export default function ModelDetailPage() {
         </Link>
 
         {isLoading ? (
-          <p className="text-sm text-muted-foreground">{t('common.loading')}</p>
+          <TableSkeleton rows={3} />
         ) : members.length === 0 ? (
           <div className="rounded-3xl border border-dashed p-8 text-center">
             <p className="text-sm text-muted-foreground">{t('models.modelNotFound')}</p>
@@ -169,6 +229,7 @@ export default function ModelDetailPage() {
                     deleting={modelDeleteMutation.isPending && modelDeleteMutation.variables === m.modelDbId}
                     onSave={(patch) => modelPatchMutation.mutate({ modelDbId: m.modelDbId, patch })}
                     onDelete={() => modelDeleteMutation.mutate(m.modelDbId)}
+                    splitAction={splitActionFor(m, members.length)}
                   />
                 ))}
               </div>
@@ -181,7 +242,7 @@ export default function ModelDetailPage() {
               <div className="space-y-1.5">
                 {members.map(m => (
                   <div key={m.modelDbId} className="flex items-center gap-2 text-xs">
-                    <span className="w-28 shrink-0 text-muted-foreground">{m.platform}</span>
+                    <span className="w-28 shrink-0 text-muted-foreground">{providerLabel(m)}</span>
                     <code className="min-w-0 flex-1 truncate font-mono text-[11px]">{m.modelId}</code>
                     <Tooltip text={t('models.copyModelName')}>
                       <CopyButton text={m.modelId} label={t('models.copyModelName')} className="border-0 bg-transparent" />
@@ -212,12 +273,14 @@ function ProviderSettingsRow({
   deleting,
   onSave,
   onDelete,
+  splitAction,
 }: {
   model: Row
   saving: boolean
   deleting: boolean
   onSave: (patch: ModelSettingsPatch) => void
   onDelete: () => void
+  splitAction?: SplitAction
 }) {
   const { t } = useI18n()
   const [displayName, setDisplayName] = useState(model.displayName)
@@ -225,7 +288,6 @@ function ProviderSettingsRow({
   const [supportsVision, setSupportsVision] = useState(model.supportsVision)
   const [supportsTools, setSupportsTools] = useState(model.supportsTools)
   const [fallbackEnabled, setFallbackEnabled] = useState(model.enabled)
-  const [confirmDelete, setConfirmDelete] = useState(false)
 
   useEffect(() => {
     setDisplayName(model.displayName)
@@ -233,14 +295,7 @@ function ProviderSettingsRow({
     setSupportsVision(model.supportsVision)
     setSupportsTools(model.supportsTools)
     setFallbackEnabled(model.enabled)
-    setConfirmDelete(false)
   }, [model.modelDbId, model.displayName, model.contextWindow, model.supportsVision, model.supportsTools, model.enabled])
-
-  useEffect(() => {
-    if (!confirmDelete) return
-    const timer = window.setTimeout(() => setConfirmDelete(false), 3000)
-    return () => window.clearTimeout(timer)
-  }, [confirmDelete])
 
   const parsedContext = contextWindow.trim() === '' ? null : Number(contextWindow)
   const contextInvalid = parsedContext !== null && (!Number.isInteger(parsedContext) || parsedContext <= 0)
@@ -265,24 +320,36 @@ function ProviderSettingsRow({
     })
   }
 
-  function remove() {
-    if (!confirmDelete) {
-      setConfirmDelete(true)
-      return
-    }
-    onDelete()
-  }
-
   return (
     <div className="rounded-xl border bg-background/60 p-3">
       <div className="mb-3 flex flex-wrap items-center gap-2">
-        <span className="text-xs font-medium">{model.platform}</span>
+        <span className="text-xs font-medium">{providerLabel(model)}</span>
         <code className="min-w-0 truncate font-mono text-[11px] text-muted-foreground">{model.modelId}</code>
         <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">{sourceLabel}</span>
         {model.hasOverrides && (
           <span className="rounded-full bg-emerald-600/15 px-1.5 py-0.5 text-[10px] text-emerald-700 dark:text-emerald-400">
             {t('models.localOverride')}
           </span>
+        )}
+        {splitAction?.kind === 'undo' && (
+          <span className="rounded-full bg-amber-600/15 px-1.5 py-0.5 text-[10px] text-amber-700 dark:text-amber-400">
+            {t('models.splitBadge')}
+          </span>
+        )}
+        {splitAction && (
+          <Tooltip text={t(splitAction.kind === 'split' ? 'models.splitOutHint' : 'models.splitUndoHint')}>
+            <Button
+              type="button"
+              size="xs"
+              variant="ghost"
+              className="ml-auto text-muted-foreground"
+              disabled={splitAction.pending}
+              onClick={splitAction.onClick}
+            >
+              {splitAction.kind === 'split' ? <Split className="size-3" /> : <Merge className="size-3" />}
+              {t(splitAction.kind === 'split' ? 'models.splitOut' : 'models.splitUndo')}
+            </Button>
+          </Tooltip>
         )}
       </div>
       <div className="grid gap-3 md:grid-cols-[minmax(12rem,1fr)_8rem_auto_auto_auto_auto] md:items-end">
@@ -325,15 +392,17 @@ function ProviderSettingsRow({
               <Save className="size-3.5" />
             </Button>
           </Tooltip>
-          <Button
-            type="button"
-            size={confirmDelete ? 'xs' : 'icon-sm'}
+          <ConfirmButton
             variant="destructive"
+            size="icon-sm"
+            armedSize="xs"
+            armedClassName=""
             disabled={saving || deleting}
-            onClick={remove}
+            onConfirm={onDelete}
+            aria-label={t('common.delete')}
           >
-            {confirmDelete ? t('common.confirm') : <Trash2 className="size-3.5" />}
-          </Button>
+            <Trash2 className="size-3.5" />
+          </ConfirmButton>
         </div>
       </div>
     </div>

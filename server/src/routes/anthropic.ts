@@ -7,23 +7,23 @@ import type {
   ChatToolCall,
   ChatToolDefinition,
   ChatToolChoice,
-  ChatContent,
   ChatContentBlock,
 } from '@freellmapi/shared/types.js';
-import { routeRequest, recordRateLimitHit, recordSuccess, type RouteResult } from '../services/router.js';
-import {
-  recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit,
-  PAYMENT_REQUIRED_COOLDOWN_MS, MODEL_FORBIDDEN_COOLDOWN_MS, learnLimitFromError,
-} from '../services/ratelimit.js';
+import { routeRequest, routingReserveTokens, type RouteResult } from '../services/router.js';
 import { getUnifiedApiKey } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
+import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError } from '../lib/error-classify.js';
 import { getRequestMaxTokensBudget, getMaxConsecutiveUpstreamFails, newBreaker, recordUpstreamFailure, exceedsTokenBudget } from '../lib/guardrails.js';
+
 import { logRequest } from '../lib/request-log.js';
 import { extractApiToken, timingSafeStringEqual, getStickyModel, setStickyModel } from './proxy.js';
+import { runFallbackLoop, newFallbackState, recordUpstreamSuccess, type ExhaustionBody, setFallbackHeaders, setExhaustionHeaders, type AttemptRecord } from '../lib/fallback-loop.js';
+import { applyTokenBudget, tokenBudgetMessage } from '../lib/guardrails.js';
 import { resolveAnthropicModel } from '../services/anthropic-map.js';
+import type { ReasoningEffort } from '../lib/sampling-params.js';
 import { buildModelListing } from '../services/model-listing.js';
 
 // Anthropic-compatible Messages API (`POST /v1/messages`). This is a thin
@@ -83,20 +83,51 @@ const messagesSchema = z.object({
   system: z.union([z.string(), z.array(contentBlockSchema)]).optional(),
   temperature: z.number().min(0).max(2).optional(),
   top_p: z.number().min(0).max(1).optional(),
+  // Anthropic's native top_k — forwarded to providers that support it via the
+  // platform policy in lib/sampling-params.ts.
+  top_k: z.number().int().min(1).nullable().optional(),
   stream: z.boolean().optional(),
   stop_sequences: z.array(z.string()).optional(),
   tools: z.array(anthropicToolSchema).optional(),
   tool_choice: anthropicToolChoiceSchema.optional(),
+  // Anthropic's native extended-thinking knob. Mapped onto the internal
+  // reasoning_effort (see effortFromAnthropicThinking) so providers with
+  // request-side reasoning control receive it; platforms without support have
+  // it stripped by the policy in lib/sampling-params.ts.
+  thinking: z.object({
+    type: z.enum(['enabled', 'disabled']).optional(),
+    budget_tokens: z.number().int().optional(),
+  }).passthrough().nullable().optional(),
 }).passthrough();
 
 type AnthropicRequest = z.infer<typeof messagesSchema>;
+
+// Anthropic expresses reasoning control as a token budget; our internal knob
+// is OpenAI's coarse effort scale. Thresholds follow Anthropic's own guidance
+// bands (minimum budget 1024; multi-10k budgets for hard problems).
+export function effortFromAnthropicThinking(
+  thinking: { type?: string; budget_tokens?: number } | null | undefined,
+): ReasoningEffort | undefined {
+  if (!thinking) return undefined;
+  if (thinking.type === 'disabled') return 'none';
+  const budget = thinking.budget_tokens;
+  if (budget == null) return 'medium';
+  if (budget < 4096) return 'low';
+  if (budget < 16384) return 'medium';
+  return 'high';
+}
 
 // ── Response shape ──────────────────────────────────────────────────────────
 type AnthropicStopReason = 'end_turn' | 'max_tokens' | 'stop_sequence' | 'tool_use' | null;
 
 interface AnthropicTextBlock { type: 'text'; text: string }
-interface AnthropicToolUseBlock { type: 'tool_use'; id: string; name: string; input: unknown }
-type AnthropicResponseBlock = AnthropicTextBlock | AnthropicToolUseBlock;
+interface AnthropicToolUseBlock { type: 'tool_use'; id: string; name: string; input: unknown; thought_signature?: string }
+// The model's reasoning trace, rendered on Anthropic's native wire shape. The
+// signature field is required by the shape but is only meaningful for real
+// Anthropic models (replay verification); empty here. Our request converter
+// drops thinking blocks on the way in, so replay is safe.
+interface AnthropicThinkingBlock { type: 'thinking'; thinking: string; signature: string }
+type AnthropicResponseBlock = AnthropicTextBlock | AnthropicToolUseBlock | AnthropicThinkingBlock;
 
 interface AnthropicMessageResponse {
   id: string;
@@ -109,15 +140,39 @@ interface AnthropicMessageResponse {
   usage: { input_tokens: number; output_tokens: number };
 }
 
-// Carries an HTTP status + Anthropic error type through the routing loop.
-class AnthropicError extends Error {
-  constructor(readonly status: number, readonly errorType: string, message: string) {
-    super(message);
-  }
-}
-
 function sendError(res: Response, status: number, errorType: string, message: string): void {
   res.status(status).json({ type: 'error', error: { type: errorType, message } });
+}
+
+// The shared exhaustion body's `type` strings are chosen to be valid on the
+// OpenAI-shaped surfaces; several of them are not Anthropic error types. Remap
+// them onto Anthropic's vocabulary via the body's coarse `kind` so this
+// surface stays wire-correct: auth/upstream failures → 'api_error', pool
+// unavailability → 'overloaded_error', context exhaustion → Anthropic's 413
+// 'request_too_large', model-gone → 'not_found_error'.
+function anthropicErrorType(body: ExhaustionBody): string {
+  if (body.kind === 'auth' || body.kind === 'upstream') return 'api_error';
+  if (body.kind === 'unavailable') return 'overloaded_error';
+  if (body.kind === 'context_too_large') return 'request_too_large';
+  if (body.kind === 'model_not_found') return 'not_found_error';
+  return body.type;
+}
+
+// Render an exhaustion body on the Anthropic wire shape, carrying the
+// machine-readable extras (`code`, `retryAtMs`) alongside Anthropic's standard
+// type/message and stamping the matching Retry-After header. Extra keys on the
+// error object are ignored by Anthropic SDKs, so this stays wire-compatible.
+function sendExhaustion(res: Response, body: ExhaustionBody): void {
+  setExhaustionHeaders(res, body);
+  res.status(body.status).json({
+    type: 'error',
+    error: {
+      type: anthropicErrorType(body),
+      message: body.message,
+      ...(body.code ? { code: body.code } : {}),
+      ...(body.retryAtMs != null ? { retryAtMs: body.retryAtMs } : {}),
+    },
+  });
 }
 
 function newMessageId(): string {
@@ -231,10 +286,12 @@ function convertRequest(input: AnthropicRequest): ConvertedRequest {
         const url = imageBlockToUrl(block);
         if (url) { imageBlocks.push({ type: 'image_url', image_url: { url } } as ChatContentBlock); hasImage = true; }
       } else if (type === 'tool_use') {
+        const thoughtSignature = (block as any).thought_signature ?? (block as any).thoughtSignature;
         toolCalls.push({
           id: String((block as any).id ?? ''),
           type: 'function',
           function: { name: String((block as any).name ?? ''), arguments: JSON.stringify((block as any).input ?? {}) },
+          ...(typeof thoughtSignature === 'string' && thoughtSignature.length > 0 ? { thought_signature: thoughtSignature } : {}),
         });
       } else if (type === 'tool_result') {
         toolResults.push({
@@ -311,10 +368,24 @@ function parseToolInput(raw: string): unknown {
 
 function toAnthropicContent(message: ChatMessage | undefined): AnthropicResponseBlock[] {
   const blocks: AnthropicResponseBlock[] = [];
+  // Reasoning output (native provider reasoning_content, or extracted from an
+  // inline <think> block by lib/think-tags.ts) → Anthropic thinking block,
+  // first per Anthropic convention.
+  const reasoning = message?.reasoning_content;
+  if (typeof reasoning === 'string' && reasoning.length > 0) {
+    blocks.push({ type: 'thinking', thinking: reasoning, signature: '' });
+  }
   const text = contentToString(message?.content ?? '');
   if (text.length > 0) blocks.push({ type: 'text', text });
   for (const call of message?.tool_calls ?? []) {
-    blocks.push({ type: 'tool_use', id: call.id, name: call.function.name, input: parseToolInput(call.function.arguments) });
+    const block: AnthropicToolUseBlock = {
+      type: 'tool_use',
+      id: call.id,
+      name: call.function.name,
+      input: parseToolInput(call.function.arguments),
+    };
+    if (call.thought_signature) block.thought_signature = call.thought_signature;
+    blocks.push(block);
   }
   return blocks;
 }
@@ -325,14 +396,19 @@ function writeSse(res: Response, event: string, data: unknown): void {
   res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
-// ── Routing (shared loop, trimmed for the translation layer) ────────────────
-// Returns the routed result + the converted (internal) response for the
-// non-streaming path. Streaming is handled inline so we can translate chunks
-// as they arrive. Mirrors the OpenAI route's cooldown/skip/analytics handling.
-function cooldownFor(route: RouteResult, err: any): number {
-  if (isPaymentRequiredError(err)) return PAYMENT_REQUIRED_COOLDOWN_MS;
-  if (isModelAccessForbiddenError(err)) return MODEL_FORBIDDEN_COOLDOWN_MS;
-  return getCooldownDurationForLimit(route.platform, route.modelId, route.keyId, { rpd: route.rpdLimit, tpd: route.tpdLimit }, err?.retryAfterMs);
+// Convert rescued inline tool calls (parsed out of a model that serialized its
+// tool call as TEXT) into OpenAI-shaped tool_calls, so toAnthropicContent /
+// the streaming tool_use emitter render them as Anthropic tool_use blocks —
+// the same rescue /chat/completions and /v1/responses already apply (#231).
+function rescuedToToolCalls(
+  calls: Array<{ name: string; arguments: string }>,
+  schemas: Map<string, unknown>,
+): ChatToolCall[] {
+  return calls.map((c, i) => ({
+    id: `toolu_${crypto.randomBytes(8).toString('hex')}_rescued_${i + 1}`,
+    type: 'function' as const,
+    function: { name: c.name, arguments: repairToolArguments(c.arguments, schemas.get(c.name) as any) },
+  }));
 }
 
 anthropicRouter.post('/messages', async (req: Request, res: Response) => {
@@ -351,16 +427,40 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
 
   const body = parsed.data;
   const requestedModel = body.model ?? 'auto';
-  const max_tokens = body.max_tokens != null && body.max_tokens > 0 ? body.max_tokens : DEFAULT_MAX_TOKENS;
+  // The Anthropic wire format requires max_tokens, but OUR default injection
+  // must not change the budget gate's verdict: gating AFTER defaulting made a
+  // no-max_tokens request 413 here (input + 1024 over budget) where the chat
+  // surface would cap it and serve. Gate on what the client actually sent,
+  // then resolve the default against the budget remainder.
+  const clientMaxTokens = body.max_tokens != null && body.max_tokens > 0 ? body.max_tokens : undefined;
   const { temperature, top_p, stream } = body;
 
   const { messages, tools, tool_choice, hasImage, wantsTools } = convertRequest(body);
-  const completionOptions = { temperature, max_tokens, top_p, tools, tool_choice };
 
   const estimatedInputTokens = estimateTokens(messages);
   const imageCount = messages.reduce((n, m) =>
     n + (Array.isArray(m.content) ? m.content.filter(b => (b as any)?.type === 'image_url').length : 0), 0);
-  const estimatedTotal = estimatedInputTokens + imageCount * IMAGE_TOKEN_ESTIMATE + max_tokens;
+
+  // Guardrail: per-request token budget (request_max_tokens_budget, default
+  // off). A client-set max_tokens can only pass or reject; an omitted one is
+  // capped to the budget remainder, mirroring /v1/chat/completions.
+  const budgetCheck = applyTokenBudget(estimatedInputTokens + imageCount * IMAGE_TOKEN_ESTIMATE, clientMaxTokens);
+  if (budgetCheck.rejection) {
+    sendError(res, 413, 'invalid_request_error', tokenBudgetMessage(budgetCheck.rejection));
+    return;
+  }
+  const max_tokens = clientMaxTokens
+    ?? (budgetCheck.maxTokens != null ? Math.min(DEFAULT_MAX_TOKENS, budgetCheck.maxTokens) : DEFAULT_MAX_TOKENS);
+
+  const completionOptions = {
+    temperature, max_tokens, top_p, top_k: body.top_k ?? undefined, tools, tool_choice,
+    // Native `thinking: {type, budget_tokens}` → the same internal knob the
+    // OpenAI surface's reasoning_effort feeds; absent when the client sent none.
+    reasoning_effort: effortFromAnthropicThinking(body.thinking),
+  };
+  // Capped output reserve so a large max_tokens can't falsely exclude the model
+  // pool (#470); input + images count in full.
+  const estimatedTotal = estimatedInputTokens + imageCount * IMAGE_TOKEN_ESTIMATE + routingReserveTokens(max_tokens);
 
   // Resolve the model through the operator's Claude-family map (opus/sonnet/
   // haiku/default → auto | a pinned catalog model). A concrete catalog id pins
@@ -401,30 +501,66 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
         sendError(res, err?.status ?? 503, 'api_error', err?.message ?? 'No model available to route this request');
       }
       return;
-    }
 
-    try {
+    }
+  });
+  const dispatchOptions = { ...completionOptions, signal: clientAbort.signal };
+
+  await runFallbackLoop({
+    maxRetries: MAX_RETRIES,
+    state,
+    attemptLog,
+    clientGone: () => clientGone,
+    route: () => routeRequest(estimatedTotal, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined),
+    dispatch: async (route, attempt) => {
       if (stream) {
-        await streamCompletion(res, route, messages, completionOptions, {
-          start, attempt, requestedModel, estimatedInputTokens, tools, pinnedModelId,
-          sessionId, pinned: resolved.pinned,
-        });
-        return;
+        try {
+          await streamCompletion(res, route, messages, dispatchOptions, {
+            start, attempt, attemptLog, clientGone: () => clientGone, requestedModel, estimatedInputTokens, tools, pinnedModelId,
+            sessionId, pinned: resolved.pinned,
+          });
+          return 'done';
+        } catch (err: any) {
+          // The stream already committed (message_start sent) and surfaced its
+          // own error event; stop without failover or a second response.
+          if (err instanceof StreamAlreadyStarted) return 'committed';
+          throw err;
+        }
       }
 
-      const result = await route.provider.chatCompletion(route.apiKey, messages, route.modelId, completionOptions);
+      const result = await route.provider.chatCompletion(route.apiKey, messages, route.modelId, dispatchOptions);
       const respMsg = result.choices?.[0]?.message;
       const respText = contentToString(respMsg?.content ?? '');
-      const respToolCalls = respMsg?.tool_calls ?? [];
+      let respToolCalls = respMsg?.tool_calls ?? [];
 
-      // Empty completion → fail over, exactly like the OpenAI route.
+      // Empty completion → fail over via the shared loop, exactly like the
+      // OpenAI route; finish_reason 'length' (whole output budget spent on
+      // hidden reasoning) skips the cooldown/penalty.
       if (!respText && respToolCalls.length === 0) {
-        logRequest(route.platform, route.modelId, route.keyId, 'error', estimatedInputTokens, 0, Date.now() - start, 'empty completion (no content, no tool_calls)', null, pinnedModelId);
-        skipKeys.add(`${route.platform}:${route.modelId}:${route.keyId}`);
-        setCooldown(route.platform, route.modelId, route.keyId, cooldownFor(route, {}));
-        recordRateLimitHit(route.modelDbId);
-        lastError = new Error(`empty completion from ${route.displayName}`);
-        continue;
+        throw Object.assign(
+          new Error(`empty completion from ${route.displayName}`),
+          result.choices?.[0]?.finish_reason === 'length' ? { skipBench: true } : {},
+        );
+      }
+
+      // Inline tool-call dialect rescue (#231): a tool-bearing request answered
+      // with the call serialized as TEXT → re-parse it into structured tool_use
+      // so Claude Code's agent loop keeps working; a detected-but-unparseable
+      // dialect is a dead turn and fails over like an empty completion. Same
+      // rescue /chat/completions and /v1/responses already apply.
+      if (wantsTools && respMsg && respToolCalls.length === 0 && respText) {
+        const rescue = rescueInlineToolCalls(respText, new Set((tools ?? []).map(t => t.function.name)));
+        if (rescue.detected) {
+          if (!rescue.calls) {
+            throw new Error(`unparseable inline tool-call dialect from ${route.displayName}: ${respText.slice(0, 120)}`);
+          }
+          const schemas = toolSchemaMap(tools);
+          respMsg.tool_calls = rescuedToToolCalls(rescue.calls, schemas);
+          respMsg.content = rescue.cleanText.length > 0 ? rescue.cleanText : null;
+          if (result.choices?.[0]) result.choices[0].finish_reason = 'tool_calls';
+          respToolCalls = respMsg.tool_calls;
+          console.log(`[Anthropic] Rescued ${rescue.calls.length} inline tool call(s) from ${route.displayName} into tool_use`);
+        }
       }
 
       // Repair double-encoded tool arguments against the request schemas, so
@@ -441,9 +577,7 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
       const promptTokens = result.usage?.prompt_tokens ?? estimatedInputTokens;
       const completionTokens = result.usage?.completion_tokens ?? Math.ceil((respText.length + respToolCalls.reduce((n, c) => n + c.function.arguments.length, 0)) / 4);
 
-      recordRequest(route.platform, route.modelId, route.keyId);
-      recordTokens(route.platform, route.modelId, route.keyId, result.usage?.total_tokens ?? promptTokens + completionTokens);
-      recordSuccess(route.modelDbId);
+      recordUpstreamSuccess(route, result.usage?.total_tokens ?? promptTokens + completionTokens);
       // Remember this model for the rest of the auto-routed session (no-op for
       // a pinned request — the pin already fixes the model).
       if (!resolved.pinned) setStickyModel(messages, route.modelDbId, sessionId);
@@ -460,7 +594,7 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
       };
 
       res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
-      if (attempt > 0) res.setHeader('X-Fallback-Attempts', String(attempt));
+      setFallbackHeaders(res, attempt, attemptLog);
       logRequest(route.platform, route.modelId, route.keyId, 'success', promptTokens, completionTokens, Date.now() - start, null, null, pinnedModelId);
       res.json(anthropicResponse);
       return;
@@ -496,6 +630,7 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
     return;
   }
   sendError(res, 429, 'rate_limit_error', `All models rate-limited after ${MAX_RETRIES} attempts. Last: ${sanitizeProviderErrorMessage(lastError?.message)}`);
+
 });
 
 // Thrown by streamCompletion once the SSE response is underway, so the outer
@@ -506,6 +641,8 @@ class StreamAlreadyStarted extends Error {}
 interface StreamCtx {
   start: number;
   attempt: number;
+  attemptLog: AttemptRecord[];
+  clientGone: () => boolean;
   requestedModel: string;
   estimatedInputTokens: number;
   tools?: ChatToolDefinition[];
@@ -529,13 +666,23 @@ async function streamCompletion(
   options: any,
   ctx: StreamCtx,
 ): Promise<void> {
-  let messageStarted = false; // doubles as "headers + message_start sent"
+  let messageStarted = false; // doubles as "headers + message_start sent" = committed
   let textBlockOpen = false;
   let textBlockIndex = -1;
   let nextIndex = 0;
   let outputChars = 0;
   let upstreamFinish: string | null = null;
-  const toolAcc = new Map<number, { id?: string; name: string; args: string }>();
+  const toolAcc = new Map<number, { id?: string; name: string; args: string; thought_signature?: string }>();
+
+  // Inline-dialect hold window (#231): the first text is held until it either
+  // matches a tool-call dialect marker (held to the end and rescued into
+  // tool_use blocks) or provably cannot (flushed and streamed normally). This is
+  // also the commit point convergence — message_start is not sent until the
+  // first MEANINGFUL content, so a stream that opens with a dialect marker and
+  // then turns out unparseable fails over invisibly (previously this surface
+  // committed on the first non-empty text and had no dialect rescue at all).
+  let dialectMode: 'undecided' | 'passthrough' | 'dialect' = 'undecided';
+  let heldText = '';
 
   const ensureMessageStart = () => {
     if (messageStarted) return;
@@ -543,7 +690,7 @@ async function streamCompletion(
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
     res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
-    if (ctx.attempt > 0) res.setHeader('X-Fallback-Attempts', String(ctx.attempt));
+    setFallbackHeaders(res, ctx.attempt, ctx.attemptLog);
     writeSse(res, 'message_start', {
       type: 'message_start',
       message: {
@@ -555,10 +702,41 @@ async function streamCompletion(
     messageStarted = true;
   };
 
+  // Reasoning output (delta.reasoning_content from providers / the <think>
+  // extractor, delta.reasoning from Ollama-style upstreams) is buffered and
+  // emitted as one complete thinking block right before the first text/tool
+  // block. Buffering (not live thinking_delta streaming) keeps the commit
+  // point where it was: a stream that produces ONLY reasoning and dies still
+  // fails over invisibly, exactly like the OpenAI surface's preamble hold.
+  let reasoningBuf = '';
+  const flushThinking = () => {
+    if (reasoningBuf.length === 0) return;
+    const idx = nextIndex++;
+    writeSse(res, 'content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'thinking', thinking: '' } });
+    writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'thinking_delta', thinking: reasoningBuf } });
+    writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: idx });
+    outputChars += reasoningBuf.length;
+    reasoningBuf = '';
+  };
+
+  // Commit (if needed), open the text block (if needed), and stream `text`.
+  const emitText = (text: string) => {
+    ensureMessageStart();
+    if (!textBlockOpen) {
+      flushThinking(); // thinking block precedes the text block
+      textBlockIndex = nextIndex++;
+      writeSse(res, 'content_block_start', { type: 'content_block_start', index: textBlockIndex, content_block: { type: 'text', text: '' } });
+      textBlockOpen = true;
+    }
+    writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: textBlockIndex, delta: { type: 'text_delta', text } });
+    outputChars += text.length;
+  };
+
   try {
     const gen = route.provider.streamChatCompletion(route.apiKey, messages, route.modelId, options);
 
     for await (const chunk of gen) {
+      if (ctx.clientGone()) break; // client hung up: stop pulling; reader.cancel() aborts upstream
       const anyChunk = chunk as Record<string, any>;
 
       // In-band provider error frame (e.g. Groq emits {"error":…} inside a 200
@@ -584,46 +762,118 @@ async function streamCompletion(
         if (tc.id && !acc.id) acc.id = tc.id;
         if (tc.function?.name) acc.name += tc.function.name;
         if (tc.function?.arguments) acc.args += tc.function.arguments;
+        const thoughtSignature = (tc as any).thought_signature ?? (tc as any).thoughtSignature;
+        if (typeof thoughtSignature === 'string' && thoughtSignature.length > 0 && !acc.thought_signature) {
+          acc.thought_signature = thoughtSignature;
+        }
       }
+
+      // Reasoning deltas: providers emit reasoning_content (or Ollama-style
+      // `reasoning`); the shared <think> extractor emits reasoning_content.
+      const reasoningDelta = choice.delta?.reasoning_content ?? choice.delta?.reasoning;
+      if (typeof reasoningDelta === 'string' && reasoningDelta.length > 0) reasoningBuf += reasoningDelta;
 
       const text = typeof choice.delta?.content === 'string' ? choice.delta.content : '';
       if (text.length === 0) continue;
 
-      ensureMessageStart();
-      if (!textBlockOpen) {
-        textBlockIndex = nextIndex++;
-        writeSse(res, 'content_block_start', { type: 'content_block_start', index: textBlockIndex, content_block: { type: 'text', text: '' } });
-        textBlockOpen = true;
+      if (dialectMode === 'passthrough') {
+        emitText(text);
+      } else {
+        heldText += text;
+        if (dialectMode === 'undecided') {
+          const probe = heldText.trimStart();
+          if (startsWithDialectMarker(probe)) {
+            dialectMode = 'dialect';
+          } else if (!couldBecomeDialectMarker(probe) || heldText.length > 256) {
+            dialectMode = 'passthrough';
+            emitText(heldText);
+            heldText = '';
+          }
+        }
+        // else: still a strict prefix of a marker — keep holding.
       }
-      writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: textBlockIndex, delta: { type: 'text_delta', text } });
-      outputChars += text.length;
     }
 
     // Assemble buffered tool calls: synthesize missing ids, repair args against
     // the request schemas, drop any that still aren't valid JSON.
     const schemas = toolSchemaMap(ctx.tools);
     let synthetic = 0;
-    const completedCalls = [...toolAcc.entries()]
+    const completedCalls: Array<{ id: string; name: string; arguments: string; thought_signature?: string }> = [...toolAcc.entries()]
       .sort((a, b) => a[0] - b[0])
       .map(([, acc]) => ({
         id: acc.id && acc.id.length > 0 ? acc.id : `toolu_${crypto.randomBytes(8).toString('hex')}_${++synthetic}`,
         name: acc.name,
         arguments: repairToolArguments(acc.args || '{}', schemas.get(acc.name)),
+        ...(acc.thought_signature ? { thought_signature: acc.thought_signature } : {}),
       }))
       .filter(c => { try { JSON.parse(c.arguments); return c.name.length > 0; } catch { return false; } });
+
+    // Resolve the dialect hold window now the full text is known. Held text was
+    // never emitted, so a dead dialect turn can still fail over (nothing has been
+    // committed). A rescued dialect becomes tool_use blocks; leftover clean text
+    // is emitted as a text block first.
+    if (heldText.length > 0) {
+      const rescue = (dialectMode === 'dialect' || containsDialectMarker(heldText))
+        ? rescueInlineToolCalls(heldText, new Set((ctx.tools ?? []).map(t => t.function.name)))
+        : { detected: false as const, calls: null, cleanText: heldText };
+      if (rescue.detected && !rescue.calls) {
+        throw new Error(`unparseable inline tool-call dialect from ${route.displayName}: ${heldText.slice(0, 120)}`);
+      }
+      if (rescue.detected && rescue.calls) {
+        if (rescue.cleanText.length > 0) emitText(rescue.cleanText);
+        for (const c of rescue.calls) {
+          const repaired = repairToolArguments(c.arguments, schemas.get(c.name));
+          if (c.name.length === 0) continue;
+          try { JSON.parse(repaired); } catch { continue; }
+          completedCalls.push({ id: `toolu_${crypto.randomBytes(8).toString('hex')}_rescued_${++synthetic}`, name: c.name, arguments: repaired });
+        }
+        console.log(`[Anthropic] Rescued ${rescue.calls.length} inline tool call(s) from ${route.displayName} into tool_use`);
+      } else {
+        emitText(heldText);
+      }
+      heldText = '';
+    }
 
     // Nothing usable came out — fail over (message_start was never sent, so the
     // client never saw this attempt).
     if (!messageStarted && completedCalls.length === 0) {
-      throw new Error(`empty completion from ${route.displayName} (stream produced no content and no tool calls)`);
+      // Disconnect before the commit point: the pump loop broke with nothing
+      // accumulated because the CLIENT left, not because the provider failed —
+      // benching a healthy model+key for it was wrong. StreamAlreadyStarted
+      // maps to 'committed' in the dispatcher: stop, no failover, no
+      // exhaustion render (the socket is gone anyway).
+      if (ctx.clientGone()) {
+        console.log(`[Anthropic] client disconnected before first token from ${route.displayName} — dropping attempt without benching`);
+        throw new StreamAlreadyStarted();
+      }
+      // finish_reason 'length' = the model spent the whole output budget on
+      // hidden reasoning before any visible text: fail over, but skip the
+      // cooldown/penalty (not a provider-health signal).
+      throw Object.assign(
+        new Error(`empty completion from ${route.displayName} (stream produced no content and no tool calls)`),
+        upstreamFinish === 'length' ? { skipBench: true } : {},
+      );
     }
 
     ensureMessageStart();
     if (textBlockOpen) writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: textBlockIndex });
+    // Residual reasoning: tool-only turns (no text block ever opened) and
+    // reasoning that arrived after the text block was already streaming.
+    flushThinking();
 
     for (const call of completedCalls) {
       const idx = nextIndex++;
-      writeSse(res, 'content_block_start', { type: 'content_block_start', index: idx, content_block: { type: 'tool_use', id: call.id, name: call.name, input: {} } });
+      writeSse(res, 'content_block_start', {
+        type: 'content_block_start',
+        index: idx,
+        content_block: {
+          type: 'tool_use',
+          id: call.id,
+          name: call.name,
+          input: {},
+          ...(call.thought_signature ? { thought_signature: call.thought_signature } : {}),
+        },
+      });
       writeSse(res, 'content_block_delta', { type: 'content_block_delta', index: idx, delta: { type: 'input_json_delta', partial_json: call.arguments } });
       writeSse(res, 'content_block_stop', { type: 'content_block_stop', index: idx });
       outputChars += call.arguments.length;
@@ -635,13 +885,17 @@ async function streamCompletion(
     writeSse(res, 'message_stop', { type: 'message_stop' });
     res.end();
 
-    recordRequest(route.platform, route.modelId, route.keyId);
-    recordTokens(route.platform, route.modelId, route.keyId, ctx.estimatedInputTokens + outputTokens);
-    recordSuccess(route.modelDbId);
+    recordUpstreamSuccess(route, ctx.estimatedInputTokens + outputTokens);
     if (!ctx.pinned) setStickyModel(messages, route.modelDbId, ctx.sessionId);
     logRequest(route.platform, route.modelId, route.keyId, 'success', ctx.estimatedInputTokens, outputTokens, Date.now() - ctx.start, null, null, ctx.pinnedModelId);
   } catch (err: any) {
     if (err instanceof StreamAlreadyStarted) throw err;
+    // Client abort mid-stream: the pump's own `if (ctx.clientGone()) break`
+    // can lose the race against the fetch-signal rejection, so the abort may
+    // surface here instead. Rethrow — the shared loop's client-abort branch
+    // stops the ladder without benching or an error log row (the socket is
+    // gone; nothing to render).
+    if (isClientAbortError(err)) throw err;
     if (messageStarted) {
       // Real payload already reached the client — finish the SSE response
       // honestly instead of leaving Claude Code hanging, and stop the retry loop.

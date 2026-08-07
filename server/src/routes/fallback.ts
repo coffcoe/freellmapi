@@ -12,6 +12,7 @@ import { BANDIT_PRESETS, type RoutingStrategy } from '../services/scoring.js';
 import { parseBudget } from '../lib/budget.js';
 import { getModelGroups } from '../services/model-groups.js';
 import { getPenaltyInspector } from '../services/penalty-inspector.js';
+import { getActiveProfileId } from '../services/profile-models.js';
 
 export const fallbackRouter = Router();
 
@@ -63,7 +64,25 @@ fallbackRouter.put('/routing', (req: Request, res: Response) => {
 // Get fallback chain (with dynamic penalties)
 fallbackRouter.get('/', (_req: Request, res: Response) => {
   const db = getDb();
-  const rows = db.prepare(`
+  const activeProfileId = getActiveProfileId(db);
+  let rows = activeProfileId == null ? [] : db.prepare(`
+    SELECT pm.model_db_id, pm.priority, pm.enabled,
+           m.platform, m.model_id, m.display_name, m.intelligence_rank,
+           m.speed_rank, m.size_label, m.rpm_limit, m.rpd_limit,
+           m.tpm_limit, m.tpd_limit, m.context_window,
+           m.monthly_token_budget, m.supports_vision, m.supports_tools,
+           m.key_id, ak.label AS key_label,
+           mo.overrides_json IS NOT NULL AS has_overrides
+    FROM profile_models pm
+    JOIN models m ON m.id = pm.model_db_id
+    LEFT JOIN api_keys ak ON ak.id = m.key_id
+    LEFT JOIN model_overrides mo ON mo.platform = m.platform AND mo.model_id = m.model_id
+    WHERE pm.profile_id = ? AND m.enabled = 1
+    ORDER BY pm.priority ASC
+  `).all(activeProfileId) as any[];
+
+  if (rows.length === 0) {
+    rows = db.prepare(`
     SELECT fc.model_db_id, fc.priority, fc.enabled,
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.speed_rank, m.size_label, m.rpm_limit, m.rpd_limit,
@@ -77,12 +96,15 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
     LEFT JOIN model_overrides mo ON mo.platform = m.platform AND mo.model_id = m.model_id
     WHERE m.enabled = 1
     ORDER BY fc.priority ASC
-  `).all() as any[];
+    `).all() as any[];
+  }
 
-  // Count enabled keys per platform
+  // Count usable keys per platform — enabled AND healthy/unknown status. Unified
+  // with /token-usage and the routing scorer (#456) so budget pooling is computed
+  // from the same key set everywhere (a disabled or invalid key adds no capacity).
   const keyCounts = db.prepare(`
     SELECT platform, COUNT(*) as count
-    FROM api_keys WHERE enabled = 1
+    FROM api_keys WHERE enabled = 1 AND status IN ('healthy', 'unknown')
     GROUP BY platform
   `).all() as { platform: string; count: number }[];
   const keyCountMap = new Map(keyCounts.map(k => [k.platform, k.count]));
@@ -130,7 +152,8 @@ fallbackRouter.get('/', (_req: Request, res: Response) => {
       monthlyTokenBudget: r.monthly_token_budget,
       // Parsed once here (single source of truth) so the dashboard never re-implements
       // budget-label parsing; 0 for rate-limited/placeholder labels. See lib/budget.ts.
-      monthlyTokenBudgetTokens: parseBudget(r.monthly_token_budget),
+      // Scaled by healthy/enabled key count for multi-account pooled capacity.
+      monthlyTokenBudgetTokens: parseBudget(r.monthly_token_budget) * Math.max(1, keyCountMap.get(r.platform) ?? 1),
       supportsVision: r.supports_vision === 1,
       supportsTools: r.supports_tools === 1,
       source: r.platform === 'custom' || r.key_id != null ? 'custom' : 'catalog',
@@ -157,13 +180,18 @@ fallbackRouter.put('/', (req: Request, res: Response) => {
   }
 
   const db = getDb();
-  const update = db.prepare(`
-    UPDATE fallback_config SET priority = ?, enabled = ? WHERE model_db_id = ?
-  `);
+  const activeProfileId = getActiveProfileId(db);
+  const useProfile = activeProfileId != null && Boolean(
+    db.prepare('SELECT 1 FROM profile_models WHERE profile_id = ? LIMIT 1').get(activeProfileId),
+  );
+  const update = useProfile
+    ? db.prepare('UPDATE profile_models SET priority = ?, enabled = ? WHERE profile_id = ? AND model_db_id = ?')
+    : db.prepare('UPDATE fallback_config SET priority = ?, enabled = ? WHERE model_db_id = ?');
 
   const updateAll = db.transaction(() => {
     for (const entry of parsed.data) {
-      update.run(entry.priority, entry.enabled ? 1 : 0, entry.modelDbId);
+      if (useProfile) update.run(entry.priority, entry.enabled ? 1 : 0, activeProfileId, entry.modelDbId);
+      else update.run(entry.priority, entry.enabled ? 1 : 0, entry.modelDbId);
     }
   });
   updateAll();
@@ -213,6 +241,10 @@ fallbackRouter.post('/sort/:preset', (req: Request, res: Response) => {
   const preset = String(req.params.preset);
   const db = getDb();
   let models: { id: number }[] = [];
+  const activeProfileId = getActiveProfileId(db);
+  const useProfile = activeProfileId != null && Boolean(
+    db.prepare('SELECT 1 FROM profile_models WHERE profile_id = ? LIMIT 1').get(activeProfileId),
+  );
 
   if (preset === 'budget') {
     const allModels = db.prepare(`SELECT id, monthly_token_budget, tpd_limit FROM models`).all() as any[];
@@ -227,10 +259,13 @@ fallbackRouter.post('/sort/:preset', (req: Request, res: Response) => {
     models = db.prepare(`SELECT m.id FROM models m ORDER BY ${orderBy}`).all() as { id: number }[];
   }
 
-  const update = db.prepare('UPDATE fallback_config SET priority = ? WHERE model_db_id = ?');
+  const update = useProfile
+    ? db.prepare('UPDATE profile_models SET priority = ? WHERE profile_id = ? AND model_db_id = ?')
+    : db.prepare('UPDATE fallback_config SET priority = ? WHERE model_db_id = ?');
   const reorder = db.transaction(() => {
     for (let i = 0; i < models.length; i++) {
-      update.run(i + 1, models[i].id);
+      if (useProfile) update.run(i + 1, activeProfileId, models[i].id);
+      else update.run(i + 1, models[i].id);
     }
   });
   reorder();
@@ -295,21 +330,29 @@ fallbackRouter.get('/token-usage', (_req: Request, res: Response) => {
   `).all() as { platform: string; model_id: string; used: number }[];
   const usageByModel = new Map(usageRows.map(r => [`${r.platform}:${r.model_id}`, r.used]));
 
+  const keyCountMap = new Map(
+    (db.prepare("SELECT platform, COUNT(*) as count FROM api_keys WHERE enabled = 1 AND status IN ('healthy', 'unknown') GROUP BY platform").all() as { platform: string; count: number }[])
+      .map(k => [k.platform, k.count])
+  );
+
   const modelBudgets = rawModels
     .filter(m => platformSet.has(m.platform))
-    .map(m => ({
-      modelDbId: m.model_db_id,
-      displayName: m.display_name,
-      platform: m.platform,
-      modelId: m.model_id,
-      budget: parseBudget(m.monthly_token_budget),
-      used: usageByModel.get(`${m.platform}:${m.model_id}`) ?? 0,
-      enabled: m.enabled === 1,
-      rpmLimit: m.rpm_limit,
-      rpdLimit: m.rpd_limit,
-      tpmLimit: m.tpm_limit,
-      tpdLimit: m.tpd_limit,
-    }));
+    .map(m => {
+      const keys = Math.max(1, keyCountMap.get(m.platform) ?? 1);
+      return {
+        modelDbId: m.model_db_id,
+        displayName: m.display_name,
+        platform: m.platform,
+        modelId: m.model_id,
+        budget: parseBudget(m.monthly_token_budget) * keys,
+        used: usageByModel.get(`${m.platform}:${m.model_id}`) ?? 0,
+        enabled: m.enabled === 1,
+        rpmLimit: m.rpm_limit,
+        rpdLimit: m.rpd_limit,
+        tpmLimit: m.tpm_limit,
+        tpdLimit: m.tpd_limit,
+      };
+    });
 
   // Total budget counts all models (both enabled and disabled — they contribute to the pool)
   const totalBudget = modelBudgets.reduce((s, m) => s + m.budget, 0);

@@ -15,12 +15,16 @@ export interface NormalizedModel {
   enabled: number;
   contextWindow: number | null;
   intel: number;
+  // Local fork enrichment (dashboard / analytics)
   category: string | null;
   lastVerifiedAt: string | null;
   probeStatus: number;
   rateLimit: string;
   tier: string;
   requiresCreditCard: boolean;
+  // Upstream additions
+  platforms: string[];
+  supportsTools: boolean;
 }
 
 export interface ModelListing {
@@ -47,13 +51,14 @@ export function buildModelListing(): ModelListing {
   if (isUnifyEnabled()) {
     // Unify ON: one entry per logical model group. Pull per-row availability +
     // context keyed by db id, then aggregate over each group's members.
-    type AvailRow = { id: number; platform: string; intelligence_rank: number; context_window: number | null; enabled: number; available: number; category: string | null; last_verified_at: string | null; probe_status: number; rpm_limit: number | null; rpd_limit: number | null; tpm_limit: number | null; tpd_limit: number | null; paid_input_per_m: number | null; paid_output_per_m: number | null };
+    type AvailRow = { id: number; platform: string; intelligence_rank: number; context_window: number | null; enabled: number; available: number; category: string | null; last_verified_at: string | null; probe_status: number; rpm_limit: number | null; rpd_limit: number | null; tpm_limit: number | null; tpd_limit: number | null; paid_input_per_m: number | null; paid_output_per_m: number | null; supports_tools: number };
     const rows = db.prepare(`
       SELECT m.id, m.platform, m.intelligence_rank, m.context_window,
              m.enabled AS enabled, ${availableExpr} AS available,
              m.category, m.last_verified_at, m.probe_status,
              m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit,
-             m.paid_input_per_m, m.paid_output_per_m
+             m.paid_input_per_m, m.paid_output_per_m,
+             m.supports_tools
       FROM models m
     `).all() as AvailRow[];
     const byId = new Map(rows.map(r => [r.id, r]));
@@ -83,6 +88,8 @@ export function buildModelListing(): ModelListing {
         rateLimit,
         tier,
         requiresCreditCard,
+        platforms: [...new Set(infos.map(i => i.platform))],
+        supportsTools: infos.some(i => i.supports_tools === 1),
       };
     });
   } else {
@@ -92,9 +99,10 @@ export function buildModelListing(): ModelListing {
       SELECT platform, model_id, display_name, context_window, enabled, available, intelligence_rank, id,
              category, last_verified_at, probe_status,
              rpm_limit, rpd_limit, tpm_limit, tpd_limit,
-             paid_input_per_m, paid_output_per_m
+             paid_input_per_m, paid_output_per_m,
+             supports_tools
       FROM (
-        SELECT m.platform, m.model_id, m.display_name, m.context_window, m.intelligence_rank, m.id,
+        SELECT m.platform, m.model_id, m.display_name, m.context_window, m.intelligence_rank, m.id, m.supports_tools,
                m.enabled AS enabled,
                ${availableExpr} AS available,
                m.category, m.last_verified_at, m.probe_status,
@@ -107,7 +115,7 @@ export function buildModelListing(): ModelListing {
         FROM models m
       )
       WHERE rn = 1
-    `).all() as (ModelListRow & { intelligence_rank: number; id: number; category: string | null; last_verified_at: string | null; probe_status: number; rpm_limit: number | null; rpd_limit: number | null; tpm_limit: number | null; tpd_limit: number | null; paid_input_per_m: number | null; paid_output_per_m: number | null })[];
+    `).all() as (ModelListRow & { intelligence_rank: number; id: number; supports_tools: number; category: string | null; last_verified_at: string | null; probe_status: number; rpm_limit: number | null; rpd_limit: number | null; tpm_limit: number | null; tpd_limit: number | null; paid_input_per_m: number | null; paid_output_per_m: number | null })[];
     allListed = models.map(m => {
       const rateLimit = [
         m.rpm_limit ? `${m.rpm_limit} RPM` : null,
@@ -127,6 +135,8 @@ export function buildModelListing(): ModelListing {
         rateLimit,
         tier,
         requiresCreditCard,
+        platforms: [m.platform],
+        supportsTools: m.supports_tools === 1,
       };
     });
   }
