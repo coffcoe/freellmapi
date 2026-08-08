@@ -20,7 +20,6 @@ import { logRequest } from '../lib/request-log.js';
 import { observeServedModel } from '../lib/served-model.js';
 import { parseCacheDirective, cacheActive, isCacheableTemperature, computeCacheKey, getCachedResponse, storeCachedResponse } from '../services/cache.js';
 import { runFallbackLoop, newFallbackState, recordUpstreamSuccess, exhaustedRetryError, setFallbackHeaders, exhaustionErrorPayload, setExhaustionHeaders, type AttemptRecord } from '../lib/fallback-loop.js';
-import { detectScene, normalizeNetworkTier } from '../lib/scene.js';
 import { applyTokenBudget, tokenBudgetMessage } from '../lib/guardrails.js';
 import { samplingParamSchemaFields, pickSamplingParams, supportedParametersForPlatforms } from '../lib/sampling-params.js';
 import { enforceJsonContent } from '../lib/structured-output.js';
@@ -940,15 +939,6 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
   // Legacy /completions is a thin adapter over the shared fallback loop
   // (lib/fallback-loop.ts): the cooldown/skip/penalty/exhaustion machinery is
   // shared; only the text_completion request/stream translation lives here.
-  // Scene routing (re-derived on top of the upstream loop): a pure signal
-  // computed once from the prompt, then folded into the router's existing
-  // scoring as a soft additive bias — no bespoke retry loop of our own.
-  // Auto-routed requests only: a pinned model or a unified group is a
-  // deliberate client choice, and reordering it would violate that intent.
-  const scene = isAutoModel(requestedModel)
-    ? detectScene(messages, false, normalizeNetworkTier(req.headers['x-network-tier']))
-    : undefined;
-
   await runFallbackLoop({
     maxRetries: MAX_RETRIES,
     state,
@@ -962,8 +952,6 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
       false,
       state.skipModels.size > 0 ? state.skipModels : undefined,
       groupChain ?? resolvedChain?.chain,
-      false,
-      scene,
     ),
     dispatch: async (route, attempt) => {
       traceRouteEvent('Proxy', {
@@ -1699,14 +1687,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     }
   });
 
-  // Scene routing (re-derived on top of the upstream loop): detect once per
-  // request, then let the router fold it into scoring as a soft additive bias.
-  // Computing it outside route() guarantees every retry sees the same scene.
-  // Auto-routed requests only — see the /completions note above.
-  const scene = isAutoModel(requestedModel)
-    ? detectScene(messages, wantsTools, normalizeNetworkTier(req.headers['x-network-tier']))
-    : undefined;
-
   await runFallbackLoop({
     maxRetries: MAX_RETRIES,
     state,
@@ -1720,7 +1700,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       // model is on record). Turns where injection can't happen — every turn 1, and
       // sessions that never switched — pay no headroom tax.
       const routingEstimate = handoffPossible ? estimatedTotal + HANDOFF_MAX_TOKENS : estimatedTotal;
-      return routeRequest(routingEstimate, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain ?? resolvedChain?.chain, samplingParams.response_format !== undefined, scene);
+      return routeRequest(routingEstimate, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain ?? resolvedChain?.chain, samplingParams.response_format !== undefined);
     },
     dispatch: async (route, attempt) => {
     const modelKey = `${route.platform}:${route.modelId}`;

@@ -1,5 +1,4 @@
 import { getDb, getSetting, setSetting } from '../db/index.js';
-import { isEmptyScene, type SceneSignal } from '../lib/scene.js';
 import { getProvider, hasProvider, resolveProvider } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
 import {
@@ -541,133 +540,12 @@ function scoreChainEntry(
  * faithful reflection of the user's picked strategy, not a re-sampled draw each
  * request. Priority mode is deterministic either way.
  */
-// ── Scene routing bias (re-derived business logic, lost in df001b2) ──
-// Three soft-preference layers, original weights preserved:
-//   L1 network_tier match (X-Network-Tier header)  +4
-//   L2 category match     (models.category)        +2
-//   L3 tag match          (models.tags)            +1 each
-// Folded into orderChain instead of pre-sorting the chain: only "which key to
-// try first" is biased; retries, cooldowns and failover are untouched.
-
-/** Per-model scene attributes, loaded on demand for the entries in one chain. */
-export interface ModelSceneAttrs {
-  category: string | null;
-  networkTier: string | null;
-  tags: string[];
-}
-
-/**
- * Parse the `models.tags` column defensively.
- *
- * The column has accumulated THREE incompatible shapes over time:
- *   1. a JSON array of strings   — ["free-tier","long-context"]
- *   2. a bare CSV string         — free-tier,long-context
- *   3. a JSON array of objects   — [{"platform_policy": ...}]   (~75% of rows)
- * The pre-refactor implementation did a plain `JSON.parse` in a try/catch and
- * fell back to `[]`, so shapes 2 and 3 silently contributed nothing — the L3
- * layer was effectively dead for most of the catalog. Accepting all three
- * revives it without a data migration. Never throws.
- */
-export function parseModelTags(raw: unknown): string[] {
-  if (typeof raw !== 'string') return [];
-  const s = raw.trim();
-  if (!s) return [];
-  if (s.startsWith('[') || s.startsWith('{')) {
-    try {
-      const v = JSON.parse(s);
-      const arr = Array.isArray(v) ? v : [v];
-      // Objects carry provider metadata, not scene tags — keep only strings.
-      return arr.filter((x): x is string => typeof x === 'string').map(x => x.trim()).filter(Boolean);
-    } catch {
-      return [];
-    }
-  }
-  return s.split(',').map(x => x.trim()).filter(Boolean);
-}
-
-/**
- * Load scene attributes for exactly the models in this chain.
- *
- * Scoped per call rather than cached process-wide: the admin UI can retag or
- * recategorise a model at any time, and a stale module-level map would pin the
- * router to the old labels until restart. A primary-key `IN (...)` lookup over
- * a few dozen ids is far cheaper than that staleness risk.
- */
-export function loadSceneAttrs(db: Db, chain: ChainRow[]): Map<number, ModelSceneAttrs> {
-  const out = new Map<number, ModelSceneAttrs>();
-  if (chain.length === 0) return out;
-  const ids = [...new Set(chain.map(e => e.model_db_id))];
-  const placeholders = ids.map(() => '?').join(',');
-  const rows = db.prepare(
-    `SELECT id, category, network_tier, tags FROM models WHERE id IN (${placeholders})`,
-  ).all(...ids) as { id: number; category: string | null; network_tier: string | null; tags: string | null }[];
-  for (const r of rows) {
-    out.set(r.id, {
-      category: r.category,
-      networkTier: r.network_tier,
-      tags: parseModelTags(r.tags),
-    });
-  }
-  return out;
-}
-
-/**
- * Raw scene bias for a chain entry, in "priority points" (0..N, higher = more
- * preferred). Pure and directly unit-testable.
- */
-export function sceneBiasScore(
-  entry: ChainRow,
-  scene: SceneSignal | undefined,
-  attrs: Map<number, ModelSceneAttrs> | undefined,
-): number {
-  if (!scene || !attrs) return 0;
-  const a = attrs.get(entry.model_db_id);
-  if (!a) return 0;
-
-  let bias = 0;
-  // L1 — network tier is the strongest signal: a domestic-only client simply
-  // cannot reach a global endpoint, so tier outranks capability.
-  if (scene.networkTier && a.networkTier === scene.networkTier) bias += 4;
-  // L2 — capability category.
-  if (scene.category && a.category === scene.category) bias += 2;
-  // L3 — declared tags.
-  if (scene.tags.length && a.tags.length) {
-    for (const tag of scene.tags) {
-      if (a.tags.includes(tag)) bias += 1;
-    }
-  }
-  return bias;
-}
-
-/**
- * Bandit-mode conversion factor for the scene bias.
- *
- * `combineScore` is a convex combination in [0,1] multiplied by two guardrail
- * factors, so adding raw priority points (up to 4+2+1·4 = 10) would swamp
- * reliability, speed AND the rate-limit guardrail — turning a *soft* preference
- * into a hard override that keeps routing to a throttled model. Scaling each
- * point to 0.02 caps the total nudge at ~0.2, enough to reorder near-ties and
- * to beat the priority tiebreaker, never enough to outvote a large health gap.
- */
-const SCENE_BIAS_UNIT = 0.02;
-
-function orderChain(
-  chain: ChainRow[],
-  strategy: RoutingStrategy,
-  sampled = true,
-  scene?: SceneSignal,
-  attrs?: Map<number, ModelSceneAttrs>,
-): ChainRow[] {
+function orderChain(chain: ChainRow[], strategy: RoutingStrategy, sampled = true): ChainRow[] {
   const weights = weightsFor(strategy);
   if (!weights) {
-    // Legacy priority mode: base priority + 429 penalty, ascending (lower wins),
-    // so the scene bias is SUBTRACTED — adding it would demote the very models
-    // the scene prefers.
+    // Legacy priority mode: base priority + 429 penalty, ascending.
     return chain
-      .map(e => ({
-        e,
-        eff: e.priority + getPenalty(e.model_db_id) - sceneBiasScore(e, scene, attrs),
-      }))
+      .map(e => ({ e, eff: e.priority + getPenalty(e.model_db_id) }))
       .sort((a, b) => a.eff - b.eff || a.e.priority - b.e.priority)
       .map(x => x.e);
   }
@@ -678,11 +556,7 @@ function orderChain(
   const keyCounts = usableKeyCountsByPlatform(getDb());
 
   return chain
-    .map(e => ({
-      e,
-      s: scoreChainEntry(e, weights, intelMin, intelMax, sampled, keyCounts).score
-        + sceneBiasScore(e, scene, attrs) * SCENE_BIAS_UNIT,
-    }))
+    .map(e => ({ e, s: scoreChainEntry(e, weights, intelMin, intelMax, sampled, keyCounts).score }))
     // Higher score first; manual priority breaks ties so the chain still matters.
     .sort((a, b) => b.s - a.s || a.e.priority - b.e.priority)
     .map(x => x.e);
@@ -1310,7 +1184,7 @@ function filterHighValueIfLarge(db: Db, chain: ChainRow[]): ChainRow[] {
   return filtered.length > 0 ? filtered : chain;
 }
 
-export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, requireTools = false, skipModels?: Set<number>, prefetchedChain?: ChainRow[], requireStructured = false, scene?: SceneSignal): RouteResult {
+export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, requireTools = false, skipModels?: Set<number>, prefetchedChain?: ChainRow[], requireStructured = false): RouteResult {
   const db = getDb();
 
   const strategy = getRoutingStrategy();
@@ -1330,10 +1204,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     if (graded.length > 0) chain = graded;
   }
 
-  // Scene attributes are only read when the request actually carries a scene,
-  // so non-scene callers (fusion panel, dashboards, tests) pay nothing.
-  const sceneAttrs = scene && !isEmptyScene(scene) ? loadSceneAttrs(db, chain) : undefined;
-  const sortedChain = orderChain(chain, strategy, true, scene, sceneAttrs);
+  const sortedChain = orderChain(chain, strategy);
 
   // Sticky session / Explicit pinning: move preferred model to front of chain
   if (preferredModelDbId) {

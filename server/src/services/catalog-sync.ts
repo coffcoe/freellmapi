@@ -12,7 +12,6 @@ import {
   deleteTombstonedCatalogModels,
   isCatalogModelTombstoned,
 } from './model-state.js';
-import { inferModelCategory } from './model-category.js';
 import { ensureAllModelsInProfiles } from './profile-models.js';
 
 // Generative-media modalities are routed into the separate media_models table
@@ -256,17 +255,16 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
       size_label = @sizeLabel, rpm_limit = @rpm, tpm_limit = @tpm, tpd_limit = @tpd,
       monthly_token_budget = @monthlyTokenBudget, context_window = @contextWindow,
       supports_vision = @supportsVision, supports_tools = @supportsTools,
-      category = @category,
       enabled = @enabled
     WHERE id = @id
   `);
   const insertModel = db.prepare(`
     INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
                         rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
-                        enabled, supports_vision, supports_tools, source, category)
+                        enabled, supports_vision, supports_tools, source)
     VALUES (@platform, @modelId, @displayName, @intelligenceRank, @speedRank, @sizeLabel,
             @rpm, @rpd, @tpm, @tpd, @monthlyTokenBudget, @contextWindow,
-            @enabled, @supportsVision, @supportsTools, 'catalog', @category)
+            @enabled, @supportsVision, @supportsTools, 'catalog')
   `);
 
   // Generative-media models go to their own table (never the chat router's pool).
@@ -378,15 +376,6 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
         contextWindow: routableContextWindow(m.platform, m.modelId, m.contextWindow),
         supportsVision: m.supportsVision ? 1 : 0,
         supportsTools: m.supportsTools ? 1 : 0,
-        // TD-027: derive models.category from catalog metadata (capability
-        // flags + id/name hints) instead of shipping NULLs. Explicit flags
-        // outrank name hints; un-inferable rows stay NULL (never guessed).
-        category: inferModelCategory({
-          modelId: m.modelId,
-          displayName: m.displayName,
-          supportsVision: m.supportsVision,
-          supportsTools: m.supportsTools,
-        }),
       };
       if (row) {
         // Catalog disable wins (dead upstream); local disable also wins.
@@ -577,31 +566,6 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
       const info = insertQuirk.run(q.slug, q.title, q.body, q.severity, now, now);
       for (const t of q.targets) insertTarget.run(info.lastInsertRowid, t.platform ?? null, t.modelGlob ?? null);
       counts.quirks++;
-    }
-
-    // TD-027: backfill category on any catalog-owned row that still carries
-    // NULL (legacy rows that predate inference, or rows whose category was
-    // never set by an older sync). Only source='catalog' rows are touched —
-    // user-owned models (declarative config, admin adds, custom endpoints)
-    // keep whatever category they were assigned, and NULL stays NULL when no
-    // signal is strong enough (never guessed).
-    const categoryRows = db
-      .prepare(`
-        SELECT id, model_id, display_name, supports_vision, supports_tools
-          FROM models
-         WHERE category IS NULL
-           AND source = 'catalog'
-      `)
-      .all() as { id: number; model_id: string; display_name: string; supports_vision: number; supports_tools: number }[];
-    const setCategory = db.prepare('UPDATE models SET category = ? WHERE id = ?');
-    for (const r of categoryRows) {
-      const inferred = inferModelCategory({
-        modelId: r.model_id,
-        displayName: r.display_name,
-        supportsVision: r.supports_vision === 1,
-        supportsTools: r.supports_tools === 1,
-      });
-      if (inferred) setCategory.run(inferred, r.id);
     }
   });
 

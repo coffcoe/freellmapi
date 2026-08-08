@@ -3,12 +3,14 @@
 # 配套触发时务必传 npc.workMode: true（写权限 scope），否则即便 sandbox:false 也缺写权。
 # 仅 freellmapi Batch1（TD-012a/012b/027 直改代码）使用；其余工作流用 web2kb 仓库的 .cnb.yml（sandbox:true）。
 #
-# ⚠️ 关键修正（2026-08-08）：官方文档要求 api_trigger_* 事件必须顶格写，且为「列表」形态。
-#    原配置把它嵌在 main: 下会导致构建成功但跳过 NPC 阶段（实测 cnb-chg-1jvgqsdbg 三 pipeline 均无 npc 输出）。
-#    参考：https://docs.cnb.cool/zh/build/npc-integration.html
+# ⚠️ 关键：api_trigger 事件必须挂在分支键（main）之下，不能顶格写！
+#    顶格写会被 CNB 报 CONFIG_EVENT_EMPTY（"for branch main and $"）。
+#    参考官方 demo：所有事件都嵌套在 main: 之下。
+#    api_trigger_npc 必须是「映射」形态（docker/sandbox/stages 同级键），不能有前导 -。
 
-api_trigger_npc:
-  - docker:
+main:
+  api_trigger_npc:
+    docker:
       image: cnbcool/default-npc:latest
     sandbox: false
     stages:
