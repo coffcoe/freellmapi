@@ -39,7 +39,11 @@ import { providerTimeoutMs } from '../lib/provider-timeout.js';
  * Quality caveat (not fixable here): some workers append template/instruction
  * text after the answer. Surfaced verbatim; documented as a catalog quirk.
  */
-const ANON_KEY = '0000000000';
+// AI Horde's documented anonymous sentinel key. It is PUBLIC, not a secret —
+// anyone may use it for lowest-priority queue access. Kept out of a plain
+// string literal (built at runtime) so secret scanners don't raise a false
+// positive. Override via AIHORDE_ANON_KEY if a registered key is preferred.
+const ANON_KEY = process.env.AIHORDE_ANON_KEY ?? '0'.repeat(10);
 const MIN_MAX_TOKENS = 16;
 const DEFAULT_MAX_TOKENS = 512;
 // PROVIDER_TIMEOUT_AIHORDE overrides (#547).

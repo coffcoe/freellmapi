@@ -3,7 +3,7 @@
   "freellmapi_source": {
     "name": "FreeLLMAPI (localhost:3001)",
     "base_url": "http://localhost:3001/v1",
-    "api_key": "freellmapi-75b227f03e70501e0715cc4a1bf9accfd9873b9031837000",
+    "api_key": "<YOUR_FREELLMAPI_KEY>",
     "models": [
       {
         "id": "freellmapi/auto",
