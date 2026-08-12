@@ -12,6 +12,7 @@ import {
   deleteTombstonedCatalogModels,
   isCatalogModelTombstoned,
 } from './model-state.js';
+import { inferModelCategory } from './model-category.js';
 import { ensureAllModelsInProfiles } from './profile-models.js';
 
 // Generative-media modalities are routed into the separate media_models table
@@ -40,13 +41,10 @@ const DEFAULT_BASE_URL = 'https://api.freellmapi.co';
 // The Ed25519 public key the production catalog is signed with. The private
 // half was generated on the catalog host and has never left it. Self-hosters
 // running their own catalog server can override both via env.
-//
-// Shipped base64-encoded (decoded at runtime) so the raw PEM literal does not
-// trip CNB's sensitive-info scanner — it is a PUBLIC verification key, not a
-// secret.
-const PINNED_CATALOG_PUBKEY_B64 =
-  'LS0tLS1CRUdJTiBQVUJMSUMgS0VZLS0tLS0KTUNvd0JRWURLMlZ3QXlFQXE5eXY0KzNFZXlNSEtzZlZZQmhrY3oxbFlnSVhTVWVITm5ONnROZ1lYM2s9Ci0tLS0tRU5EIFBVQkxJQyBLRVktLS0tLQo=';
-const PINNED_CATALOG_PUBKEY = Buffer.from(PINNED_CATALOG_PUBKEY_B64, 'base64').toString('utf8');
+const PINNED_CATALOG_PUBKEY = `-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEAq9yv4+3EeyMHKsfVYBhkcz1lYgIXSUeHNnN6tNgYX3k=
+-----END PUBLIC KEY-----
+`;
 
 // Catalogs older than this are ignored. Bump to today's date whenever a model
 // migration lands, so the bundled DB is always the floor.
@@ -258,16 +256,17 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
       size_label = @sizeLabel, rpm_limit = @rpm, tpm_limit = @tpm, tpd_limit = @tpd,
       monthly_token_budget = @monthlyTokenBudget, context_window = @contextWindow,
       supports_vision = @supportsVision, supports_tools = @supportsTools,
+      category = @category,
       enabled = @enabled
     WHERE id = @id
   `);
   const insertModel = db.prepare(`
     INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
                         rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
-                        enabled, supports_vision, supports_tools, source)
+                        enabled, supports_vision, supports_tools, source, category)
     VALUES (@platform, @modelId, @displayName, @intelligenceRank, @speedRank, @sizeLabel,
             @rpm, @rpd, @tpm, @tpd, @monthlyTokenBudget, @contextWindow,
-            @enabled, @supportsVision, @supportsTools, 'catalog')
+            @enabled, @supportsVision, @supportsTools, 'catalog', @category)
   `);
 
   // Generative-media models go to their own table (never the chat router's pool).
@@ -379,6 +378,15 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
         contextWindow: routableContextWindow(m.platform, m.modelId, m.contextWindow),
         supportsVision: m.supportsVision ? 1 : 0,
         supportsTools: m.supportsTools ? 1 : 0,
+        // TD-027: derive models.category from catalog metadata (capability
+        // flags + id/name hints) instead of shipping NULLs. Explicit flags
+        // outrank name hints; un-inferable rows stay NULL (never guessed).
+        category: inferModelCategory({
+          modelId: m.modelId,
+          displayName: m.displayName,
+          supportsVision: m.supportsVision,
+          supportsTools: m.supportsTools,
+        }),
       };
       if (row) {
         // Catalog disable wins (dead upstream); local disable also wins.
@@ -569,6 +577,31 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
       const info = insertQuirk.run(q.slug, q.title, q.body, q.severity, now, now);
       for (const t of q.targets) insertTarget.run(info.lastInsertRowid, t.platform ?? null, t.modelGlob ?? null);
       counts.quirks++;
+    }
+
+    // TD-027: backfill category on any catalog-owned row that still carries
+    // NULL (legacy rows that predate inference, or rows whose category was
+    // never set by an older sync). Only source='catalog' rows are touched —
+    // user-owned models (declarative config, admin adds, custom endpoints)
+    // keep whatever category they were assigned, and NULL stays NULL when no
+    // signal is strong enough (never guessed).
+    const categoryRows = db
+      .prepare(`
+        SELECT id, model_id, display_name, supports_vision, supports_tools
+          FROM models
+         WHERE category IS NULL
+           AND source = 'catalog'
+      `)
+      .all() as { id: number; model_id: string; display_name: string; supports_vision: number; supports_tools: number }[];
+    const setCategory = db.prepare('UPDATE models SET category = ? WHERE id = ?');
+    for (const r of categoryRows) {
+      const inferred = inferModelCategory({
+        modelId: r.model_id,
+        displayName: r.display_name,
+        supportsVision: r.supports_vision === 1,
+        supportsTools: r.supports_tools === 1,
+      });
+      if (inferred) setCategory.run(inferred, r.id);
     }
   });
 
