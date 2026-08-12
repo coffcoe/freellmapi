@@ -22,6 +22,7 @@ import {
 } from './scoring.js';
 import { TIMEOUT_ERROR_MARKERS } from '../lib/error-classify.js';
 import { applyModelWeightOverride, getModelWeightOverrides } from './model-weight-overrides.js';
+import { isEmptyScene, type SceneSignal } from '../lib/scene.js';
 import { modelsWithOverriddenField } from './model-state.js';
 import { parseBudget } from '../lib/budget.js';
 import { platformDropsResponseFormat } from '../lib/sampling-params.js';
@@ -147,6 +148,12 @@ export interface ChainRow {
   supports_vision: number;
   supports_tools: number;
   context_window: number | null;
+  // Scene-routing soft-preference labels (see lib/scene.ts). Optional on the
+  // row: only the scene-bias path reads them, and rows joined before the
+  // columns existed are simply treated as unmatched.
+  category: string | null;
+  network_tier: string | null;
+  tags: string | null;
   // Custom models bind to the api_keys row carrying their endpoint (#212);
   // NULL for built-in platforms.
   key_id: number | null;
@@ -807,6 +814,120 @@ function usableKeyCountsByPlatform(db: Db): Map<string, number> {
   return new Map(rows.map(r => [r.platform, r.count]));
 }
 
+// ── Scene routing bias (re-derived business logic, v0.7.0 style) ──────────
+// Three soft-preference layers, original weights preserved:
+//   L1 network_tier match (X-Network-Tier header)  +4
+//   L2 category match     (models.category)        +2
+//   L3 tag match          (models.tags)            +1 each
+// Folded into orderChain instead of pre-sorting the chain: only "which key to
+// try first" is biased; retries, cooldowns and failover are untouched. The
+// mechanism mirrors the upstream model-weight-overrides hook — a per-model
+// multiplier on the bandit score — but the nudge is derived per REQUEST from
+// the client's scene signal rather than configured statically per model.
+
+/** Per-model scene attributes, loaded on demand for the entries in one chain. */
+export interface ModelSceneAttrs {
+  category: string | null;
+  networkTier: string | null;
+  tags: string[];
+}
+
+/**
+ * Parse the `models.tags` column defensively.
+ *
+ * The column has accumulated THREE incompatible shapes over time:
+ *   1. a JSON array of strings   — ["free-tier","long-context"]
+ *   2. a bare CSV string         — free-tier,long-context
+ *   3. a JSON array of objects   — [{"platform_policy": ...}]   (~75% of rows)
+ * The pre-refactor implementation did a plain `JSON.parse` in a try/catch and
+ * fell back to `[]`, so shapes 2 and 3 silently contributed nothing — the L3
+ * layer was effectively dead for most of the catalog. Accepting all three
+ * revives it without a data migration. Never throws.
+ */
+export function parseModelTags(raw: unknown): string[] {
+  if (typeof raw !== 'string') return [];
+  const s = raw.trim();
+  if (!s) return [];
+  if (s.startsWith('[') || s.startsWith('{')) {
+    try {
+      const v = JSON.parse(s);
+      const arr = Array.isArray(v) ? v : [v];
+      // Objects carry provider metadata, not scene tags — keep only strings.
+      return arr.filter((x): x is string => typeof x === 'string').map(x => x.trim()).filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+  return s.split(',').map(x => x.trim()).filter(Boolean);
+}
+
+/**
+ * Load scene attributes for exactly the models in this chain.
+ *
+ * Scoped per call rather than cached process-wide: the admin UI can retag or
+ * recategorise a model at any time, and a stale module-level map would pin the
+ * router to the old labels until restart. A primary-key `IN (...)` lookup over
+ * a few dozen ids is far cheaper than that staleness risk. Returns null when no
+ * row carries scene labels, so callers can skip the (cheap) bias pass entirely.
+ */
+export function loadSceneAttrs(db: Db, chain: ChainRow[]): Map<number, ModelSceneAttrs> {
+  const out = new Map<number, ModelSceneAttrs>();
+  if (chain.length === 0) return out;
+  const ids = [...new Set(chain.map(e => e.model_db_id))];
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = db.prepare(
+    `SELECT id, category, network_tier, tags FROM models WHERE id IN (${placeholders})`,
+  ).all(...ids) as { id: number; category: string | null; network_tier: string | null; tags: string | null }[];
+  for (const r of rows) {
+    out.set(r.id, {
+      category: r.category,
+      networkTier: r.network_tier,
+      tags: parseModelTags(r.tags),
+    });
+  }
+  return out;
+}
+
+/**
+ * Raw scene bias for a chain entry, in "priority points" (0..N, higher = more
+ * preferred). Pure and directly unit-testable.
+ */
+export function sceneBiasScore(
+  entry: ChainRow,
+  scene: SceneSignal | undefined,
+  attrs: Map<number, ModelSceneAttrs> | undefined,
+): number {
+  if (!scene || !attrs) return 0;
+  const a = attrs.get(entry.model_db_id);
+  if (!a) return 0;
+
+  let bias = 0;
+  // L1 — network tier is the strongest signal: a domestic-only client simply
+  // cannot reach a global endpoint, so tier outranks capability.
+  if (scene.networkTier && a.networkTier === scene.networkTier) bias += 4;
+  // L2 — capability category.
+  if (scene.category && a.category === scene.category) bias += 2;
+  // L3 — declared tags.
+  if (scene.tags.length && a.tags.length) {
+    for (const tag of scene.tags) {
+      if (a.tags.includes(tag)) bias += 1;
+    }
+  }
+  return bias;
+}
+
+/**
+ * Bandit-mode conversion factor for the scene bias.
+ *
+ * `combineScore` is a convex combination in [0,1] multiplied by two guardrail
+ * factors, so adding raw priority points (up to 4+2+1·4 = 10) would swamp
+ * reliability, speed AND the rate-limit guardrail — turning a *soft* preference
+ * into a hard override that keeps routing to a throttled model. Scaling each
+ * point to 0.02 caps the total nudge at ~0.2, enough to reorder near-ties and
+ * to beat the priority tiebreaker, never enough to outvote a large health gap.
+ */
+const SCENE_BIAS_UNIT = 0.02;
+
 function scoreChainEntry(
   entry: ChainRow,
   weights: RoutingWeights,
@@ -814,6 +935,8 @@ function scoreChainEntry(
   intelMax: number,
   sampled: boolean,
   keyCounts: Map<string, number>,
+  scene?: SceneSignal,
+  sceneAttrs?: Map<number, ModelSceneAttrs>,
 ): ScoredEntry {
   const stats = statsCache?.get(modelStatsKey(entry.platform, entry.model_id, entry.endpoint_scope));
   const successes = stats?.successes ?? 0;
@@ -842,11 +965,16 @@ function scoreChainEntry(
 
   // Per-model env overrides (#738) scale the final score so a slow or
   // poor-quality model is demoted without being disabled outright — a manual
-  // 'priority' chain can still select it.
-  const score = applyModelWeightOverride(
+  // 'priority' chain can still select it. The scene bias is then folded in as a
+  // soft nudge (see SCENE_BIAS_UNIT): it reorders near-ties toward the client's
+  // preferred category / tag / network tier without ever outvoting a health gap.
+  let score = applyModelWeightOverride(
     combineScore({ reliability, speed, intelligence, headroom, rateLimit: rl }, weights),
     entry.model_id,
   );
+  if (scene && sceneAttrs) {
+    score += sceneBiasScore(entry, scene, sceneAttrs) * SCENE_BIAS_UNIT;
+  }
   return { axes: { reliability, speed, intelligence }, headroom, rateLimit: rl, score };
 }
 
@@ -863,16 +991,24 @@ function scoreChainEntry(
  * faithful reflection of the user's picked strategy, not a re-sampled draw each
  * request. Priority mode is deterministic either way.
  */
-function orderChain(chain: ChainRow[], strategy: RoutingStrategy, sampled = true): ChainRow[] {
+function orderChain(
+  chain: ChainRow[],
+  strategy: RoutingStrategy,
+  sampled = true,
+  scene?: SceneSignal,
+  attrs?: Map<number, ModelSceneAttrs>,
+): ChainRow[] {
   // Tier first, always: it is the one ordering input that score must not be able
   // to override (see ChainRow.match_tier). Zero for every chain built anywhere
   // else, so this is a no-op outside slug-fallback resolution.
   const tier = (e: ChainRow) => e.match_tier ?? 0;
   const weights = weightsFor(strategy);
   if (!weights) {
-    // Legacy priority mode: base priority + 429 penalty, ascending.
+    // Legacy priority mode: base priority + 429 penalty, ascending (lower wins),
+    // so the scene bias is SUBTRACTED — adding it would demote the very models
+    // the scene prefers.
     return chain
-      .map(e => ({ e, eff: e.priority + getPenalty(e.model_db_id) }))
+      .map(e => ({ e, eff: e.priority + getPenalty(e.model_db_id) - sceneBiasScore(e, scene, attrs) }))
       .sort((a, b) => tier(a.e) - tier(b.e) || a.eff - b.eff || a.e.priority - b.e.priority)
       .map(x => x.e);
   }
@@ -883,7 +1019,7 @@ function orderChain(chain: ChainRow[], strategy: RoutingStrategy, sampled = true
   const keyCounts = usableKeyCountsByPlatform(getDb());
 
   return chain
-    .map(e => ({ e, s: scoreChainEntry(e, weights, intelMin, intelMax, sampled, keyCounts).score }))
+    .map(e => ({ e, s: scoreChainEntry(e, weights, intelMin, intelMax, sampled, keyCounts, scene, attrs).score }))
     // Higher score first WITHIN a tier; manual priority breaks ties so the chain
     // still matters.
     .sort((a, b) => tier(a.e) - tier(b.e) || b.s - a.s || a.e.priority - b.e.priority)
@@ -928,7 +1064,7 @@ function getActiveChain(db: Db): ChainRow[] {
              m.platform, m.model_id, m.display_name, m.intelligence_rank,
              m.size_label, m.monthly_token_budget,
              m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-             m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
+             m.supports_tools, m.context_window, m.category, m.network_tier, m.tags, m.key_id, m.endpoint_scope
       FROM profile_models pm
       JOIN models m ON m.id = pm.model_db_id AND m.enabled = 1
       WHERE pm.profile_id = ?
@@ -943,7 +1079,7 @@ function getActiveChain(db: Db): ChainRow[] {
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.size_label, m.monthly_token_budget,
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-           m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
+           m.supports_tools, m.context_window, m.category, m.network_tier, m.tags, m.key_id, m.endpoint_scope
     FROM fallback_config fc
     JOIN models m ON m.id = fc.model_db_id AND m.enabled = 1
     ORDER BY fc.priority ASC
@@ -959,7 +1095,7 @@ function getChainByProfileName(db: Db, name: string): ChainRow[] | null {
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.size_label, m.monthly_token_budget,
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-           m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
+           m.supports_tools, m.context_window, m.category, m.network_tier, m.tags, m.key_id, m.endpoint_scope
     FROM profile_models pm
     JOIN models m ON m.id = pm.model_db_id AND m.enabled = 1
     WHERE pm.profile_id = ?
@@ -981,7 +1117,7 @@ function getChainByGlobalSort(db: Db, globalAxis: string): ChainRow[] {
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.size_label, m.monthly_token_budget,
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-           m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
+           m.supports_tools, m.context_window, m.category, m.network_tier, m.tags, m.key_id, m.endpoint_scope
     FROM models m
     LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
     ${profileId != null ? 'LEFT JOIN profile_models pm ON pm.profile_id = ? AND pm.model_db_id = m.id' : ''}
@@ -1312,7 +1448,7 @@ function getModelChainRow(db: Db, modelDbId: number): ChainRow | undefined {
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
            m.size_label, m.monthly_token_budget,
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-           m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
+           m.supports_tools, m.context_window, m.category, m.network_tier, m.tags, m.key_id, m.endpoint_scope
     FROM models m
     WHERE m.id = ? AND m.enabled = 1
   `).get(modelDbId) as ChainRow | undefined;
@@ -1371,7 +1507,7 @@ export function resolveModelGroupCandidates(
              m.platform, m.model_id, m.display_name, m.intelligence_rank,
              m.size_label, m.monthly_token_budget,
              m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-             m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
+             m.supports_tools, m.context_window, m.category, m.network_tier, m.tags, m.key_id, m.endpoint_scope
       FROM models m
       LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
       WHERE m.id = ? AND m.enabled = 1
@@ -1382,7 +1518,7 @@ export function resolveModelGroupCandidates(
              m.platform, m.model_id, m.display_name, m.intelligence_rank,
              m.size_label, m.monthly_token_budget,
              m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-             m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
+             m.supports_tools, m.context_window, m.category, m.network_tier, m.tags, m.key_id, m.endpoint_scope
       FROM models m
       LEFT JOIN profile_models pm ON pm.profile_id = ? AND pm.model_db_id = m.id
       LEFT JOIN fallback_config fc ON fc.model_db_id = m.id
@@ -1541,7 +1677,7 @@ export function resolveFusionCandidate(modelId: string): FusionCandidate | null 
   return null;
 }
 
-export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, requireTools = false, skipModels?: Set<number>, prefetchedChain?: ChainRow[], requireStructured = false, skipPlatforms?: Set<string>): RouteResult {
+export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, requireTools = false, skipModels?: Set<number>, prefetchedChain?: ChainRow[], requireStructured = false, skipPlatforms?: Set<string>, scene?: SceneSignal): RouteResult {
   const db = getDb();
 
   const strategy = getRoutingStrategy();
@@ -1549,7 +1685,16 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
 
   const chain = (prefetchedChain ?? getActiveChain(db)).filter(e => e.enabled);
 
-  const sortedChain = orderChain(chain, strategy);
+  // Scene-routing soft preference (see lib/scene.ts): when a request carries a
+  // scene signal and any chain row carries scene labels, load the labels and
+  // let orderChain fold them into the ordering. When the signal is empty or
+  // nothing carries labels the bias is a no-op, so the bandit keeps its exact
+  // prior behaviour.
+  const sceneAttrs = scene && !isEmptyScene(scene)
+    ? loadSceneAttrs(db, chain)
+    : undefined;
+
+  const sortedChain = orderChain(chain, strategy, true, scene, sceneAttrs);
 
   // Exploration toggle (#685/#707 follow-up): when enabled, give a model with
   // no reliability/speed samples a guaranteed chance to be tried, so it stops
@@ -1610,7 +1755,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
                m.platform, m.model_id, m.display_name, m.intelligence_rank,
                m.size_label, m.monthly_token_budget,
                m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
-               m.supports_tools, m.context_window, m.key_id, m.endpoint_scope
+               m.supports_tools, m.context_window, m.category, m.network_tier, m.tags, m.key_id, m.endpoint_scope
         FROM models m
         WHERE m.id = ? AND m.enabled = 1
       `).get(preferredModelDbId) as ChainRow | undefined;

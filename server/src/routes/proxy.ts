@@ -18,6 +18,7 @@ import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarke
 import { getContextHandoffMode, recordIncomingMessages, maybeInjectContextHandoff, recordSuccessfulModel, hasPriorModel, HANDOFF_MAX_TOKENS } from '../services/context-handoff.js';
 import { isFusionModel, runFusion, fusionConfigSchema, FusionError, FUSION_MODEL_ID } from '../services/fusion.js';
 import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError, isClientAbortError, newClientAbortError } from '../lib/error-classify.js';
+import { detectScene, normalizeNetworkTier } from '../lib/scene.js';
 import { logRequest } from '../lib/request-log.js';
 import { observeServedModel } from '../lib/served-model.js';
 import { parseCacheDirective, cacheActive, isCacheableTemperature, computeCacheKey, getCachedResponse, storeCachedResponse } from '../services/cache.js';
@@ -970,6 +971,9 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
   // Legacy /completions is a thin adapter over the shared fallback loop
   // (lib/fallback-loop.ts): the cooldown/skip/penalty/exhaustion machinery is
   // shared; only the text_completion request/stream translation lives here.
+  const scene = isAutoModel(requestedModel)
+    ? detectScene(messages, false, normalizeNetworkTier(req.headers['x-network-tier']))
+    : undefined;
   await runFallbackLoop({
     maxRetries: MAX_RETRIES,
     state,
@@ -985,6 +989,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
       groupChain ?? resolvedChain?.chain,
       false,
       state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined,
+      scene,
     ),
     dispatch: async (route, attempt) => {
       traceRouteEvent('Proxy', {
@@ -1752,6 +1757,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // here is /chat/completions-specific: the response-cache MISS store, the
   // context-handoff injection, group/unified-chain routing, and the OpenAI
   // stream turn-integrity framing.
+
+  // Scene-routing soft preference (re-derived business logic): detect the
+  // client's scene from the request messages + X-Network-Tier header, computed
+  // ONCE here so every retry sees the same scene. Folded into the router's
+  // chain ordering via routeRequest's scene argument; an empty scene is a no-op.
+  const scene = isAutoModel(requestedModel)
+    ? detectScene(messages, wantsTools, normalizeNetworkTier(req.headers['x-network-tier']))
+    : undefined;
   const state = newFallbackState();
   const attemptLog: AttemptRecord[] = [];
   // Client-disconnect fan-out: the flag stops the loop before the NEXT
@@ -1782,7 +1795,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       // model is on record). Turns where injection can't happen — every turn 1, and
       // sessions that never switched — pay no headroom tax.
       const routingEstimate = handoffPossible ? estimatedTotal + HANDOFF_MAX_TOKENS : estimatedTotal;
-      return routeRequest(routingEstimate, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain ?? resolvedChain?.chain, samplingParams.response_format !== undefined, state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined);
+      return routeRequest(routingEstimate, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain ?? resolvedChain?.chain, samplingParams.response_format !== undefined, state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined, scene);
     },
     dispatch: async (route, attempt) => {
     const modelKey = `${route.platform}:${route.modelId}`;

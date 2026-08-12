@@ -1,0 +1,22 @@
+# CNB NPC API-触发胶水（freellmapi 版 · 需 push）
+# 与 web2kb 唯一区别：sandbox: false -> 流水线内 CNB_TOKEN 有效，NPC 可 push npc/* 分支。
+# 配套触发时务必传 npc.workMode: true（写权限 scope），否则即便 sandbox:false 也缺写权。
+# 仅 freellmapi Batch1（TD-012a/012b/027 直改代码）使用；其余工作流用 web2kb 仓库的 .cnb.yml（sandbox:true）。
+#
+# ⚠️ 形态修正（2026-08-08，实测两轮得出）：
+#   - 顶格列表  -> build/start 报 CONFIG_EVENT_EMPTY（CNB 找不到 branch 上下文）
+#   - main 下映射 -> 构建 success 但 docker/sandbox/stages 被当成 3 个独立空跑 pipeline，npc:go 不执行
+#   - main 下列表 -> 既按 branch main 命中，又成为单一 pipeline 含正确 stages（采用本形态）
+#   参考：https://docs.cnb.cool/zh/build/npc-integration.html
+
+main:
+  api_trigger_npc:
+    - docker:
+        image: cnbcool/default-npc:latest
+      sandbox: false
+      stages:
+        - name: npc go
+          type: npc:go
+          options:
+            systemPrompt: $systemPrompt
+            userPrompt: $userPrompt

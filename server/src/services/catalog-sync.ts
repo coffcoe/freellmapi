@@ -14,6 +14,7 @@ import {
   reinstateUpstreamRetiredCatalogModel,
 } from './model-state.js';
 import { ensureAllModelsInProfiles } from './profile-models.js';
+import { inferModelCategory } from './model-category.js';
 
 // Generative-media modalities are routed into the separate media_models table
 // (see services/media.ts), never into the chat `models` table.
@@ -253,16 +254,16 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
       size_label = @sizeLabel, rpm_limit = @rpm, rpd_limit = @rpd, tpm_limit = @tpm, tpd_limit = @tpd,
       monthly_token_budget = @monthlyTokenBudget, context_window = @contextWindow,
       supports_vision = @supportsVision, supports_tools = @supportsTools,
-      enabled = @enabled
+      category = @category, enabled = @enabled
     WHERE id = @id
   `);
   const insertModel = db.prepare(`
     INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
                         rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
-                        enabled, supports_vision, supports_tools, source)
+                        enabled, supports_vision, supports_tools, category, source)
     VALUES (@platform, @modelId, @displayName, @intelligenceRank, @speedRank, @sizeLabel,
             @rpm, @rpd, @tpm, @tpd, @monthlyTokenBudget, @contextWindow,
-            @enabled, @supportsVision, @supportsTools, 'catalog')
+            @enabled, @supportsVision, @supportsTools, @category, 'catalog')
   `);
 
   // Generative-media models go to their own table (never the chat router's pool).
@@ -383,6 +384,16 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
         contextWindow: routableContextWindow(m.platform, m.modelId, m.contextWindow),
         supportsVision: m.supportsVision ? 1 : 0,
         supportsTools: m.supportsTools ? 1 : 0,
+        // Scene-routing category, inferred from the catalog capability + name
+        // hints (TD-027). NULL is a valid value ("cannot infer, don't guess");
+        // it is always written so a catalog metadata change that should relabel
+        // a model (e.g. a new supports_vision flag) is reflected here too.
+        category: inferModelCategory({
+          modelId: m.modelId,
+          displayName: m.displayName,
+          supportsVision: m.supportsVision,
+          supportsTools: m.supportsTools,
+        }),
       };
       if (row) {
         // Catalog disable wins (dead upstream); local disable also wins.

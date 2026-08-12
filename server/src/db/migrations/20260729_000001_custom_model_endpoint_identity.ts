@@ -117,10 +117,28 @@ function rebuildModels(db: Db, extraColumns: string, copiedColumns: string, uniq
 }
 
 export function up(db: Db): void {
+  // The models table is rebuilt here to swap its UNIQUE constraint. The schema
+  // is derived from the LIVE table (PRAGMA table_info) rather than only the
+  // hard-coded baseline, so a migration applied later that added columns
+  // (e.g. the scene-routing `category` / `network_tier` / `tags` labels) is
+  // carried across the rebuild intact instead of silently dropped. The
+  // hard-coded MODELS_COLUMNS/CARRIED_COLUMNS above remain the auditable
+  // baseline; the live column list is the superset actually present at runtime.
+  const liveCols = db.prepare("SELECT name, type, dflt_value FROM pragma_table_info('models')")
+    .all() as { name: string; type: string; dflt_value: unknown }[];
+  const baseNames = CARRIED_COLUMNS.split(',').map(s => s.trim());
+  const extraNames = liveCols
+    .map(c => c.name)
+    .filter(name => !baseNames.includes(name) && name !== 'endpoint_scope');
+  // Columns unknown to the baseline are added to the rebuilt table verbatim
+  // (NULL-able, no default expressed here so the copy can't violate a default).
+  const extraColumns = extraNames.map(n => `,\n      ${n} TEXT`).join('');
+  const copiedColumns = [...baseNames, ...extraNames].join(', ');
+
   rebuildModels(
     db,
-    `,\n      endpoint_scope TEXT NOT NULL DEFAULT ''`,
-    CARRIED_COLUMNS,
+    `${extraColumns},\n      endpoint_scope TEXT NOT NULL DEFAULT ''`,
+    copiedColumns,
     'UNIQUE(platform, model_id, endpoint_scope)',
   );
 
@@ -161,5 +179,16 @@ export function down(db: Db): void {
   }
 
   db.exec('DROP INDEX IF EXISTS idx_models_endpoint_scope;');
-  rebuildModels(db, '', CARRIED_COLUMNS, 'UNIQUE(platform, model_id)');
+  // Down also derives the carried columns from the live schema so a column
+  // added by a later migration survives the rebuild back to (platform, model_id)
+  // uniqueness — otherwise the round trip would silently drop it.
+  const liveCols = db.prepare("SELECT name FROM pragma_table_info('models')")
+    .all() as { name: string }[];
+  const baseNames = CARRIED_COLUMNS.split(',').map(s => s.trim());
+  const downExtra = liveCols
+    .map(c => c.name)
+    .filter(name => !baseNames.includes(name) && name !== 'endpoint_scope');
+  const downCopied = [...baseNames, ...downExtra].join(', ');
+  const downExtraCols = downExtra.map(n => `,\n      ${n} TEXT`).join('');
+  rebuildModels(db, downExtraCols, downCopied, 'UNIQUE(platform, model_id)');
 }

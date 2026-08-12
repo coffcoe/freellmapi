@@ -115,6 +115,28 @@ describe('applyCatalog', () => {
     expect(fb).toBeTruthy();
   });
 
+  it('infers and writes models.category from catalog capability + name hints (TD-027)', () => {
+    const models = existingAsCatalogModels();
+    // Vision flag outranks everything.
+    models.push(baseModel({ modelId: 'vision-capable', displayName: 'Vision Model', supportsVision: true, supportsTools: false }));
+    // Tool-capable with no stronger hint -> function-calling.
+    models.push(baseModel({ modelId: 'tool-model', displayName: 'Tool Model', supportsVision: false, supportsTools: true }));
+    // No hint at all -> category stays NULL (never guessed).
+    models.push(baseModel({ modelId: 'plain-model', displayName: 'Plain Model', supportsVision: false, supportsTools: false }));
+
+    applyCatalog(getDb(), catalogOf(models));
+
+    const cat = (modelId: string) => {
+      const r = getDb()
+        .prepare("SELECT category FROM models WHERE platform = 'groq' AND model_id = ?")
+        .get(modelId) as { category: string | null };
+      return r.category;
+    };
+    expect(cat('vision-capable')).toBe('vision');
+    expect(cat('tool-model')).toBe('function-calling');
+    expect(cat('plain-model')).toBeNull();
+  });
+
   it('caps GitHub GPT-4.1 catalog context at the routable free-tier limit (#426)', () => {
     const models = existingAsCatalogModels();
     const target = models.find((m) => m.platform === 'github' && m.modelId === 'openai/gpt-4.1');
