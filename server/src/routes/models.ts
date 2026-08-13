@@ -252,6 +252,20 @@ modelsRouter.get('/', (_req: Request, res: Response) => {
     enabled: m.enabled === 1,
     supportsVision: m.supports_vision === 1,
     supportsTools: m.supports_tools === 1,
+    category: m.category ?? 'chat',
+    lastVerifiedAt: m.last_verified_at ?? null,
+    probeStatus: m.probe_status === 1,
+    // Rate limit summary: combine rpm/rpd/tpm into human-readable format
+    rateLimit: [
+      m.rpm_limit ? `${m.rpm_limit} RPM` : null,
+      m.rpd_limit ? `${m.rpd_limit} RPD` : null,
+      m.tpm_limit ? `${m.tpm_limit} TPM` : null,
+      m.tpd_limit ? `${m.tpd_limit} TPD` : null,
+    ].filter(Boolean).join(' / ') || 'unknown',
+    // Tier: derive from pricing fields and enabled/disabled
+    tier: m.paid_input_per_m != null || m.paid_output_per_m != null ? 'paid' : 'free',
+    // Whether a credit card is likely required (heuristic: paid models with no key usually require card)
+    requiresCreditCard: m.platform === 'nvidia' || m.platform === 'groq' || m.platform === 'mistral',
     priority: m.priority,
     fallbackEnabled: m.fallback_enabled === 1,
     // Real provenance from models.source ('catalog' | 'user'). The dashboard's

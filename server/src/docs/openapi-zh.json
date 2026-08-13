@@ -1,0 +1,185 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "FreeLLMAPI",
+    "version": "0.4.1",
+    "description": "兼容 OpenAI 的免费大语言模型代理。在统一的 /v1 端点后聚合 16+ 个免费提供商。"
+  },
+  "servers": [
+    { "url": "http://localhost:3001/v1", "description": "本地开发服务器" }
+  ],
+  "paths": {
+    "/chat/completions": {
+      "post": {
+        "operationId": "createChatCompletion",
+        "summary": "创建对话补全",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ChatCompletionRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "成功响应",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ChatCompletionResponse" }
+              }
+            }
+          },
+          "400": { "description": "无效请求", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "401": { "description": "无效的 API 密钥", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "429": { "description": "超出速率限制", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+          "500": { "description": "服务器错误", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/models": {
+      "get": {
+        "operationId": "listModels",
+        "summary": "列出可用模型",
+        "responses": {
+          "200": {
+            "description": "成功响应",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ModelList" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/responses": {
+      "post": {
+        "operationId": "createResponse",
+        "summary": "OpenAI Responses API（兼容 Codex CLI）",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ResponseRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "description": "成功响应" }
+        }
+      }
+    },
+    "/usage": {
+      "get": {
+        "operationId": "getUsage",
+        "summary": "获取使用统计（需要控制面板授权）",
+        "responses": {
+          "200": {
+            "description": "使用统计",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/UsageStats" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ChatCompletionRequest": {
+        "type": "object",
+        "required": ["messages"],
+        "properties": {
+          "model": { "type": "string", "description": "模型 ID，或 'auto' 用于自动路由", "default": "auto" },
+          "messages": { "type": "array", "items": { "$ref": "#/components/schemas/Message" }, "description": "对话消息列表" },
+          "temperature": { "type": "number", "minimum": 0, "maximum": 2, "description": "采样温度（0-2）" },
+          "max_tokens": { "type": "integer", "description": "最大生成 token 数" },
+          "top_p": { "type": "number", "description": "核采样概率" },
+          "stream": { "type": "boolean", "default": false, "description": "是否流式返回" },
+          "tools": { "type": "array", "items": { "type": "object" }, "description": "工具定义列表" },
+          "tool_choice": { "oneOf": [{ "type": "string" }, { "type": "object" }], "description": "工具选择方式" }
+        }
+      },
+      "Message": {
+        "type": "object",
+        "required": ["role", "content"],
+        "properties": {
+          "role": { "type": "string", "enum": ["system", "user", "assistant", "tool"], "description": "消息角色" },
+          "content": { "oneOf": [{ "type": "string" }, { "type": "array" }], "description": "消息内容" },
+          "name": { "type": "string", "description": "工具调用名称" },
+          "tool_calls": { "type": "array", "description": "工具调用列表" }
+        }
+      },
+      "ChatCompletionResponse": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "description": "补全 ID" },
+          "object": { "type": "string", "description": "对象类型" },
+          "created": { "type": "integer", "description": "创建时间戳" },
+          "model": { "type": "string", "description": "使用的模型" },
+          "choices": { "type": "array", "items": { "type": "object" }, "description": "补全选项列表" },
+          "usage": { "$ref": "#/components/schemas/Usage", "description": "token 使用统计" }
+        }
+      },
+      "Usage": {
+        "type": "object",
+        "properties": {
+          "prompt_tokens": { "type": "integer", "description": "提示词 token 数" },
+          "completion_tokens": { "type": "integer", "description": "补全 token 数" },
+          "total_tokens": { "type": "integer", "description": "总 token 数" }
+        }
+      },
+      "ModelList": {
+        "type": "object",
+        "properties": {
+          "object": { "type": "string", "enum": ["list"] },
+          "data": { "type": "array", "items": { "$ref": "#/components/schemas/Model" }, "description": "模型列表" }
+        }
+      },
+      "Model": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string", "description": "模型 ID" },
+          "object": { "type": "string", "enum": ["model"] },
+          "created": { "type": "integer", "description": "创建时间戳" },
+          "owned_by": { "type": "string", "description": "所属提供商" }
+        }
+      },
+      "Error": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "type": "object",
+            "properties": {
+              "message": { "type": "string", "description": "错误描述" },
+              "type": { "type": "string", "description": "错误类型" },
+              "param": { "type": "string", "nullable": true, "description": "相关参数" },
+              "code": { "type": "string", "description": "错误代码" }
+            }
+          }
+        }
+      },
+      "UsageStats": {
+        "type": "object",
+        "properties": {
+          "totalRequests": { "type": "integer", "description": "总请求数" },
+          "successRate": { "type": "number", "description": "成功率（0-1）" },
+          "totalInputTokens": { "type": "integer", "description": "总输入 token 数" },
+          "totalOutputTokens": { "type": "integer", "description": "总输出 token 数" },
+          "avgLatencyMs": { "type": "integer", "description": "平均延迟（毫秒）" },
+          "estimatedCostSavings": { "type": "number", "description": "估算成本节省（美元）" }
+        }
+      },
+      "ResponseRequest": {
+        "type": "object",
+        "properties": {
+          "model": { "type": "string", "description": "模型 ID" },
+          "input": { "type": "string", "description": "输入文本" }
+        }
+      }
+    }
+  }
+}

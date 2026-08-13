@@ -11,6 +11,7 @@ import { NodeScheduler } from './lib/scheduler.js';
 import { loadConfig } from './lib/config.js';
 import { applyDeclarativeConfigFromEnv } from './services/declarative-config.js';
 import { restoreDbBackupIfNeeded, startDbBackupPump } from './lib/db-backup.js';
+import { cleanupExpiredCooldowns } from './services/ratelimit.js';
 import { userCount } from './services/auth.js';
 import { generateSetupCode } from './lib/setup-code.js';
 import { warnOnEnvDrift } from './lib/env-drift.js';
@@ -39,6 +40,16 @@ async function main() {
   }
   initDb(config.dbPath ?? undefined);
   applyDeclarativeConfigFromEnv();
+
+  // Proactive cooldown cleanup on startup: stale DB rows from previous
+  // sessions (e.g. 31 expired cooldowns from 2026-08-02 incident) would
+  // otherwise survive until a request hits that exact (platform, model, key).
+  // If every model is cooldown-blocked, no request can trigger the lazy
+  // cleanup in isOnCooldown → "routing exhausted" deadlock.
+  const cleared = cleanupExpiredCooldowns();
+  if (cleared > 0) {
+    console.log(`[startup] Cleaned ${cleared} expired rate-limit cooldown(s)`);
+  }
 
   // First-run hardening: when the dashboard is still unclaimed, mint a one-time
   // setup code and log it. A loopback browser can finish setup without it; a

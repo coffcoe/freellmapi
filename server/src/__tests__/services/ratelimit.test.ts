@@ -145,29 +145,23 @@ describe('Rate Limiter', () => {
       ).toBe(90 * 1000);
     });
 
-    it('escalates null-limit 429s through the same ladder as documented RPD exhaustion', () => {
-      // Documented RPD path (see "escalates only once the daily request limit
-      // is actually reached"): 1st call after counter ≥ limit → 2min (idx=0),
-      // 2nd → 10min (idx=1), 3rd → HOUR (idx=2), 4th+ → DAY (idx=3).
-      //
-      // Null-limit path mirrors that sequence starting at the 2nd 429 (1st
-      // is transient — no signal yet). Uses an independent counter so the
-      // ladder index isn't inflated by the heuristic's own hits.
+    it('caps null-limit 429s at NO_LIMIT_COOLDOWN_CAP_MS (never the 24h ladder)', () => {
+      // No-limit free providers (cloudflare/ollama/...) 429 on transient RPM
+      // jitter, not real daily exhaustion. After the heuristic threshold (2 hits)
+      // is crossed we bench at the 10min cap and stay there — we must NOT escalate
+      // to the 24h ladder, which would cascade 429s to high-volume consumers.
       const id = Math.floor(Math.random() * 1_000_000);
       const platform = 'ollama';
       const model = `nolimit-esc-${id}`;
       // 1st 429 — no history → transient
       expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(90 * 1000);
-      // 2nd 429 — heuristic threshold (2) crossed → 2min (ladder idx=0)
-      expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(2 * 60 * 1000);
-      // 3rd 429 → 10min (idx=1)
+      // 2nd 429 — heuristic threshold (2) crossed → capped at 10min
       expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(10 * 60 * 1000);
-      // 4th 429 → HOUR (idx=2)
-      expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(60 * 60 * 1000);
-      // 5th 429 → DAY (idx=3, capped)
-      expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(24 * 60 * 60 * 1000);
-      // 6th+ stays at DAY
-      expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(24 * 60 * 60 * 1000);
+      // 3rd..6th 429 — stays capped at 10min (bounded protective cooldown)
+      expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(10 * 60 * 1000);
+      expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(10 * 60 * 1000);
+      expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(10 * 60 * 1000);
+      expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(10 * 60 * 1000);
     });
 
     it('does NOT trigger the heuristic when limits are known (even after 5+ hits)', () => {
@@ -190,7 +184,7 @@ describe('Rate Limiter', () => {
       const model = `nolimit-success-${id}`;
 
       expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(90 * 1000);
-      expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(2 * 60 * 1000);
+      expect(getCooldownDurationForLimit(platform, model, id, { rpd: null, tpd: null })).toBe(10 * 60 * 1000);
       expect(recentHitCount(platform, model, id, Date.now())).toBe(2);
 
       recordRequest(platform, model, id);
