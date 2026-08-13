@@ -71,9 +71,13 @@ export function up(db: Db): void {
 }
 
 export function down(db: Db): void {
-  // SQLite >= 3.35 supports DROP COLUMN; all three columns are plain and
-  // unindexed, so dropping is safe and order-independent.
-  for (const col of ['tags', 'network_tier', 'category']) {
+  // SQLite >= 3.35 supports DROP COLUMN; the columns this migration carries are
+  // plain and unindexed, so dropping is safe. `category` is deliberately NOT
+  // dropped here: it was originally introduced by
+  // 20260701_000001_add_category_to_models (whose own down() owns it). If this
+  // down() removed it too, the round trip would leave that migration's down()
+  // a no-op (column already gone) and fail the round-trip gate.
+  for (const col of ['tags', 'network_tier']) {
     if (hasColumn(db, 'models', col)) {
       db.prepare(`ALTER TABLE models DROP COLUMN ${col}`).run();
     }

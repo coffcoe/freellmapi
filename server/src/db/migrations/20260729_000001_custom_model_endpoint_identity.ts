@@ -130,9 +130,14 @@ export function up(db: Db): void {
   const extraNames = liveCols
     .map(c => c.name)
     .filter(name => !baseNames.includes(name) && name !== 'endpoint_scope');
-  // Columns unknown to the baseline are added to the rebuilt table verbatim
-  // (NULL-able, no default expressed here so the copy can't violate a default).
-  const extraColumns = extraNames.map(n => `,\n      ${n} TEXT`).join('');
+  // Columns unknown to the baseline are added to the rebuilt table verbatim,
+  // preserving their declared type (e.g. BOOLEAN for probe_status) so the
+  // rebuild does not silently downgrade NUMERIC affinity and flip stored
+  // values (0 vs "0"). NULL-able, no default expressed here so the copy can't
+  // violate a default.
+  const extraColumns = extraNames
+    .map(n => `,\n      ${n} ${liveCols.find(c => c.name === n)?.type || 'TEXT'}`)
+    .join('');
   const copiedColumns = [...baseNames, ...extraNames].join(', ');
 
   rebuildModels(
@@ -181,14 +186,18 @@ export function down(db: Db): void {
   db.exec('DROP INDEX IF EXISTS idx_models_endpoint_scope;');
   // Down also derives the carried columns from the live schema so a column
   // added by a later migration survives the rebuild back to (platform, model_id)
-  // uniqueness — otherwise the round trip would silently drop it.
-  const liveCols = db.prepare("SELECT name FROM pragma_table_info('models')")
-    .all() as { name: string }[];
+  // uniqueness — otherwise the round trip would silently drop it. Types are
+  // preserved (not forced to TEXT) so NUMERIC/BOOLEAN columns keep their
+  // affinity and stored values across the round trip.
+  const liveCols = db.prepare("SELECT name, type FROM pragma_table_info('models')")
+    .all() as { name: string; type: string }[];
   const baseNames = CARRIED_COLUMNS.split(',').map(s => s.trim());
   const downExtra = liveCols
     .map(c => c.name)
     .filter(name => !baseNames.includes(name) && name !== 'endpoint_scope');
   const downCopied = [...baseNames, ...downExtra].join(', ');
-  const downExtraCols = downExtra.map(n => `,\n      ${n} TEXT`).join('');
+  const downExtraCols = downExtra
+    .map(n => `,\n      ${n} ${liveCols.find(c => c.name === n)?.type || 'TEXT'}`)
+    .join('');
   rebuildModels(db, downExtraCols, downCopied, 'UNIQUE(platform, model_id)');
 }

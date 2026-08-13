@@ -4,6 +4,8 @@ import * as customProviderModalities from '../migrations/20260627_000001_custom_
 import * as catalogModelState from '../migrations/20260627_000002_catalog_model_state.js';
 import * as requestAggregates from '../migrations/20260628_120000_request_aggregates.js';
 import * as githubGpt41Context from '../migrations/20260630_000001_github_gpt41_context.js';
+import * as addCategoryToModels from '../migrations/20260701_000001_add_category_to_models.js';
+import * as addProbeFields from '../migrations/20260701_000002_add_probe_fields.js';
 import * as requestClientInfo from '../migrations/20260706_000001_request_client_info.js';
 import * as customModelToolSupport from '../migrations/20260706_000002_custom_model_tool_support.js';
 import * as profileChainBackfill from '../migrations/20260714_000001_profile_chain_backfill.js';
@@ -17,6 +19,7 @@ import * as attemptErrorSummary from '../migrations/20260726_000006_attempt_erro
 import * as agentCompatibility from '../migrations/20260727_000001_agent_compatibility.js';
 import * as tombstoneProvenance from '../migrations/20260728_000001_tombstone_provenance.js';
 import * as customModelEndpointIdentity from '../migrations/20260729_000001_custom_model_endpoint_identity.js';
+import * as quotaGuardColumns from '../migrations/20260802_000000_quota_guard_columns.js';
 import * as customEndpointHostLabels from '../migrations/20260802_000001_custom_endpoint_host_labels.js';
 import * as keyModelScope from '../migrations/20260805_000001_key_model_scope.js';
 import * as clientProfiles from '../migrations/20260805_000002_client_profiles.js';
@@ -38,6 +41,8 @@ export const CUSTOM_PROVIDER_MODALITIES_FILENAME = '20260627_000001_custom_provi
 export const CATALOG_MODEL_STATE_FILENAME = '20260627_000002_catalog_model_state.ts';
 export const REQUEST_AGGREGATES_FILENAME = '20260628_120000_request_aggregates.ts';
 export const GITHUB_GPT41_CONTEXT_FILENAME = '20260630_000001_github_gpt41_context.ts';
+export const ADD_CATEGORY_TO_MODELS_FILENAME = '20260701_000001_add_category_to_models.ts';
+export const ADD_PROBE_FIELDS_FILENAME = '20260701_000002_add_probe_fields.ts';
 export const REQUEST_CLIENT_INFO_FILENAME = '20260706_000001_request_client_info.ts';
 export const CUSTOM_MODEL_TOOL_SUPPORT_FILENAME = '20260706_000002_custom_model_tool_support.ts';
 export const PROFILE_CHAIN_BACKFILL_FILENAME = '20260714_000001_profile_chain_backfill.ts';
@@ -51,6 +56,7 @@ export const ATTEMPT_ERROR_SUMMARY_FILENAME = '20260726_000006_attempt_error_sum
 export const AGENT_COMPATIBILITY_FILENAME = '20260727_000001_agent_compatibility.ts';
 export const TOMBSTONE_PROVENANCE_FILENAME = '20260728_000001_tombstone_provenance.ts';
 export const CUSTOM_MODEL_ENDPOINT_IDENTITY_FILENAME = '20260729_000001_custom_model_endpoint_identity.ts';
+export const QUOTA_GUARD_COLUMNS_FILENAME = '20260802_000000_quota_guard_columns.ts';
 export const CUSTOM_ENDPOINT_HOST_LABELS_FILENAME = '20260802_000001_custom_endpoint_host_labels.ts';
 export const KEY_MODEL_SCOPE_FILENAME = '20260805_000001_key_model_scope.ts';
 export const CLIENT_PROFILES_FILENAME = '20260805_000002_client_profiles.ts';
@@ -63,6 +69,8 @@ export const DEFAULT_MIGRATIONS: readonly DefaultMigration[] = [
   { filename: CATALOG_MODEL_STATE_FILENAME, module: catalogModelState },
   { filename: REQUEST_AGGREGATES_FILENAME, module: requestAggregates },
   { filename: GITHUB_GPT41_CONTEXT_FILENAME, module: githubGpt41Context },
+  { filename: ADD_CATEGORY_TO_MODELS_FILENAME, module: addCategoryToModels },
+  { filename: ADD_PROBE_FIELDS_FILENAME, module: addProbeFields },
   { filename: REQUEST_CLIENT_INFO_FILENAME, module: requestClientInfo },
   { filename: CUSTOM_MODEL_TOOL_SUPPORT_FILENAME, module: customModelToolSupport },
   { filename: PROFILE_CHAIN_BACKFILL_FILENAME, module: profileChainBackfill },
@@ -76,6 +84,7 @@ export const DEFAULT_MIGRATIONS: readonly DefaultMigration[] = [
   { filename: AGENT_COMPATIBILITY_FILENAME, module: agentCompatibility },
   { filename: TOMBSTONE_PROVENANCE_FILENAME, module: tombstoneProvenance },
   { filename: CUSTOM_MODEL_ENDPOINT_IDENTITY_FILENAME, module: customModelEndpointIdentity },
+  { filename: QUOTA_GUARD_COLUMNS_FILENAME, module: quotaGuardColumns },
   { filename: CUSTOM_ENDPOINT_HOST_LABELS_FILENAME, module: customEndpointHostLabels },
   { filename: KEY_MODEL_SCOPE_FILENAME, module: keyModelScope },
   { filename: CLIENT_PROFILES_FILENAME, module: clientProfiles },
