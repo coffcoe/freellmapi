@@ -246,22 +246,31 @@ git stash pop                                      # 取回自定义改动
 
 ## 7. 漂移检测汇总（同步上游后逐项跑，空输出=被覆盖）
 
+> **v0.7.0 合入后复核（2026-08-13 灰狐，审计 round 2）**：以下清单已按 v0.7.0 现状更新——
+> ✅ 存活项标记改名/上游化（等价物已列）；❌ 丢失项为 v0.7.0 重写融入未保留，详见 `shared/discussions/agent-grey-fox/2026-08-13-freellmapi-v070-audit-round2.md` §四。
+
 ```bash
-cd C:/Users/coffcoe/freellmapi
-grep -n "QUOTA_GUARD_COLUMNS"            server/src/db/migrate/defaults.ts
-grep -n "filterExhaustedQuota\|filterHighValueIfLarge" server/src/services/router.ts
-grep -n "clientAborted\|truncateMessagesForGithub"     server/src/routes/proxy.ts
-grep -n "rpd_limit 治本"                  server/src/services/catalog-sync.ts
-grep -n "NO_LIMIT_COOLDOWN_CAP_MS"       server/src/services/ratelimit.ts
-grep -n "createHmac"                     server/src/middleware/proxyAuth.ts
-grep -n "api/v1/key\|agnes-ai.cn"       server/src/providers/index.ts
-grep -n "notifyTracker\|clientTag"       server/src/lib/request-log.ts
-grep -n "CLIENT_TEMPLATES"               server/src/routes/config.ts
-grep -n "modelscope"                     shared/types.ts
+cd D:/Users/Yin/freellmapi
+# ✅ 存活（等价物）
+grep -n "QUOTA_GUARD_COLUMNS"                     server/src/db/migrate/defaults.ts
+grep -n "summarizeExhaustion\|usableKeyCountsByPlatform" server/src/services/router.ts   # 原 filterExhaustedQuota
+grep -n "clientAbort\|clientGone"                 server/src/routes/proxy.ts               # 原 clientAborted
+grep -n "rpd_limit 治本"                          server/src/services/catalog-sync.ts
+grep -n "NO_LIMIT_COOLDOWN_CAP_MS"               server/src/services/ratelimit.ts
+grep -n "createHmac"                              server/src/middleware/proxyAuth.ts
+grep -n "agnes-ai.cn"                            server/src/providers/index.ts
+grep -n "client_agent"                            server/src/lib/request-log.ts              # 原 clientTag
+grep -n "detectCategoryScene\|SCENE_BIAS_UNIT"    server/src/lib/scene.ts server/src/services/router.ts
+grep -n "CLIENT_TEMPLATES"                        server/src/routes/config.ts
+grep -n "modelscope"                              shared/types.ts
+# ❌ 丢失（v0.7.0 未保留，待领航员裁决是否重写）
+grep -n "filterHighValueIfLarge\|is_high_value"  server/src/services/router.ts  # 预期空（is_high_value 仅迁移列残留）
+grep -n "truncateMessagesForGithub"              server/src/routes/proxy.ts     # 预期空
+grep -n "notifyTracker\|3003"                    server/src/lib/request-log.ts  # 预期空
 # DB 数据存活
 python - <<'PY'
 import sqlite3
-db=sqlite3.connect(r'C:/Users/coffcoe/freellmapi/server/data/freeapi.db')
+db=sqlite3.connect(r'D:/Users/Yin/freellmapi/server/data/freeapi.db')
 print("is_high_value=1:", db.execute("SELECT COUNT(*) FROM models WHERE is_high_value=1").fetchone()[0])
 print("github emb disabled:", db.execute("SELECT COUNT(*) FROM embedding_models WHERE platform='github' AND enabled=0").fetchone()[0])
 print("rpd capped platforms:", len(db.execute("SELECT DISTINCT platform FROM models WHERE rpd_limit IS NOT NULL").fetchall()))

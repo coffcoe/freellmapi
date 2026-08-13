@@ -6,8 +6,15 @@ import { describe, it, expect, beforeAll } from 'vitest';
 // quota, so neither the 90s transient bench nor the 2m→24h escalation ladder
 // ever applies — the bench is capped at a few seconds, even for a literal 429
 // (local servers emit those under concurrent load) and even when a Retry-After
-// is attached. Non-local keys (public IPs/hostnames, built-in platforms with
-// base_url NULL) keep the full pre-existing behavior.
+// is attached.
+//
+// Non-local keys (public IPs/hostnames, built-in platforms with base_url NULL)
+// keep the pre-existing quota behavior: with published RPD/TPD limits a real
+// 429 walks the standard ladder (2m→10m→…→24h); with NULL limits (the built-in
+// free-platform shape) the local NO_LIMIT_COOLDOWN_CAP_MS applies — repeated
+// real 429s bench at the 10min cap instead of climbing to a 24h death penalty
+// (see CUSTOM-PATCHES §3.9/§6.4: ollama 130× 429 in 1h with ladder escalation
+// cascaded 429s to high-volume consumers).
 
 import { initDb, getDb } from '../../db/index.js';
 import { cooldownDecisionForError } from '../../lib/fallback-loop.js';
@@ -75,22 +82,22 @@ describe('local-endpoint cooldown cap (#592)', () => {
     expect(cooldownDecisionForError(route, err).durationMs).toBe(LOCAL_CAP_MS);
   });
 
-  it('public-IP base_url is NOT exempt: transient then ladder on real 429s', () => {
+  it('public-IP base_url with NULL limits: transient then 10min cap on real 429s', () => {
     const route = routeForKey(insertKey('http://203.0.113.10/v1'));
     expect(cooldownDecisionForError(route, real429()).durationMs).toBe(TRANSIENT);
-    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(2 * MINUTE);
+    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(10 * MINUTE);
     expect(cooldownDecisionForError(route, real429()).durationMs).toBe(10 * MINUTE);
   });
 
-  it('non-literal hostname is treated as non-local (no DNS on the hot path)', () => {
+  it('non-literal hostname with NULL limits is non-local: transient then 10min cap', () => {
     const route = routeForKey(insertKey('https://inference.example.com/v1'));
     expect(cooldownDecisionForError(route, real429()).durationMs).toBe(TRANSIENT);
-    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(2 * MINUTE);
+    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(10 * MINUTE);
   });
 
-  it('a key with no base_url (built-in platform shape) keeps full behavior', () => {
+  it('a key with no base_url (built-in platform shape): transient then 10min cap', () => {
     const route = routeForKey(insertKey(null));
     expect(cooldownDecisionForError(route, real429()).durationMs).toBe(TRANSIENT);
-    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(2 * MINUTE);
+    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(10 * MINUTE);
   });
 });

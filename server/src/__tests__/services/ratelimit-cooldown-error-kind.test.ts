@@ -8,6 +8,12 @@ import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
 // is often the user's only route. Also covers the cooldownHits ladder decay on
 // success: two back-to-back failures used to keep their ladder step for 24h
 // even after successful requests proved the quota alive.
+//
+// v0.7.0 local semantics (CUSTOM-PATCHES §3.9): real 429s on NULL-limit free
+// platforms bench at NO_LIMIT_COOLDOWN_CAP_MS (10min) — bounded, never the
+// 24h ladder — because ladder escalation cascaded 429s to high-volume
+// consumers (ollama 130× 429 in 1h, §6.4). The RPD/TPD-counter ladder (2m→24h)
+// still applies only to platforms with a published daily quota.
 
 import { initDb } from '../../db/index.js';
 import { cooldownDecisionForError } from '../../lib/fallback-loop.js';
@@ -71,21 +77,25 @@ describe('null-limits heuristic only fires on quota signals (#592)', () => {
 
   it('a timeout does not inherit escalation started by real 429s', () => {
     expect(cooldownDecisionForError(route, real429()).durationMs).toBe(TRANSIENT);
-    // 2nd real 429 crosses the heuristic threshold → ladder (2m).
-    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(2 * MINUTE);
-    // A timeout right after must NOT climb to the next ladder step (10m):
-    // it is not a quota signal, so it neither records a hit nor escalates.
+    // 2nd real 429 crosses the heuristic threshold → NO_LIMIT_COOLDOWN_CAP_MS
+    // (10min cap for NULL-limit free platforms, NOT the 2m ladder step — see
+    // CUSTOM-PATCHES §3.9: ladder escalation on no-limit providers cascaded
+    // 429s to high-volume consumers, ollama 130× 429 in 1h).
+    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(10 * MINUTE);
+    // A timeout right after must NOT climb further: it is not a quota signal,
+    // so it neither records a hit nor raises the bench.
     expect(cooldownDecisionForError(route, timeoutErr()).durationMs).toBe(TRANSIENT);
     // Hit count still only reflects the two genuine 429s.
     expect(recentHitCount(route.platform, route.modelId, route.keyId, Date.now())).toBe(2);
   });
 
-  it('real 429s still escalate — the Ollama-Cloud opaque-quota protection holds', () => {
-    // 1st 429 → transient (no signal yet), then the ladder: 2m, 10m, 1h.
+  it('real 429s bench at the 10min cap on NULL-limit platforms (#592 + §3.9)', () => {
+    // 1st 429 → transient (no signal yet), then every further real 429 sits at
+    // NO_LIMIT_COOLDOWN_CAP_MS (10min) — bounded, never the 24h ladder.
     expect(cooldownDecisionForError(route, real429()).durationMs).toBe(TRANSIENT);
-    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(2 * MINUTE);
     expect(cooldownDecisionForError(route, real429()).durationMs).toBe(10 * MINUTE);
-    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(60 * MINUTE);
+    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(10 * MINUTE);
+    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(10 * MINUTE);
   });
 });
 
