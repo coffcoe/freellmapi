@@ -262,7 +262,7 @@ describe('scene routing end to end (priority strategy)', () => {
     addModel({ platform: 'groq', modelId: 'second', priority: 2, category: 'reasoning' });
     const scene = detectScene([msg('reason about this proof')], false);
     expect(scene.category).toBe('reasoning');
-    expect(routeRequest(100, undefined, undefined, false, false, undefined, undefined, false, scene).modelId)
+    expect(routeRequest(100, undefined, undefined, false, false, undefined, undefined, false, undefined, scene).modelId)
       .toBe('second');
   });
 
@@ -271,7 +271,7 @@ describe('scene routing end to end (priority strategy)', () => {
     addModel({ platform: 'groq', modelId: 'by-tier', priority: 2, networkTier: 'domestic' });
     const scene: SceneSignal = { category: 'reasoning', tags: [], networkTier: 'domestic' };
     // by-category: 1 - 2 = -1 ; by-tier: 2 - 4 = -2 → by-tier wins.
-    expect(routeRequest(100, undefined, undefined, false, false, undefined, undefined, false, scene).modelId)
+    expect(routeRequest(100, undefined, undefined, false, false, undefined, undefined, false, undefined, scene).modelId)
       .toBe('by-tier');
   });
 
@@ -280,7 +280,7 @@ describe('scene routing end to end (priority strategy)', () => {
     // Two matching tags = -2, so priority 2 beats priority 1 (2-2 = 0 < 1).
     addModel({ platform: 'groq', modelId: 'second', priority: 2, tags: 'free-tier,long-context' });
     const scene: SceneSignal = { category: null, tags: ['free-tier', 'long-context'], networkTier: null };
-    expect(routeRequest(100, undefined, undefined, false, false, undefined, undefined, false, scene).modelId)
+    expect(routeRequest(100, undefined, undefined, false, false, undefined, undefined, false, undefined, scene).modelId)
       .toBe('second');
   });
 
@@ -296,7 +296,7 @@ describe('scene routing end to end (priority strategy)', () => {
   it('never lets the bias drop a model out of the chain', () => {
     addModel({ platform: 'google', modelId: 'only', priority: 1 });
     const scene: SceneSignal = { category: 'vision', tags: ['free-tier'], networkTier: 'domestic' };
-    expect(routeRequest(100, undefined, undefined, false, false, undefined, undefined, false, scene).modelId)
+    expect(routeRequest(100, undefined, undefined, false, false, undefined, undefined, false, undefined, scene).modelId)
       .toBe('only');
   });
 });

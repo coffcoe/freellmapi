@@ -1,5 +1,5 @@
 /**
- * models.category inference — TD-027.
+ * models.category inference — TD-027, re-derived onto v0.7.0.
  *
  * The live catalog historically never populated `models.category`, so the
  * scene router's L2 layer (category match, +2) only ever hit the rows some
@@ -11,7 +11,10 @@
  * This module derives a category from the catalog metadata the DB already
  * carries (capability flags + model id/display name), so enriching the catalog
  * is a pure data/backfill operation — no new upstream field, no manual
- * labelling, no guessing. The mapping is deliberately conservative:
+ * labelling, no guessing. It is written in the v0.7.0 style of the model
+ * modules: a small, pure, dependency-free helper the migration and the
+ * catalog sync both call, so the "infer from capability + name" rule lives in
+ * exactly one place. The mapping is deliberately conservative:
  *
  *   1. `supports_vision`      -> 'vision'          (explicit capability flag)
  *   2. code-tuned id/name     -> 'coding'          (qwen3-coder / codestral / …)
@@ -25,6 +28,7 @@
  * satisfies TD-027's "cannot infer -> leave NULL and count it, do not guess".
  */
 
+/** Catalog metadata that can drive a category inference, without a DB row. */
 export interface CategoryInferenceSource {
   modelId: string;
   displayName: string;

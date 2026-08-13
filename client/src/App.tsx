@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from 'react'
 import { BrowserRouter, Routes, Route, Navigate, NavLink, Link, useLocation, useNavigate } from 'react-router-dom'
 import { MutationCache, QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { ChevronDown, LogOut, Menu, MoreHorizontal, Search, Settings, Sparkles } from 'lucide-react'
+import { ChevronDown, KeyRound, LogOut, Menu, MoreHorizontal, Search, Settings, Sparkles } from 'lucide-react'
 import { buttonVariants } from '@/components/ui/button'
 import {
   DropdownMenu,
@@ -14,12 +14,13 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { AuthGate } from '@/components/auth-gate'
+import { AuthGate, ChangeCredentialsModal } from '@/components/auth-gate'
 import { CommandPalette } from '@/components/command-palette'
 import { openCommandPalette } from '@/components/command-palette-state'
 import { ErrorBoundary } from '@/components/error-boundary'
 import { SettingsDialog } from '@/components/settings-dialog'
 import { Toaster } from '@/components/toaster'
+import { UpdateReminder } from '@/components/update-reminder'
 import { usePremium } from '@/hooks/use-premium'
 import { I18nProvider, useI18n } from '@/i18n'
 import { logout } from '@/lib/api'
@@ -38,6 +39,7 @@ import EmbeddingDetailPage from '@/pages/EmbeddingDetailPage'
 import AnalyticsPage from '@/pages/AnalyticsPage'
 import PremiumPage from '@/pages/PremiumPage'
 import NotFoundPage from '@/pages/NotFoundPage'
+import AgentsPage from '@/pages/AgentsPage'
 
 // Every failed mutation surfaces as an error toast, so no action fails
 // silently. A page that already shows the failure inline can opt out with
@@ -55,6 +57,7 @@ const navItems = [
   { to: '/models', labelKey: 'nav.models' },
   { to: '/playground', labelKey: 'nav.playground' },
   { to: '/keys', labelKey: 'nav.keys' },
+  { to: '/agents', labelKey: 'nav.agents' },
   { to: '/analytics', labelKey: 'nav.analytics' },
   { to: '/premium', labelKey: 'nav.premium' },
 ]
@@ -117,15 +120,23 @@ function AccountMenuItems({
   upgradeLabel,
   settingsLabel,
   signOutLabel,
+  changeEmailLabel,
+  changePasswordLabel,
   onUpgrade,
   onOpenSettings,
+  onChangeEmail,
+  onChangePassword,
 }: {
   showUpgrade: boolean
   upgradeLabel: string
   settingsLabel: string
   signOutLabel: string
+  changeEmailLabel: string
+  changePasswordLabel: string
   onUpgrade: () => void
   onOpenSettings: () => void
+  onChangeEmail: () => void
+  onChangePassword: () => void
 }) {
   return (
     <>
@@ -139,9 +150,19 @@ function AccountMenuItems({
         <Settings />
         {settingsLabel}
       </DropdownMenuItem>
+      {/* Desktop signs in with a hidden local account, so it has no credentials
+          to change and no session to end. */}
       {!isDesktopApp && (
         <>
           <DropdownMenuSeparator />
+          <DropdownMenuItem onClick={onChangeEmail}>
+            <span className="flex size-4 items-center justify-center font-serif text-xs font-bold">@</span>
+            {changeEmailLabel}
+          </DropdownMenuItem>
+          <DropdownMenuItem onClick={onChangePassword}>
+            <KeyRound />
+            {changePasswordLabel}
+          </DropdownMenuItem>
           <DropdownMenuItem onClick={() => logout()}>
             <LogOut />
             {signOutLabel}
@@ -157,6 +178,7 @@ function Navbar() {
   const location = useLocation()
   const navigate = useNavigate()
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [credentialsMode, setCredentialsMode] = useState<'password' | 'email' | null>(null)
   const { data: premium, licensed, isLoading: premiumLoading, isError: premiumError } = usePremium()
   const showUpgrade = Boolean(premium) && !licensed && !premiumLoading && !premiumError
 
@@ -235,8 +257,12 @@ function Navbar() {
                   upgradeLabel={t('nav.upgrade')}
                   settingsLabel={t('nav.settings')}
                   signOutLabel={t('nav.signOut')}
+                  changeEmailLabel={t('auth.changeEmail')}
+                  changePasswordLabel={t('auth.changePassword')}
                   onUpgrade={() => navigate('/premium')}
                   onOpenSettings={() => setSettingsOpen(true)}
+                  onChangeEmail={() => setCredentialsMode('email')}
+                  onChangePassword={() => setCredentialsMode('password')}
                 />
               </DropdownMenuContent>
             </DropdownMenu>
@@ -284,8 +310,12 @@ function Navbar() {
                   upgradeLabel={t('nav.upgrade')}
                   settingsLabel={t('nav.settings')}
                   signOutLabel={t('nav.signOut')}
+                  changeEmailLabel={t('auth.changeEmail')}
+                  changePasswordLabel={t('auth.changePassword')}
                   onUpgrade={() => navigate('/premium')}
                   onOpenSettings={() => setSettingsOpen(true)}
+                  onChangeEmail={() => setCredentialsMode('email')}
+                  onChangePassword={() => setCredentialsMode('password')}
                 />
               </DropdownMenuContent>
             </DropdownMenu>
@@ -293,6 +323,9 @@ function Navbar() {
         </div>
       </header>
       <SettingsDialog open={settingsOpen} onOpenChange={setSettingsOpen} />
+      {credentialsMode && (
+        <ChangeCredentialsModal mode={credentialsMode} onClose={() => setCredentialsMode(null)} />
+      )}
     </>
   )
 }
@@ -329,6 +362,7 @@ function App() {
                       <Route path="/models/transcription/:id" element={<MediaDetailPage modality="transcription" />} />
                       <Route path="/playground" element={<PlaygroundPage />} />
                       <Route path="/keys" element={<KeysPage />} />
+                      <Route path="/agents" element={<AgentsPage />} />
                       <Route path="/fallback" element={<Navigate to="/models/chat" replace />} />
                       <Route path="/analytics" element={<AnalyticsPage />} />
                       <Route path="/premium" element={<PremiumPage />} />
@@ -340,6 +374,7 @@ function App() {
                 </main>
                 <Toaster />
                 <CommandPalette />
+                <UpdateReminder />
               </div>
             </AuthGate>
           </BrowserRouter>

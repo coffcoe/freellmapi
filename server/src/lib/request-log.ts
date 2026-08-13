@@ -34,6 +34,11 @@ function setSettingIfMissing(db: LogTx, key: string, value: string): void {
 // is logged identically. Lives in a neutral lib module to avoid an import cycle
 // between the fusion service and the proxy route that both call it.
 //
+// Status is 'success', 'error', or 'canceled' (#752 — the client hung up
+// mid-attempt). A canceled request counts toward request totals — it happened —
+// but toward NEITHER success nor error: rates and scoring must read
+// success/(success+error), never success/total.
+//
 // In addition to the raw row, we update two durable aggregates so analytics
 // totals survive the raw-row prune (REQUEST_ANALYTICS_MAX_ROWS):
 //   - request_hourly: per-hour bucket counts and tokens (max window = 30d).
@@ -59,14 +64,7 @@ export function logRequest(
   // from the routed model_id after cosmetic normalization (#534 — see
   // lib/served-model.ts). NULL when it matches or the provider reported
   // nothing usable, so the column stays empty in the healthy case.
-  // Kept at position 11 to stay wire-compatible with upstream callers that
-  // pass servedModel as the 11th argument.
   servedModel: string | null = null,
-  // Calling client/app identifier (from the x-client-tag request header), or
-  // null when the client does not self-identify. Used to attribute auto-traffic
-  // to its source during quota investigations (P2-a). Local fork extension —
-  // appended LAST so it never shifts upstream's positional arguments.
-  clientTag: string | null = null,
 ) {
   try {
     const db = getDb();
@@ -75,9 +73,9 @@ export function logRequest(
     const client = getClientContext();
     const tx = db.transaction(() => {
       const insert = db.prepare(`
-        INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, ttfb_ms, requested_model, client_tag, served_model, client_ip, client_user_agent)
+        INSERT INTO requests (platform, model_id, key_id, status, input_tokens, output_tokens, latency_ms, error, ttfb_ms, requested_model, served_model, client_ip, client_user_agent, client_agent)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error, ttfbMs, requestedModel, clientTag, servedModel, client.ip, client.userAgent);
+      `).run(platform, modelId, keyId, status, inputTokens, outputTokens, latencyMs, error, ttfbMs, requestedModel, servedModel, client.ip, client.userAgent, client.agent);
 
       // Report the row id back to the fallback loop's attempt trace (if one is
       // active): the LAST id noted during a loop run is the terminal row the
@@ -110,48 +108,9 @@ export function logRequest(
     tx();
 
     pruneRequestAnalytics({ db });
-
-    // Fire-and-forget POST to local token tracker (port 3003).
-    // Only for successful completions with actual token data; errors and
-    // zero-token entries are skipped. Non-blocking — never slows the caller.
-    if (status === 'success' && (inputTokens > 0 || outputTokens > 0)) {
-      notifyTracker(platform, modelId, inputTokens, outputTokens);
-    }
   } catch (e) {
     console.error('Failed to log request:', e);
   }
-}
-
-/**
- * Fire-and-forget POST to the local tracker.py Flask server.
- * Deliberately non-blocking: we do not await the fetch, and a 300ms
- * timeout caps the overhead. If the tracker is not running, the request
- * silently fails after 300ms with zero impact on the proxy.
- */
-function notifyTracker(
-  platform: string,
-  modelId: string,
-  inputTokens: number,
-  outputTokens: number,
-): void {
-  const url = 'http://localhost:3003/api/log';
-  const body = JSON.stringify({
-    platform,
-    model: modelId,
-    prompt_tokens: inputTokens,
-    completion_tokens: outputTokens,
-  });
-
-  // Fire-and-forget via AbortController with a 300ms timeout.
-  // Promise is explicitly un-awaited — the caller never blocks.
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 300);
-  fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body,
-    signal: controller.signal,
-  }).catch(() => {}).finally(() => clearTimeout(timer));
 }
 
 // Persist a finished attempt trace as one small insert batch keyed to the
@@ -159,9 +118,10 @@ function notifyTracker(
 // mid-stream error row, or the last per-attempt failure row). Called once per
 // request by the fallback loop AFTER the response is finished, so the write is
 // off the client's latency path. Zero-failure single-attempt successes write
-// exactly one 'ok' row; a trace with no parent row (e.g. a client abort before
-// any attempt was logged) writes nothing — consistent with the `requests`
-// table, which records nothing for those either.
+// exactly one 'ok' row. A trace with no parent row writes nothing — since the
+// fallback loop logs a 'canceled' row for pure client aborts (#752), that is
+// now only the loop-top stop paths, whose failed attempts each wrote their own
+// row already.
 export function persistRequestAttempts(trace: RequestTrace): void {
   if (trace.records.length === 0 || trace.lastRequestRowId == null) return;
   try {

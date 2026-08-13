@@ -12,8 +12,9 @@ export function up(db: Db): void {
 }
 
 export function down(db: Db): void {
-  // SQLite doesn't support DROP COLUMN directly, we need to recreate table
-  // However, for simplicity in this context, we'll just note that downgrade is not supported
-  // In a real scenario, you would create a new table without the column and copy data
-  throw new Error('Downgrade not implemented for this migration');
-};
+  // Reversible: plain unindexed TEXT column — SQLite >= 3.35 supports DROP COLUMN.
+  const cols = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
+  if (cols.some(c => c.name === 'category')) {
+    db.prepare('ALTER TABLE models DROP COLUMN category').run();
+  }
+}

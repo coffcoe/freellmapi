@@ -9,20 +9,24 @@ import type {
   ChatToolChoice,
   ChatContentBlock,
 } from '@freellmapi/shared/types.js';
-import { routeRequest, routingReserveTokens, type RouteResult } from '../services/router.js';
-import { getUnifiedApiKey } from '../db/index.js';
+import { routeRequest, resolveStickyPreference, routingReserveTokens, type RouteResult } from '../services/router.js';
+import { getSetting, getUnifiedApiKey } from '../db/index.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
+import { invalidToolArgumentsError, invalidToolCallReasons, isToolArgumentValidationEnabled } from '../lib/tool-validate.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
+import { convertDocumentBlock, documentRejectionMessage } from '../lib/anthropic-documents.js';
 import { isClientAbortError, newClientAbortError } from '../lib/error-classify.js';
 import { logRequest } from '../lib/request-log.js';
 import { extractApiToken, timingSafeStringEqual, getStickyModel, setStickyModel } from './proxy.js';
 import { runFallbackLoop, newFallbackState, recordUpstreamSuccess, type ExhaustionBody, setFallbackHeaders, setExhaustionHeaders, type AttemptRecord } from '../lib/fallback-loop.js';
+import { routedViaValue } from '../lib/header-value.js';
 import { applyTokenBudget, tokenBudgetMessage } from '../lib/guardrails.js';
 import { resolveAnthropicModel } from '../services/anthropic-map.js';
 import type { ReasoningEffort } from '../lib/sampling-params.js';
 import { buildModelListing } from '../services/model-listing.js';
+import { compressRequest, formatCompressionHeader } from '../services/compression/pipeline.js';
 
 // Anthropic-compatible Messages API (`POST /v1/messages`). This is a thin
 // translation layer over the SAME router/fallback/analytics machinery the
@@ -92,8 +96,11 @@ const messagesSchema = z.object({
   // reasoning_effort (see effortFromAnthropicThinking) so providers with
   // request-side reasoning control receive it; platforms without support have
   // it stripped by the policy in lib/sampling-params.ts.
+  // `type` is a free string, not the enabled/disabled enum: Anthropic keeps
+  // adding modes (Claude Code sends 'adaptive') and validating the enum here
+  // turned a knob we only use as a hint into a hard 400 (#632).
   thinking: z.object({
-    type: z.enum(['enabled', 'disabled']).optional(),
+    type: z.string().optional(),
     budget_tokens: z.number().int().optional(),
   }).passthrough().nullable().optional(),
 }).passthrough();
@@ -107,8 +114,13 @@ export function effortFromAnthropicThinking(
   thinking: { type?: string; budget_tokens?: number } | null | undefined,
 ): ReasoningEffort | undefined {
   if (!thinking) return undefined;
-  if (thinking.type === 'disabled') return 'none';
+  const type = thinking.type?.trim().toLowerCase();
+  if (type === 'disabled' || type === 'off' || type === 'none') return 'none';
   const budget = thinking.budget_tokens;
+  // Model-managed modes ('adaptive', 'auto') without an explicit budget mean
+  // "you decide how much" — forward no knob at all and let the provider
+  // default stand, same as a -1 Gemini thinking budget.
+  if (budget == null && (type === 'adaptive' || type === 'auto')) return undefined;
   if (budget == null) return 'medium';
   if (budget < 4096) return 'low';
   if (budget < 16384) return 'medium';
@@ -243,10 +255,14 @@ interface ConvertedRequest {
   tool_choice?: ChatToolChoice;
   hasImage: boolean;
   wantsTools: boolean;
+  /** Reasons the request carried documents we cannot convert. Non-empty means
+   *  the caller must be told, not served — see the rejection below. */
+  documentRejections: string[];
 }
 
 function convertRequest(input: AnthropicRequest): ConvertedRequest {
   const messages: ChatMessage[] = [];
+  const documentRejections: string[] = [];
   let hasImage = false;
 
   const system = flattenSystem(input.system);
@@ -297,8 +313,15 @@ function convertRequest(input: AnthropicRequest): ConvertedRequest {
           tool_call_id: String((block as any).tool_use_id ?? ''),
           content: flattenToolResult((block as any).content),
         });
+      } else if (type === 'document') {
+        // A document that is already text costs nothing to inline. One that
+        // needs decoding cannot be served by any provider here, and dropping
+        // it would answer confidently about a document the model never saw.
+        const result = convertDocumentBlock(block);
+        if (result.ok) textParts.push(result.text);
+        else documentRejections.push(result.reason);
       }
-      // Unknown block types (thinking, document, …) are intentionally dropped.
+      // Other unknown block types (thinking, …) are intentionally dropped.
     }
 
     const text = textParts.join('\n');
@@ -336,6 +359,7 @@ function convertRequest(input: AnthropicRequest): ConvertedRequest {
     tool_choice: convertToolChoice(input.tool_choice),
     hasImage,
     wantsTools: (tools?.length ?? 0) > 0,
+    documentRejections,
   };
 }
 
@@ -425,6 +449,9 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
 
   const body = parsed.data;
   const requestedModel = body.model ?? 'auto';
+  const routedModel = body.model?.startsWith('claude/')
+    ? body.model.slice('claude/'.length)
+    : body.model;
   // The Anthropic wire format requires max_tokens, but OUR default injection
   // must not change the budget gate's verdict: gating AFTER defaulting made a
   // no-max_tokens request 413 here (input + 1024 over budget) where the chat
@@ -433,7 +460,33 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
   const clientMaxTokens = body.max_tokens != null && body.max_tokens > 0 ? body.max_tokens : undefined;
   const { temperature, top_p, stream } = body;
 
-  const { messages, tools, tool_choice, hasImage, wantsTools } = convertRequest(body);
+  const converted = convertRequest(body);
+  // Rejected before routing, and before compression: this is our verdict, not
+  // a provider's. Entering the failover loop would spend quota on a request
+  // every candidate would fail identically, and book it as provider failure.
+  if (converted.documentRejections.length > 0) {
+    const message = documentRejectionMessage(converted.documentRejections);
+    console.warn(`[anthropic] 400 unsupported document block: ${converted.documentRejections.join('; ')}`);
+    sendError(res, 400, 'invalid_request_error', message);
+    return;
+  }
+  let { messages } = converted;
+  const { tools, tool_choice, hasImage, wantsTools } = converted;
+  const systemHasCacheControl = Array.isArray(body.system)
+    && body.system.some(block => block && typeof block === 'object' && 'cache_control' in block);
+  const messageHasCacheControl = body.messages.some(message =>
+    Array.isArray(message.content)
+    && message.content.some(block => block && typeof block === 'object' && 'cache_control' in block));
+  const compressionResult = compressRequest(messages, {
+    header: req.headers['x-freellm-compress'],
+    tools,
+    // Claude Code normally marks the system prefix. If a later native message
+    // carries a breakpoint, conservatively cap the translated prefix at
+    // lossless rather than risk invalidating upstream prompt-cache semantics.
+    cacheControlPrefixLength: messageHasCacheControl ? messages.length : (systemHasCacheControl ? 1 : 0),
+  });
+  messages = compressionResult.messages;
+  res.setHeader('X-FreeLLM-Compress', formatCompressionHeader(compressionResult));
 
   const estimatedInputTokens = estimateTokens(messages);
   const imageCount = messages.reduce((n, m) =>
@@ -463,7 +516,7 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
   // Resolve the model through the operator's Claude-family map (opus/sonnet/
   // haiku/default → auto | a pinned catalog model). A concrete catalog id pins
   // directly. `pinned` drives the analytics requested-model label.
-  const resolved = resolveAnthropicModel(body.model);
+  const resolved = resolveAnthropicModel(routedModel);
   const pinnedModelId = resolved.pinned ? (body.model ?? null) : null;
 
   // Session affinity: Claude Code stamps every request in a session with
@@ -472,7 +525,7 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
   const rawSession = req.headers['x-claude-code-session-id'] ?? req.headers['x-session-id'];
   const sessionId = Array.isArray(rawSession) ? rawSession[0] : rawSession;
   let preferredModel = resolved.preferredModelDbId;
-  if (preferredModel == null) preferredModel = getStickyModel(messages, sessionId);
+  if (preferredModel == null) preferredModel = resolveStickyPreference(getStickyModel(messages, sessionId));
 
   // Thin adapter over the shared fallback loop (lib/fallback-loop.ts): the
   // cooldown/skip/penalty/exhaustion machinery is shared, only the Anthropic
@@ -504,7 +557,7 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
     state,
     attemptLog,
     clientGone: () => clientGone,
-    route: () => routeRequest(estimatedTotal, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined),
+    route: () => routeRequest(estimatedTotal, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, undefined, false, state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined),
     dispatch: async (route, attempt) => {
       if (stream) {
         try {
@@ -565,6 +618,14 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
             tc.function.arguments = repairToolArguments(tc.function.arguments, schemas.get(tc.function.name));
           }
         }
+        // Opt-in schema verdict on what the repair could not fix. This surface
+        // is where the silent failure was worst: parseToolInput turns
+        // unparseable arguments into `input: {}`, so the client sees a tool_use
+        // block with nothing in it and no indication anything went wrong.
+        if (isToolArgumentValidationEnabled()) {
+          const invalid = invalidToolCallReasons(respToolCalls, schemas);
+          if (invalid.length > 0) throw invalidToolArgumentsError(route.displayName, invalid);
+        }
       }
 
       const promptTokens = result.usage?.prompt_tokens ?? estimatedInputTokens;
@@ -586,7 +647,7 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
         usage: { input_tokens: promptTokens, output_tokens: completionTokens },
       };
 
-      res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+      res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
       setFallbackHeaders(res, attempt, attemptLog);
       logRequest(route.platform, route.modelId, route.keyId, 'success', promptTokens, completionTokens, Date.now() - start, null, null, pinnedModelId);
       res.json(anthropicResponse);
@@ -666,7 +727,7 @@ async function streamCompletion(
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
-    res.setHeader('X-Routed-Via', `${route.platform}/${route.modelId}`);
+    res.setHeader('X-Routed-Via', routedViaValue(route.platform, route.modelId));
     setFallbackHeaders(res, ctx.attempt, ctx.attemptLog);
     writeSse(res, 'message_start', {
       type: 'message_start',
@@ -811,6 +872,20 @@ async function streamCompletion(
       heldText = '';
     }
 
+    // Opt-in schema verdict, same rule as the non-streaming surface above and
+    // as /chat/completions: this is the surface the silent failure hurt most,
+    // and Claude Code streams. Placed after the dialect rescue so a rescued
+    // call is judged too, and gated on `!messageStarted` — once message_start
+    // has gone out there is no failing over, and tearing the SSE stream down
+    // would be worse for the client than a tool_use the schema dislikes.
+    if (isToolArgumentValidationEnabled() && !messageStarted && completedCalls.length > 0) {
+      const invalid = invalidToolCallReasons(
+        completedCalls.map(c => ({ function: { name: c.name, arguments: c.arguments } })),
+        schemas,
+      );
+      if (invalid.length > 0) throw invalidToolArgumentsError(route.displayName, invalid);
+    }
+
     // Nothing usable came out — fail over (message_start was never sent, so the
     // client never saw this attempt).
     if (!messageStarted && completedCalls.length === 0) {
@@ -895,8 +970,22 @@ anthropicRouter.post('/messages/count_tokens', (req: Request, res: Response) => 
     sendError(res, 400, 'invalid_request_error', 'Invalid request');
     return;
   }
-  const { messages } = convertRequest(parsed.data);
-  res.json({ input_tokens: estimateTokens(messages) });
+  const converted = convertRequest(parsed.data);
+  // Same verdict as POST /messages, so a client sizing a context window learns
+  // the document is unusable here rather than getting a count for a prompt we
+  // would go on to refuse.
+  if (converted.documentRejections.length > 0) {
+    sendError(res, 400, 'invalid_request_error', documentRejectionMessage(converted.documentRejections));
+    return;
+  }
+  const { messages, tools } = converted;
+  const compressionResult = compressRequest(messages, {
+    header: req.headers['x-freellm-compress'],
+    tools,
+    recordStats: false,
+  });
+  res.setHeader('X-FreeLLM-Compress', formatCompressionHeader(compressionResult));
+  res.json({ input_tokens: estimateTokens(compressionResult.messages) });
 });
 
 // Anthropic-compatible GET /v1/models. Content-negotiated: only answers when
@@ -906,21 +995,26 @@ anthropicRouter.post('/messages/count_tokens', (req: Request, res: Response) => 
 // endpoint (real free models that can serve a request right now, plus "auto") —
 // no fake Claude cloud models.
 //
-// Heads-up: Claude Code's gateway model picker (enabled via
-// CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1) only surfaces ids beginning
-// with `claude`/`anthropic`, so our ids won't populate its picker by design.
-// Routing still works because Claude Code keeps its built-in `claude-*` names,
-// which the model map sends to "auto" (or a pinned model).
+// Optional `claude/<real-id>` aliases let Claude Code's gateway picker discover
+// the full catalog; /messages strips the synthetic prefix before routing.
 anthropicRouter.get('/models', (req: Request, res: Response, next: NextFunction) => {
   if (!req.headers['anthropic-version']) return next(); // OpenAI client → proxyRouter
   if (!authenticate(req, res)) return;
 
   const { models } = buildModelListing();
+  const available = models.filter(m => m.available === 1);
+  const aliasesEnabled = getSetting('expose_cc_discovery_aliases') === '1';
   const data = [
     { type: 'model' as const, id: 'auto', display_name: 'Auto (router picks the best available model)', created_at: MODEL_CREATED_AT },
-    ...models
-      .filter(m => m.available === 1)
-      .map(m => ({ type: 'model' as const, id: m.id, display_name: m.name, created_at: MODEL_CREATED_AT })),
+    ...available.map(m => ({ type: 'model' as const, id: m.id, display_name: m.name, created_at: MODEL_CREATED_AT })),
+    ...(aliasesEnabled
+      ? available.map(m => ({
+        type: 'model' as const,
+        id: `claude/${m.id}`,
+        display_name: `${m.name} (Claude Code)`,
+        created_at: MODEL_CREATED_AT,
+      }))
+      : []),
   ];
   res.json({ data, has_more: false, first_id: data[0]?.id ?? null, last_id: data[data.length - 1]?.id ?? null });
 });

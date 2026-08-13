@@ -1,14 +1,87 @@
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { getUnifiedApiKey, regenerateUnifiedKey, getSetting, setSetting } from '../db/index.js';
-import { getRequestMaxTokensBudget, getMaxConsecutiveUpstreamFails, SETTING_REQUEST_MAX_TOKENS_BUDGET, SETTING_MAX_CONSECUTIVE_UPSTREAM_FAILS, REQUEST_MAX_TOKENS_BUDGET_SETTING, MAX_CONSECUTIVE_UPSTREAM_FAILS_SETTING } from '../lib/guardrails.js';
-import { applyProxyUrl, applyProxyEnabled, applyProxyBypass, isProxyActive, getProxyUrl, isProxyEnabled, getProxyBypassPlatforms } from '../lib/proxy.js';
+import { applyProxyUrl, applyProxyEnabled, applyProxyBypass, isProxyActive, getProxyUrl, isProxyEnabled, getProxyBypassPlatforms, PROXY_SCHEMES } from '../lib/proxy.js';
 import { getSavedFusionConfig, setSavedFusionConfig, savedFusionConfigSchema, getFusionMaxK } from '../services/fusion.js';
 import { isUnifyEnabled, setUnifyEnabled, getUnifyOverrides, setUnifyOverrides, unifyOverridesSchema } from '../services/model-groups.js';
 import { getClaudeModelMap, setClaudeModelMap } from '../services/anthropic-map.js';
+import { getGeminiModelMap, setGeminiModelMap } from '../services/gemini-map.js';
+import { getOllamaEmulationMode } from './ollama.js';
+import { UPDATE_CHECK_SETTING, isAutoUpdateCheckEnabled } from './update.js';
+import { listUrlTokens, mintUrlToken, revokeUrlToken } from '../services/url-tokens.js';
+import {
+  getRequestMaxTokensBudget,
+  getMaxConsecutiveUpstreamFails,
+  REQUEST_MAX_TOKENS_BUDGET_SETTING,
+  MAX_CONSECUTIVE_UPSTREAM_FAILS_SETTING,
+} from '../lib/guardrails.js';
+import {
+  compressionUpdateSchema,
+  getCompressionConfig,
+  setCompressionConfig,
+} from '../services/compression/config.js';
 import { z } from 'zod';
+import { getAppVersion } from '../lib/app-version.js';
+import {
+  UNIFIED_MAX_TOKENS_SETTING,
+  UNIFIED_MAX_TOKENS_AUTO,
+  unifiedMaxTokensCap,
+} from '../lib/sampling-params.js';
 
 export const settingsRouter = Router();
+
+// Which RELEASE this install is, for the dashboard's version row (#703).
+// Deliberately NOT /api/version: the Ollama emulation already owns that path
+// and answers it for real Ollama clients, so mounting here would have shadowed
+// it. `null` means the version could not be established honestly, and the
+// dashboard then shows nothing rather than a number that isn't the release.
+settingsRouter.get('/version', (_req: Request, res: Response) => {
+  res.json({ version: getAppVersion() });
+});
+
+// Opt-in for the dashboard's automatic release reminder (#782). Off unless the
+// operator turns it on: a self-hosted install must not contact GitHub on page
+// load on behalf of someone who never asked it to. The manual checker in
+// Settings is a separate surface and is unaffected by this flag.
+const updateCheckSchema = z.object({ enabled: z.boolean() }).strict();
+
+settingsRouter.get('/update-check', (_req: Request, res: Response) => {
+  res.json({ enabled: isAutoUpdateCheckEnabled() });
+});
+
+settingsRouter.put('/update-check', (req: Request, res: Response) => {
+  const parsed = updateCheckSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({
+      error: {
+        message: `Invalid update check setting: ${parsed.error.errors.map(error => error.message).join(', ')}`,
+        type: 'invalid_request_error',
+      },
+    });
+    return;
+  }
+  setSetting(UPDATE_CHECK_SETTING, parsed.data.enabled ? '1' : '0');
+  res.json({ enabled: isAutoUpdateCheckEnabled() });
+});
+
+settingsRouter.get('/compression', (_req: Request, res: Response) => {
+  res.json(getCompressionConfig());
+});
+
+settingsRouter.put('/compression', (req: Request, res: Response) => {
+  const parsed = compressionUpdateSchema.safeParse(req.body);
+  if (!parsed.success) {
+    const detail = parsed.error.errors
+      .map(e => (e.path.length ? `${e.path.join('.')}: ${e.message}` : e.message))
+      .slice(0, 5)
+      .join(', ');
+    res.status(400).json({
+      error: { message: `Invalid compression settings: ${detail}`, type: 'invalid_request_error' },
+    });
+    return;
+  }
+  res.json(setCompressionConfig(parsed.data));
+});
 
 // Get the model-unification setting: the global toggle (default ON) plus any
 // merge/split overrides. Governs the dashboard grouping, /v1/models grouping,
@@ -74,6 +147,123 @@ settingsRouter.put('/anthropic-map', (req: Request, res: Response) => {
   }
 });
 
+settingsRouter.get('/gemini-map', (_req: Request, res: Response) => {
+  res.json({ map: getGeminiModelMap() });
+});
+
+settingsRouter.put('/gemini-map', (req: Request, res: Response) => {
+  try {
+    res.json({ map: setGeminiModelMap(req.body) });
+  } catch (err: any) {
+    const detail = err?.errors
+      ? err.errors.map((e: any) => (e.path?.length ? `${e.path.join('.')}: ${e.message}` : e.message)).slice(0, 5).join(', ')
+      : (err?.message ?? 'invalid');
+    res.status(400).json({ error: { message: `Invalid Gemini model map: ${detail}`, type: 'invalid_request_error' } });
+  }
+});
+
+const compatibilitySchema = z.object({
+  ollamaEmulation: z.enum(['off', 'open-loopback', 'key-required']).optional(),
+  exposeClaudeDiscoveryAliases: z.boolean().optional(),
+}).strict();
+
+settingsRouter.get('/agent-compatibility', (_req: Request, res: Response) => {
+  res.json({
+    ollamaEmulation: getOllamaEmulationMode(),
+    exposeClaudeDiscoveryAliases: getSetting('expose_cc_discovery_aliases') === '1',
+  });
+});
+
+settingsRouter.put('/agent-compatibility', (req: Request, res: Response) => {
+  const parsed = compatibilitySchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({
+      error: {
+        message: `Invalid agent compatibility settings: ${parsed.error.errors.map(error => error.message).join(', ')}`,
+        type: 'invalid_request_error',
+      },
+    });
+    return;
+  }
+  if (parsed.data.ollamaEmulation) setSetting('ollama_emulation', parsed.data.ollamaEmulation);
+  if (parsed.data.exposeClaudeDiscoveryAliases !== undefined) {
+    setSetting('expose_cc_discovery_aliases', parsed.data.exposeClaudeDiscoveryAliases ? '1' : '0');
+  }
+  res.json({
+    ollamaEmulation: getOllamaEmulationMode(),
+    exposeClaudeDiscoveryAliases: getSetting('expose_cc_discovery_aliases') === '1',
+  });
+});
+
+settingsRouter.get('/url-tokens', (_req: Request, res: Response) => {
+  res.json({ tokens: listUrlTokens() });
+});
+
+settingsRouter.post('/url-tokens', (req: Request, res: Response) => {
+  const parsed = z.object({ label: z.string().max(120).optional() }).safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: 'Invalid URL token label', type: 'invalid_request_error' } });
+    return;
+  }
+  res.status(201).json(mintUrlToken(parsed.data.label ?? ''));
+});
+
+settingsRouter.delete('/url-tokens/:id', (req: Request, res: Response) => {
+  const id = Number.parseInt(String(req.params.id), 10);
+  if (!Number.isInteger(id) || id <= 0) {
+    res.status(400).json({ error: { message: 'Invalid URL token id', type: 'invalid_request_error' } });
+    return;
+  }
+  if (!revokeUrlToken(id)) {
+    res.status(404).json({ error: { message: 'Active URL token not found', type: 'not_found_error' } });
+    return;
+  }
+  res.status(204).end();
+});
+
+// The unified output-token cap as the dashboard sees it. `mode` is exactly
+// what PUT accepts back — 'off', 'auto', or the integer itself, never a
+// stringified number — so a read/modify/write round trip can't 400 on its own
+// output. A stored value that unifiedMaxTokensCap() doesn't understand is
+// reported as 'off', which is how it actually behaves (effectiveCap null).
+function outputLimitState(): { mode: 'off' | 'auto' | number; effectiveCap: number | null; autoValue: number } {
+  const raw = (getSetting(UNIFIED_MAX_TOKENS_SETTING) ?? '').trim().toLowerCase();
+  const effectiveCap = unifiedMaxTokensCap();
+  const mode = raw === 'auto' ? 'auto' as const : (effectiveCap ?? 'off' as const);
+  return { mode, effectiveCap, autoValue: UNIFIED_MAX_TOKENS_AUTO };
+}
+
+// Get the unified output-token cap ('off' = disabled, 'auto' = 32768, or an
+// explicit integer). See lib/sampling-params.ts unifiedMaxTokensCap().
+settingsRouter.get('/output-limit', (_req: Request, res: Response) => {
+  res.json(outputLimitState());
+});
+
+const outputLimitPutSchema = z.object({
+  mode: z.union([
+    z.literal('off'),
+    z.literal('auto'),
+    z.number().int().min(1),
+  ]),
+});
+
+// Update the unified output-token cap. 'off' restores pass-through behaviour;
+// 'auto' clamps every request's max_tokens to UNIFIED_MAX_TOKENS_AUTO; an
+// integer clamps to that value. Takes effect on the next request.
+settingsRouter.put('/output-limit', (req: Request, res: Response) => {
+  const parsed = outputLimitPutSchema.safeParse(req.body);
+  if (!parsed.success) {
+    const detail = parsed.error.errors
+      .map(e => (e.path.length ? `${e.path.join('.')}: ${e.message}` : e.message))
+      .slice(0, 5)
+      .join(', ');
+    res.status(400).json({ error: { message: `Invalid output limit: ${detail}`, type: 'invalid_request_error' } });
+    return;
+  }
+  setSetting(UNIFIED_MAX_TOKENS_SETTING, String(parsed.data.mode));
+  res.json(outputLimitState());
+});
+
 // Get the request guardrails (per-request token budget + failover circuit
 // breaker). Both default to 0 = disabled; see lib/guardrails.ts.
 settingsRouter.get('/guardrails', (_req: Request, res: Response) => {
@@ -130,42 +320,6 @@ settingsRouter.get('/proxy', (_req: Request, res: Response) => {
   });
 });
 
-// Get the routing guardrails (策略 24 / 循环工程：反 Goodhart 护栏).
-//  - request_max_tokens_budget: 单请求 token 成本天花板 (0 = 不限制)
-//  - max_consecutive_upstream_fails: 连续上游失败断路器阈值 (0 = 不启用)
-settingsRouter.get('/guardrails', (_req: Request, res: Response) => {
-  res.json({
-    requestMaxTokensBudget: getRequestMaxTokensBudget(),
-    maxConsecutiveUpstreamFails: getMaxConsecutiveUpstreamFails(),
-  });
-});
-
-// Set the routing guardrails. Both fields optional; send either to patch.
-settingsRouter.put('/guardrails', (req: Request, res: Response) => {
-  const { requestMaxTokensBudget, maxConsecutiveUpstreamFails } = req.body as {
-    requestMaxTokensBudget?: number;
-    maxConsecutiveUpstreamFails?: number;
-  };
-  if (typeof requestMaxTokensBudget === 'number') {
-    if (!Number.isFinite(requestMaxTokensBudget) || requestMaxTokensBudget < 0) {
-      res.status(400).json({ error: { message: 'requestMaxTokensBudget must be a non-negative integer', type: 'invalid_request_error' } });
-      return;
-    }
-    setSetting(SETTING_REQUEST_MAX_TOKENS_BUDGET, String(Math.floor(requestMaxTokensBudget)));
-  }
-  if (typeof maxConsecutiveUpstreamFails === 'number') {
-    if (!Number.isFinite(maxConsecutiveUpstreamFails) || maxConsecutiveUpstreamFails < 0) {
-      res.status(400).json({ error: { message: 'maxConsecutiveUpstreamFails must be a non-negative integer', type: 'invalid_request_error' } });
-      return;
-    }
-    setSetting(SETTING_MAX_CONSECUTIVE_UPSTREAM_FAILS, String(Math.floor(maxConsecutiveUpstreamFails)));
-  }
-  res.json({
-    requestMaxTokensBudget: getRequestMaxTokensBudget(),
-    maxConsecutiveUpstreamFails: getMaxConsecutiveUpstreamFails(),
-  });
-});
-
 // Set the proxy settings. Accepts partial updates: proxyUrl, enabled, bypassPlatforms.
 settingsRouter.put('/proxy', (req: Request, res: Response) => {
   const { proxyUrl, enabled, bypassPlatforms } = req.body as {
@@ -180,9 +334,12 @@ settingsRouter.put('/proxy', (req: Request, res: Response) => {
     if (trimmed) {
       try {
         const u = new URL(trimmed);
-        if (!['http:', 'https:', 'socks5:', 'socks4:'].includes(u.protocol)) {
+        if (!PROXY_SCHEMES.includes(u.protocol)) {
           res.status(400).json({
-            error: { message: 'Proxy URL must use http, https, socks5, or socks4 scheme', type: 'invalid_request_error' },
+            error: {
+              message: 'Proxy URL must use http, https, socks5, socks5h, socks4, or socks4a scheme',
+              type: 'invalid_request_error',
+            },
           });
           return;
         }

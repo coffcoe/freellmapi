@@ -1,19 +1,18 @@
 /**
- * Scene routing — re-derived business logic.
+ * Scene detection — re-derived business logic, rewritten for the v0.7.0
+ * architecture.
  *
- * Lost in the runFallbackLoop refactor (df001b2) and restored here via the
- * *upstream mechanism*: a soft preference folded into the router's existing
- * chain scoring, NOT a bespoke retry loop and not a change to the fallback
- * ladder. See BUSINESS-LOGIC-PRESERVATION.md §3.
+ * The v0.7.0 router scores models with a convex bandit combination and exposes
+ * a per-model preference hook (`scoreChainEntry`). This module is the
+ * *detection* half and is deliberately pure — no DB, no request object — so it
+ * is cheap to unit-test. The *scoring* half lives in `services/router.ts`
+ * (`sceneBiasScore`), folded into the existing chain scoring exactly like the
+ * upstream's model-weight overrides.
  *
  * Three layers, same weights as the original:
  *   L1  network_tier match (from the `X-Network-Tier` header)  +4
  *   L2  category match     (models.category)                   +2
  *   L3  tag match          (models.tags)                       +1 each
- *
- * This module is the *detection* half and is deliberately pure — no DB, no
- * request object — so it is cheap to unit-test. The *scoring* half lives in
- * `services/router.ts` (`sceneBiasScore`).
  */
 import type { ChatMessage } from '@freellmapi/shared/types.js';
 
@@ -84,10 +83,10 @@ const hasAny = (t: string, cues: string[]) => cues.some(c => t.includes(c));
  * Map a detected scene to an actual DB model category.
  *
  * NOTE: the live catalog currently only carries `chat` / `function-calling` /
- * `vision` / `reasoning` (and 73 NULLs), so the `coding` and `audio` scenes are
+ * `vision` / `reasoning` (and NULLs), so the `coding` and `audio` scenes are
  * inert until models are labelled with those categories. That is a *data* gap,
- * not a logic gap — the mapping is kept so enriching the catalog is enough to
- * activate them. See TECH-DEBT-INVENTORY.md TD-027.
+ * not a logic gap — the mapping is kept so enriching the catalog (see
+ * services/model-category.ts) is enough to activate them.
  */
 function sceneToCategory(scene: string): string | null {
   const map: Record<string, string> = {

@@ -11,7 +11,12 @@ export function up(db: Db): void {
     db.exec('ALTER TABLE models ADD COLUMN last_verified_at DATETIME;');
   }
   if (!cols.some(c => c.name === 'probe_status')) {
-    db.exec('ALTER TABLE models ADD COLUMN probe_status BOOLEAN DEFAULT 0;');
+    // No DEFAULT: NULL means "never probed". The endpoint-identity rebuild
+    // (20260729) carries the column without a default anyway, so declaring a
+    // DEFAULT here would make a fresh install's column differ from one that
+    // went through a rebuild, and a down/up round trip would flip existing
+    // rows from NULL to the default. Keep it plain and consistent.
+    db.exec('ALTER TABLE models ADD COLUMN probe_status BOOLEAN;');
   }
 
   // Create probe_logs table (idempotent)
@@ -35,8 +40,18 @@ export function up(db: Db): void {
 }
 
 export function down(db: Db): void {
-  // SQLite doesn't support DROP COLUMN directly, we need to recreate table
-  // For simplicity, we'll just drop the table and columns if needed in a real scenario
-  // But for this migration, we'll note that downgrade is complex and not implemented
-  throw new Error('Downgrade not implemented for this migration');
+  // Reversible: drop the probe_logs table/indexes (plain, unindexed columns —
+  // SQLite >= 3.35 supports DROP COLUMN), so a down/up round trip is clean.
+  db.exec('DROP INDEX IF EXISTS idx_probe_logs_probed_at;');
+  db.exec('DROP INDEX IF EXISTS idx_probe_logs_model_id;');
+  db.exec('DROP TABLE IF EXISTS probe_logs;');
+
+  const cols = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
+  const has = (name: string) => cols.some(c => c.name === name);
+  if (has('probe_status')) {
+    db.prepare('ALTER TABLE models DROP COLUMN probe_status').run();
+  }
+  if (has('last_verified_at')) {
+    db.prepare('ALTER TABLE models DROP COLUMN last_verified_at').run();
+  }
 }

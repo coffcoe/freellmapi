@@ -6,10 +6,11 @@ import type {
   Platform,
 } from '@freellmapi/shared/types.js';
 import { BaseProvider, providerHttpError, type CompletionOptions, type KeyValidationResult } from './base.js';
-import { extendedBodyParams } from '../lib/sampling-params.js';
+import { extendedBodyParams, resolveMaxTokens } from '../lib/sampling-params.js';
 import { rescueInlineToolCalls } from '../lib/tool-call-rescue.js';
 import { extractThinkFromMessage } from '../lib/think-tags.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
+import { invalidToolCallReasons, isToolArgumentValidationEnabled } from '../lib/tool-validate.js';
 import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
 import { providerTimeoutMs } from '../lib/provider-timeout.js';
 import { isAbortLikeError } from '../lib/error-classify.js';
@@ -83,11 +84,21 @@ export class OpenAICompatProvider extends BaseProvider {
     const rescue = rescueInlineToolCalls(failed, toolNames);
     if (!rescue.detected || !rescue.calls?.length) return null;
     const schemas = toolSchemaMap(options?.tools);
-    return rescue.calls.map((c, i) => ({
+    const rescued = rescue.calls.map((c, i) => ({
       id: `call_rescued_${i + 1}`,
       type: 'function' as const,
       function: { name: c.name, arguments: repairToolArguments(c.arguments, schemas.get(c.name)) },
     }));
+    // Opt-in schema verdict. A rescue that produces schema-invalid arguments
+    // has turned the provider's 400 into a "success" the client cannot use, so
+    // decline it instead: the original upstream error propagates and the loop
+    // fails over exactly as it did before the rescue existed. Declining is the
+    // right shape here rather than throwing our own error — we are inside the
+    // provider's error path already.
+    if (isToolArgumentValidationEnabled() && invalidToolCallReasons(rescued, schemas).length > 0) {
+      return null;
+    }
+    return rescued;
   }
 
   /** Extract the useful text from an upstream error body. Most providers put it
@@ -175,22 +186,6 @@ export class OpenAICompatProvider extends BaseProvider {
     options?: CompletionOptions,
     quotaContext?: QuotaObservationContext,
   ): Promise<ChatCompletionResponse> {
-    // Build body defensively: skip null/undefined values to avoid sending
-    // `temperature:null` to strict local providers (Ollama, LM Studio, llama.cpp)
-    // that may 400 on unexpected keys.
-    const body: Record<string, unknown> = {
-      model: modelId,
-      messages,
-    };
-    if (options?.temperature != null) body.temperature = options.temperature;
-    if (options?.max_tokens != null) body.max_tokens = options.max_tokens;
-    if (options?.top_p != null) body.top_p = options.top_p;
-    if (options?.stop != null) body.stop = options.stop;
-    if (options?.tools != null && options.tools.length > 0) body.tools = options.tools;
-    if (options?.tool_choice != null) body.tool_choice = options.tool_choice;
-    const ptc = this.resolveParallelToolCalls(options);
-    if (ptc != null) body.parallel_tool_calls = ptc;
-
     const sampling = this.samplingForModel(modelId, options);
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
@@ -199,7 +194,20 @@ export class OpenAICompatProvider extends BaseProvider {
         'Content-Type': 'application/json',
         ...this.extraHeaders,
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        model: modelId,
+        messages: this.messagesForPlatform(messages),
+        temperature: sampling.temperature,
+        max_tokens: resolveMaxTokens(this.platform, options?.max_tokens),
+        top_p: sampling.topP,
+        stop: options?.stop,
+        tools: options?.tools,
+        tool_choice: options?.tool_choice,
+        parallel_tool_calls: this.resolveParallelToolCalls(options),
+        ...extendedBodyParams(this.platform, options),
+      }),
+      // 'request' bounds: the deadline covers the body read too, so a 200
+      // whose body hangs aborts instead of stalling res.json() forever.
     }, options?.timeoutMs ?? this.timeoutMs, { signal: options?.signal, timeoutBounds: 'request' });
 
     recordQuotaObservationsFromResponse(res, {
@@ -227,7 +235,7 @@ export class OpenAICompatProvider extends BaseProvider {
         out._routed_via = { platform: this.platform, model: modelId };
         return out;
       }
-      throw providerHttpError(res, `${this.name} API error ${res.status}: ${this.upstreamErrorText(err, res)}`);
+      throw providerHttpError(res, `${this.name} API error ${res.status}: ${this.upstreamErrorText(err, res)}`, err);
     }
 
     let data: ChatCompletionResponse;
@@ -297,21 +305,6 @@ export class OpenAICompatProvider extends BaseProvider {
     options?: CompletionOptions,
     quotaContext?: QuotaObservationContext,
   ): AsyncGenerator<ChatCompletionChunk> {
-    // Build body defensively: skip null/undefined values
-    const body: Record<string, unknown> = {
-      model: modelId,
-      messages,
-      stream: true,
-    };
-    if (options?.temperature != null) body.temperature = options.temperature;
-    if (options?.max_tokens != null) body.max_tokens = options.max_tokens;
-    if (options?.top_p != null) body.top_p = options.top_p;
-    if (options?.stop != null) body.stop = options.stop;
-    if (options?.tools != null && options.tools.length > 0) body.tools = options.tools;
-    if (options?.tool_choice != null) body.tool_choice = options.tool_choice;
-    const ptc = this.resolveParallelToolCalls(options);
-    if (ptc != null) body.parallel_tool_calls = ptc;
-
     const sampling = this.samplingForModel(modelId, options);
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
@@ -320,7 +313,22 @@ export class OpenAICompatProvider extends BaseProvider {
         'Content-Type': 'application/json',
         ...this.extraHeaders,
       },
-      body: JSON.stringify(body),
+      body: JSON.stringify({
+        model: modelId,
+        messages: this.messagesForPlatform(messages),
+        temperature: sampling.temperature,
+        max_tokens: resolveMaxTokens(this.platform, options?.max_tokens),
+        top_p: sampling.topP,
+        stop: options?.stop,
+        tools: options?.tools,
+        tool_choice: options?.tool_choice,
+        parallel_tool_calls: this.resolveParallelToolCalls(options),
+        ...extendedBodyParams(this.platform, options),
+        stream: true,
+        stream_options: options?.stream_options,
+      }),
+      // Default 'headers' bounds: the deadline dies at response headers, and
+      // the client signal + stall watchdog own the stream from there.
     }, options?.timeoutMs ?? this.timeoutMs, { signal: options?.signal });
 
     recordQuotaObservationsFromResponse(res, {
@@ -343,7 +351,7 @@ export class OpenAICompatProvider extends BaseProvider {
         yield { ...base, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }] };
         return;
       }
-      throw providerHttpError(res, `${this.name} API error ${res.status}: ${this.upstreamErrorText(err, res)}`);
+      throw providerHttpError(res, `${this.name} API error ${res.status}: ${this.upstreamErrorText(err, res)}`, err);
     }
 
     // First-byte grace (#584): the same chat timeout that bounded the headers
@@ -352,17 +360,29 @@ export class OpenAICompatProvider extends BaseProvider {
     yield* this.readSseStream(res, { firstByteTimeoutMs: options?.timeoutMs ?? this.timeoutMs });
   }
 
-  async validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<KeyValidationResult> {
-    // Note: transport errors (DNS / timeout / TLS) propagate to the caller.
-    // health.ts catches them and marks status='error' WITHOUT incrementing
-    // the consecutive-failure counter — only confirmed 401/403 disables a key.
-    const url = this.validateUrl ?? `${this.baseUrl}/models`;
+  /** This provider's OpenAI-style model catalog URL. */
+  get modelsUrl(): string {
+    return `${this.baseUrl}/models`;
+  }
+
+  /**
+   * GET a catalog-style endpoint with this provider's auth header, extra
+   * headers, proxy routing, timeout policy and quota bookkeeping. Shared by
+   * validateKey (which only reads the status) and custom-endpoint model
+   * discovery (#488), which also reads the body — one place owns how we talk
+   * to a provider's /models route.
+   *
+   * Note: transport errors (DNS / timeout / TLS) propagate to the caller.
+   * health.ts catches them and marks status='error' WITHOUT incrementing the
+   * consecutive-failure counter — only confirmed 401/403 disables a key.
+   */
+  protected fetchCatalogEndpoint(url: string, apiKey: string, quotaContext?: QuotaObservationContext): Promise<Response> {
     // 30s (not 10s): some upstreams return a large /v1/models catalog that
     // takes >10s from high-latency regions (e.g. NVIDIA NIM measured ~11.2s
     // from India). A 10s cap aborted those calls and health.ts marked a
     // perfectly good key status='error'. 30s aligns with chatCompletion's
     // own slow-upstream allowance and costs nothing for fast providers.
-    const res = await this.fetchWithTimeout(url, {
+    return this.fetchWithTimeout(url, {
       method: 'GET',
       headers: {
         ...this.authHeader(apiKey),
@@ -370,14 +390,27 @@ export class OpenAICompatProvider extends BaseProvider {
       },
       // 'request' bounds: a catalog body that hangs mid-transfer must not
       // stall the health cycle past the deadline.
-    }, 30000, { timeoutBounds: 'request' });
-    recordQuotaObservationsFromResponse(res, {
-      platform: this.platform,
-      keyId: quotaContext?.keyId,
-      providerAccountId: quotaContext?.providerAccountId,
-      quotaPoolKey: quotaContext?.quotaPoolKey,
-      endpoint: 'models',
+    }, 30000, { timeoutBounds: 'request' }).then(res => {
+      recordQuotaObservationsFromResponse(res, {
+        platform: this.platform,
+        keyId: quotaContext?.keyId,
+        providerAccountId: quotaContext?.providerAccountId,
+        quotaPoolKey: quotaContext?.quotaPoolKey,
+        endpoint: 'models',
+      });
+      return res;
     });
+  }
+
+  /** The raw `${baseUrl}/models` response, body unread. Used by custom-endpoint
+   *  model discovery (#488); unlike validateKey it always hits /models, never a
+   *  provider-specific validateUrl, because the caller wants the catalog. */
+  fetchModelCatalog(apiKey: string, quotaContext?: QuotaObservationContext): Promise<Response> {
+    return this.fetchCatalogEndpoint(this.modelsUrl, apiKey, quotaContext);
+  }
+
+  async validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<KeyValidationResult> {
+    const res = await this.fetchCatalogEndpoint(this.validateUrl ?? this.modelsUrl, apiKey, quotaContext);
     return this.validationResult(res);
   }
 }

@@ -11,9 +11,10 @@ import {
   applyModelOverrides,
   deleteTombstonedCatalogModels,
   isCatalogModelTombstoned,
+  reinstateUpstreamRetiredCatalogModel,
 } from './model-state.js';
-import { inferModelCategory } from './model-category.js';
 import { ensureAllModelsInProfiles } from './profile-models.js';
+import { inferModelCategory } from './model-category.js';
 
 // Generative-media modalities are routed into the separate media_models table
 // (see services/media.ts), never into the chat `models` table.
@@ -108,6 +109,11 @@ interface CatalogModel {
   modality?: string;
   /** Short display note for media models (e.g. "Keyless - up to 1024x1024"). */
   mediaNote?: string;
+  /** Adapter request flavor for media rows, where one platform hosts more than
+   *  one deployment style (cloudflare images: absent/'json' = JSON body,
+   *  'multipart' = form-data, which the FLUX.2 family requires). Mirrors the
+   *  same field on CatalogTranscriptionModel and lands in meta_json. */
+  requestStyle?: string | null;
 }
 
 interface CatalogEmbedding {
@@ -207,6 +213,7 @@ function isCatalog(value: unknown): value is Catalog {
         typeof m?.modelId === 'string' &&
         typeof m?.displayName === 'string' &&
         typeof m?.enabled === 'boolean' &&
+        (m.requestStyle === undefined || m.requestStyle === null || typeof m.requestStyle === 'string') &&
         !!m?.limits &&
         typeof m.limits === 'object',
     ) &&
@@ -231,7 +238,9 @@ function routableContextWindow(platform: string, modelId: string, contextWindow:
  *    declarative config, admin adds) are never updated, never deleted, and
  *    never adopted — on a platform:model_id collision the user row wins and
  *    the catalog entry is skipped outright;
- *  - catalog models the user deleted stay deleted via tombstones;
+ *  - catalog models the user deleted stay deleted via tombstones, while models
+ *    auto-retired from an upstream 410/end-of-life response (#634) are only
+ *    disabled — a catalog that still lists them lifts the retirement;
  *  - models that vanished from the catalog are deleted, exactly like the
  *    dead-model migrations do (fallback_config row first, FK order).
  */
@@ -239,34 +248,22 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
   const counts = { updated: 0, inserted: 0, removed: 0, skippedUnknownPlatform: 0, quirks: 0 };
 
   const selectModel = db.prepare('SELECT id, enabled, source FROM models WHERE platform = ? AND model_id = ?');
-  // NOTE: raw_capabilities / capability_sources are LOCAL-ONLY fields populated
-  // by the capability collector. They are intentionally excluded from both the
-  // UPDATE and INSERT statements above so that upstream catalog sync never
-  // overwrites locally-curated capability data.
-  //
-  // NOTE (rpd_limit 治本, #P2-b): rpd_limit is intentionally EXCLUDED from the
-  // UPDATE below. The catalog ships rpd_limit=null for most platforms (e.g.
-  // nvidia/cloudflare); applying it would clobber the locally-managed per-model
-  // daily caps that P0 set (FLA-RPD). New models still receive the catalog
-  // default via the INSERT statement. The durable daily gate is the
-  // platform-level PROVIDER_DAILY_REQUEST_CAP_* env (catalog-immune).
   const updateModel = db.prepare(`
     UPDATE models SET
       display_name = @displayName, intelligence_rank = @intelligenceRank, speed_rank = @speedRank,
-      size_label = @sizeLabel, rpm_limit = @rpm, tpm_limit = @tpm, tpd_limit = @tpd,
+      size_label = @sizeLabel, rpm_limit = @rpm, rpd_limit = @rpd, tpm_limit = @tpm, tpd_limit = @tpd,
       monthly_token_budget = @monthlyTokenBudget, context_window = @contextWindow,
       supports_vision = @supportsVision, supports_tools = @supportsTools,
-      category = @category,
-      enabled = @enabled
+      category = @category, enabled = @enabled
     WHERE id = @id
   `);
   const insertModel = db.prepare(`
     INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
                         rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window,
-                        enabled, supports_vision, supports_tools, source, category)
+                        enabled, supports_vision, supports_tools, category, source)
     VALUES (@platform, @modelId, @displayName, @intelligenceRank, @speedRank, @sizeLabel,
             @rpm, @rpd, @tpm, @tpd, @monthlyTokenBudget, @contextWindow,
-            @enabled, @supportsVision, @supportsTools, 'catalog', @category)
+            @enabled, @supportsVision, @supportsTools, @category, 'catalog')
   `);
 
   // Generative-media models go to their own table (never the chat router's pool).
@@ -274,12 +271,12 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
   const updateMedia = db.prepare(`
     UPDATE media_models SET
       display_name = @displayName, modality = @modality, priority = @priority,
-      quota_label = @quotaLabel, enabled = @enabled
+      quota_label = @quotaLabel, enabled = @enabled, meta_json = @metaJson
     WHERE id = @id
   `);
   const insertMedia = db.prepare(`
-    INSERT INTO media_models (platform, model_id, display_name, modality, priority, enabled, quota_label)
-    VALUES (@platform, @modelId, @displayName, @modality, @priority, @enabled, @quotaLabel)
+    INSERT INTO media_models (platform, model_id, display_name, modality, priority, enabled, quota_label, meta_json)
+    VALUES (@platform, @modelId, @displayName, @modality, @priority, @enabled, @quotaLabel, @metaJson)
   `);
   // Transcription rows share media_models but carry adapter metadata in
   // meta_json (subtitle capability, upload ceiling, request flavor).
@@ -330,11 +327,16 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
         if (isCatalogModelTombstoned(db, 'media', m.platform, m.modelId)) continue;
         inMediaCatalog.add(`${m.platform}:${m.modelId}`);
         const mrow = selectMedia.get(m.platform, m.modelId) as { id: number; enabled: number } | undefined;
+        // Generative-media meta carries only the adapter request flavor today;
+        // a row without one stores NULL so the adapter keeps its default.
+        const mmeta: Record<string, unknown> = {};
+        if (typeof m.requestStyle === 'string') mmeta.requestStyle = m.requestStyle;
         const mfields = {
           displayName: m.displayName,
           modality,
           priority: m.intelligenceRank ?? 0,
           quotaLabel: m.mediaNote ?? '',
+          metaJson: Object.keys(mmeta).length > 0 ? JSON.stringify(mmeta) : null,
         };
         if (mrow) {
           const enabled = m.enabled ? mrow.enabled : 0; // catalog disable wins; local disable wins
@@ -354,6 +356,10 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
         continue;
       }
       if (isCatalogModelTombstoned(db, 'chat', m.platform, m.modelId)) continue;
+      // A model auto-retired from a 410/end-of-life response (#634) is disabled,
+      // not deleted. A catalog that STILL lists it — and lists it enabled — is
+      // newer evidence than that one provider response, so lift the retirement.
+      if (m.enabled) reinstateUpstreamRetiredCatalogModel(db, m.platform, m.modelId);
       inCatalog.add(`${m.platform}:${m.modelId}`);
 
       const row = selectModel.get(m.platform, m.modelId) as
@@ -378,9 +384,10 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
         contextWindow: routableContextWindow(m.platform, m.modelId, m.contextWindow),
         supportsVision: m.supportsVision ? 1 : 0,
         supportsTools: m.supportsTools ? 1 : 0,
-        // TD-027: derive models.category from catalog metadata (capability
-        // flags + id/name hints) instead of shipping NULLs. Explicit flags
-        // outrank name hints; un-inferable rows stay NULL (never guessed).
+        // Scene-routing category, inferred from the catalog capability + name
+        // hints (TD-027). NULL is a valid value ("cannot infer, don't guess");
+        // it is always written so a catalog metadata change that should relabel
+        // a model (e.g. a new supports_vision flag) is reflected here too.
         category: inferModelCategory({
           modelId: m.modelId,
           displayName: m.displayName,
@@ -545,7 +552,12 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
       }
     }
 
-    if (catalog.embeddings) {
+    // Embeddings are their own full snapshot. Older catalogs omit this field,
+    // AND catalogs may publish `embeddings: []` while still shipping model
+    // rows — both cases mean "retain the app's bundled embedding baseline
+    // untouched". The JS truthy check on a non-empty array object would
+    // misfire on `[]`, wiping the seeded rows; gate on length instead.
+    if (catalog.embeddings && catalog.embeddings.length > 0) {
       const embeddingCandidates = db
         .prepare(`
           SELECT id, platform, model_id
@@ -577,31 +589,6 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
       const info = insertQuirk.run(q.slug, q.title, q.body, q.severity, now, now);
       for (const t of q.targets) insertTarget.run(info.lastInsertRowid, t.platform ?? null, t.modelGlob ?? null);
       counts.quirks++;
-    }
-
-    // TD-027: backfill category on any catalog-owned row that still carries
-    // NULL (legacy rows that predate inference, or rows whose category was
-    // never set by an older sync). Only source='catalog' rows are touched —
-    // user-owned models (declarative config, admin adds, custom endpoints)
-    // keep whatever category they were assigned, and NULL stays NULL when no
-    // signal is strong enough (never guessed).
-    const categoryRows = db
-      .prepare(`
-        SELECT id, model_id, display_name, supports_vision, supports_tools
-          FROM models
-         WHERE category IS NULL
-           AND source = 'catalog'
-      `)
-      .all() as { id: number; model_id: string; display_name: string; supports_vision: number; supports_tools: number }[];
-    const setCategory = db.prepare('UPDATE models SET category = ? WHERE id = ?');
-    for (const r of categoryRows) {
-      const inferred = inferModelCategory({
-        modelId: r.model_id,
-        displayName: r.display_name,
-        supportsVision: r.supports_vision === 1,
-        supportsTools: r.supports_tools === 1,
-      });
-      if (inferred) setCategory.run(inferred, r.id);
     }
   });
 

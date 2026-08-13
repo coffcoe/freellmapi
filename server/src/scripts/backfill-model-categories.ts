@@ -1,5 +1,6 @@
 /**
- * backfill-model-categories — TD-027 one-time data backfill (dry-run by default).
+ * backfill-model-categories — TD-027 one-time data backfill (dry-run by default),
+ * rewritten for the v0.7.0 baseline.
  *
  * Fills `models.category` for rows that carry NULL by reusing the exact same
  * inference the catalog-sync write path uses (`inferModelCategory`), so the
@@ -8,8 +9,9 @@
  * inferred are left NULL and counted (never guessed).
  *
  * Usage:
- *   npx tsx src/scripts/backfill-model-categories.ts            # dry-run only
- *   npx tsx src/scripts/backfill-model-categories.ts --apply    # write changes
+ *   npm run -w server backfill-model-categories              # dry-run only
+ *   npm run -w server backfill-model-categories -- --apply   # write changes
+ *   (or) npx tsx src/scripts/backfill-model-categories.ts [--apply]
  *
  * Idempotent: re-running with --apply after a successful run changes nothing
  * (rows with a category are skipped; NULL rows re-infer to the same value).

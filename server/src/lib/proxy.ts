@@ -1,6 +1,20 @@
 import http from 'http';
 import https from 'https';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { assertProviderUrlAllowed } from './url-guard.js';
+
+// #590 (per-key proxy): the SAME provider may be reached through different
+// exit IPs per key (geo-ban / risk-control avoidance). Providers are process
+// singletons, so the per-key override cannot live on the provider instance —
+// it rides request-scoped AsyncLocalStorage instead, set by the dispatcher
+// around a provider call and read here in proxyFetch.
+const perKeyProxyStore = new AsyncLocalStorage<string>();
+
+/** Run `fn` with a per-key proxy override in effect; empty URL = global proxy. */
+export function withKeyProxy<T>(proxyUrl: string | undefined, fn: () => T): T {
+  return perKeyProxyStore.run(proxyUrl ?? '', fn);
+}
+
 
 // undici (ProxyAgent) and socks-proxy-agent are lazy-loaded on first proxy use
 // ONLY. Importing undici at module top-level eagerly runs its web/cache init,
@@ -22,10 +36,101 @@ async function loadSocksAgent(): Promise<Ctor<unknown>> {
   return _socksAgentCtor;
 }
 
+// SOCKS schemes socks-proxy-agent understands. `socks5h`/`socks4a` are the
+// "resolve DNS at the proxy" variants (#630) — the ones that matter on
+// DNS-poisoned networks, where resolving the upstream hostname locally is
+// exactly what fails. They are ordinary SOCKS URLs to the agent; only our
+// scheme detection ever needed teaching.
+const SOCKS_SCHEMES = ['socks5:', 'socks5h:', 'socks4:', 'socks4a:'] as const;
+
+/** Every proxy scheme the app accepts. Shared with the settings validator. */
+export const PROXY_SCHEMES: readonly string[] = ['http:', 'https:', ...SOCKS_SCHEMES];
+
+/** True when the URL names a SOCKS scheme (so it needs SocksProxyAgent, not undici). */
+export function isSocksProxyUrl(url: string): boolean {
+  const colon = url.indexOf(':');
+  if (colon < 0) return false;
+  return (SOCKS_SCHEMES as readonly string[]).includes(url.slice(0, colon + 1).toLowerCase());
+}
+
+/** Strip any `user:pass@` userinfo so a proxy URL is safe to log. */
+function redactProxyUrl(url: string): string {
+  return url.replace(/\/\/[^@/]*@/, '//***@');
+}
+
+// Standard proxy env vars, in the order they are consulted. PROXY_URL is the
+// app's own knob and outranks the dashboard; the rest are ambient system
+// settings (#353) that only apply when nothing is configured in the dashboard.
+const ENV_PROXY_FALLBACKS = ['ALL_PROXY', 'HTTPS_PROXY', 'HTTP_PROXY'] as const;
+
+/** Read an env var in either the upper- or lower-case spelling. */
+function readEnv(name: string): string {
+  return (process.env[name] ?? process.env[name.toLowerCase()] ?? '').trim();
+}
+
+/**
+ * Decide which proxy URL wins, and say where it came from.
+ *
+ * PROXY_URL → dashboard setting → ALL_PROXY → HTTPS_PROXY → HTTP_PROXY.
+ *
+ * PROXY_URL stays on top because it has always documented itself as taking
+ * precedence (the dashboard hint says so). The standard vars sit *below* the
+ * dashboard: they're usually exported machine-wide for curl/git, so a proxy a
+ * user deliberately typed into the UI must not be silently overridden by them.
+ */
+function resolveProxySource(dbValue: string): { url: string; source: string } {
+  const explicit = readEnv('PROXY_URL');
+  if (explicit) return { url: explicit, source: 'PROXY_URL' };
+
+  const db = dbValue.trim();
+  if (db) return { url: db, source: 'dashboard' };
+
+  for (const name of ENV_PROXY_FALLBACKS) {
+    const value = readEnv(name);
+    if (value) return { url: value, source: name };
+  }
+  return { url: '', source: 'none' };
+}
+
+/**
+ * Parse a NO_PROXY list into match rules. Entries are hosts or suffixes,
+ * comma-separated: `localhost,.internal.corp,example.com,*`. A bare domain
+ * also covers its subdomains, matching curl/git behaviour.
+ */
+function parseNoProxy(value: string): string[] {
+  return value
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean)
+    .map(s => (s.startsWith('*.') ? s.slice(1) : s));
+}
+
+/** True when NO_PROXY says this hostname must be reached directly. */
+function noProxyMatches(hostname: string): boolean {
+  if (_noProxyRules.length === 0) return false;
+  // Trailing dot (FQDN form) and IPv6 brackets are noise for matching.
+  const host = hostname.toLowerCase().replace(/\.$/, '').replace(/^\[|\]$/g, '');
+
+  for (const rule of _noProxyRules) {
+    if (rule === '*') return true;
+    // A `host:port` qualifier narrows the rule to one port; we match on host,
+    // so compare the host half. Guarded so bare IPv6 rules aren't mangled.
+    const bare = /^[^:]+:\d+$/.test(rule) ? rule.slice(0, rule.lastIndexOf(':')) : rule;
+    if (!bare) continue;
+    if (bare.startsWith('.')) {
+      if (host === bare.slice(1) || host.endsWith(bare)) return true;
+    } else if (host === bare || host.endsWith(`.${bare}`)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // Module-level proxy URL.
 let _proxyUrl = '';
 let _proxyEnabled = true;
 let _bypassPlatforms = new Set<string>();
+let _noProxyRules: string[] = [];
 let _initialized = false;
 
 // Cache.
@@ -37,18 +142,48 @@ let cached: {
 } | null = null;
 const CACHE_TTL_MS = 30_000;
 
+// #590: per-key proxy dispatchers, keyed by the key's proxy URL. Independent
+// of the global cache so a per-key override never poisons the global one.
+//
+// A working dispatcher is cached for as long as it stays in the map: the cache
+// key IS the whole proxy URL, so unlike the global entry (whose URL can change
+// under it) it can never go stale — re-building it on a timer would only churn
+// connection pools. A FAILED build is cached briefly instead, so a proxy that
+// was down doesn't stay written off forever.
+//
+// The map is bounded: entries are per distinct proxy URL, so at human scale
+// this holds a handful, but nothing stops an operator from pointing a hundred
+// keys at a hundred rotating exits. Oldest-first eviction keeps a bad day from
+// turning into an unbounded pile of agents. An evicted (or expired) dispatcher
+// is dropped, not closed — closing it would tear down requests still streaming
+// through it; the GC collects it once they finish. Same as the global cache.
+const perKeyCached = new Map<string, { dispatcher: unknown | undefined; isSocks: boolean; ts: number }>();
+const PER_KEY_FAILURE_TTL_MS = 30_000;
+const PER_KEY_CACHE_MAX = 32;
+
+function rememberPerKeyDispatcher(proxyUrl: string, entry: { dispatcher: unknown | undefined; isSocks: boolean; ts: number }): void {
+  // Delete-then-set so re-use moves an entry to the young end of the map and
+  // eviction takes the genuinely least-recently-used URL.
+  perKeyCached.delete(proxyUrl);
+  perKeyCached.set(proxyUrl, entry);
+  while (perKeyCached.size > PER_KEY_CACHE_MAX) {
+    const oldest = perKeyCached.keys().next().value;
+    if (oldest === undefined) break;
+    perKeyCached.delete(oldest);
+  }
+}
+
 /** Called once at startup (after initDb) and on PUT /api/settings/proxy. */
 export function applyProxyUrl(dbValue: string): void {
-  const envUrl = process.env.PROXY_URL?.trim();
-  if (envUrl) {
-    _proxyUrl = envUrl;
-  } else {
-    _proxyUrl = dbValue.trim();
-  }
+  const { url, source } = resolveProxySource(dbValue);
+  _proxyUrl = url;
+  _noProxyRules = parseNoProxy(readEnv('NO_PROXY'));
   cached = null;
   if (_proxyUrl) {
-    const masked = _proxyUrl.replace(/\/\/[^@]*@/, '//***@');
-    console.log(`[proxy] Configured → ${masked}`);
+    console.log(`[proxy] Configured → ${redactProxyUrl(_proxyUrl)} (source: ${source})`);
+    if (_noProxyRules.length > 0) {
+      console.log(`[proxy] NO_PROXY direct for: ${_noProxyRules.join(', ')}`);
+    }
   } else {
     console.log('[proxy] Not configured — outbound requests go direct.');
   }
@@ -86,13 +221,26 @@ export function getProxyBypassPlatforms(): string[] {
   return [..._bypassPlatforms];
 }
 
+/** The NO_PROXY rules currently in effect (parsed from the env at apply time). */
+export function getNoProxyRules(): string[] {
+  return [..._noProxyRules];
+}
+
 /**
- * Returns true when a platform should NOT use the proxy.
- * True when: proxy is disabled globally, or the platform is in the bypass list.
+ * Returns true when a request should NOT use the proxy.
+ * True when: proxy is disabled globally, the platform is in the bypass list,
+ * or the upstream host is covered by NO_PROXY.
  */
-function shouldBypassProxy(platform?: string): boolean {
+function shouldBypassProxy(url: string, platform?: string): boolean {
   if (!_proxyEnabled) return true;
   if (platform && _bypassPlatforms.has(platform.toLowerCase())) return true;
+  if (_noProxyRules.length > 0) {
+    try {
+      if (noProxyMatches(new URL(url).hostname)) return true;
+    } catch {
+      // Unparseable URL — leave the routing decision to the caller/fetch.
+    }
+  }
   return false;
 }
 
@@ -115,7 +263,7 @@ async function resolveDispatcher(): Promise<{ dispatcher: unknown; isSocks: bool
   }
 
   try {
-    const isSocks = _proxyUrl.startsWith('socks5:') || _proxyUrl.startsWith('socks4:');
+    const isSocks = isSocksProxyUrl(_proxyUrl);
 
     if (isSocks) {
       const SocksAgent = await loadSocksAgent();
@@ -129,8 +277,7 @@ async function resolveDispatcher(): Promise<{ dispatcher: unknown; isSocks: bool
     cached = { dispatcher, proxyUrl: _proxyUrl, isSocks: false, ts: now };
     return { dispatcher, isSocks: false };
   } catch (err: any) {
-    const masked = _proxyUrl.replace(/\/\/[^@]*@/, '//***@');
-    console.error(`[proxy] Failed to create dispatcher for "${masked}": ${err.message}`);
+    console.error(`[proxy] Failed to create dispatcher for "${redactProxyUrl(_proxyUrl)}": ${err.message}`);
     cached = { dispatcher: undefined, proxyUrl: _proxyUrl, isSocks: false, ts: now };
     return undefined;
   }
@@ -237,6 +384,27 @@ function socksFetch(
   const signal = init?.signal;
   const startedAt = Date.now();
 
+  // Socket guard for the SOCKS fallback path — deliberately NOT `timeoutMs`.
+  // The two clocks measure different things: http.request's `timeout` is a
+  // socket INACTIVITY timer that stays armed across the whole streaming body,
+  // while `timeoutMs` is a header/request deadline the caller disarms the
+  // moment response headers arrive (providers/base.ts fetchWithTimeout). Mid-
+  // stream time is owned by the stall watchdog and the first-byte grace
+  // (#553/#584, default 90s), so pinning the socket timer to a platform's
+  // 15-60s chat timeout would kill healthy streams during prefill.
+  //
+  // So this only ever RAISES the historical 120s floor (#666): a user with
+  // PROVIDER_TIMEOUT_CUSTOM=600000 no longer dies at 120s, and the +30s grace
+  // keeps the caller's abort firing first so the tagged AbortError (see
+  // enrichAbort) survives instead of the bare socket 'timeout'. 0 means "no
+  // timeout" (provider semantics); undefined or malformed input falls back to
+  // the 120s guard rather than disabling it.
+  const socketTimeoutMs = timeoutMs === 0
+    ? 0
+    : typeof timeoutMs === 'number' && Number.isFinite(timeoutMs) && timeoutMs > 0
+      ? Math.max(timeoutMs + 30_000, 120_000)
+      : 120_000;
+
   // What to reject with when the signal fires. A client-caused abort carries
   // its own marked reason (newClientAbortError in lib/error-classify.ts) —
   // preserve it so the failure isn't misclassified downstream as a provider
@@ -258,7 +426,7 @@ function socksFetch(
       agent,
       servername: isTls ? url.hostname : undefined,
       rejectUnauthorized: true,
-      timeout: 120_000,
+      timeout: socketTimeoutMs,
     }, (res) => {
       if (signal?.aborted) {
         res.destroy();
@@ -379,8 +547,31 @@ async function dispatchFetch(
   requestType: ProxyRequestType,
   timeoutMs: number | undefined,
 ): Promise<Response> {
-  // Bypass check: disabled globally, or this platform is exempt.
-  if (shouldBypassProxy(platform)) {
+  // #590: a per-key proxy override (set via withKeyProxy around the provider
+  // call) takes precedence over the global proxy for THIS request. Empty
+  // string (the store default) means "fall back to global".
+  const perKeyUrl = perKeyProxyStore.getStore() ?? '';
+  if (perKeyUrl) {
+    // Every bypass still applies, unchanged: the global on/off switch, the
+    // per-platform bypass list, and NO_PROXY. A per-key override says WHICH
+    // proxy to use, not that this request must be proxied — an operator who
+    // turned proxying off, or listed the upstream in NO_PROXY, still gets a
+    // direct connection.
+    if (!shouldBypassProxy(url, platform)) {
+      const resolved = await resolvePerKeyDispatcher(perKeyUrl);
+      if (resolved) {
+        if (resolved.isSocks) {
+          return socksFetch(url, init, resolved.dispatcher as http.Agent, platform, requestType, timeoutMs);
+        }
+        return fetch(url, { ...init, dispatcher: resolved.dispatcher } as unknown as RequestInit);
+      }
+    }
+    // Per-key proxy failed to build → fall through to the global/direct path.
+  }
+
+  // Bypass check: disabled globally, this platform is exempt, or the upstream
+  // host is listed in NO_PROXY.
+  if (shouldBypassProxy(url, platform)) {
     return fetch(url, init);
   }
 
@@ -398,6 +589,37 @@ async function dispatchFetch(
 
   // HTTP/HTTPS proxy → undici (dispatcher is an undici extension not in TS types)
   return fetch(url, { ...init, dispatcher: resolved.dispatcher } as unknown as RequestInit);
+}
+
+/** Build (and TTL-cache) a dispatcher for a per-key proxy URL. Returns
+ *  undefined when the URL is empty or the agent fails to build. */
+async function resolvePerKeyDispatcher(proxyUrl: string): Promise<{ dispatcher: unknown; isSocks: boolean } | undefined> {
+  const now = Date.now();
+  const hit = perKeyCached.get(proxyUrl);
+  if (hit?.dispatcher) {
+    rememberPerKeyDispatcher(proxyUrl, hit);
+    return { dispatcher: hit.dispatcher, isSocks: hit.isSocks };
+  }
+  // Negative entry, still inside its cool-off: don't retry the build yet.
+  if (hit && now - hit.ts < PER_KEY_FAILURE_TTL_MS) return undefined;
+
+  try {
+    const isSocks = isSocksProxyUrl(proxyUrl);
+    if (isSocks) {
+      const SocksAgent = await loadSocksAgent();
+      const dispatcher = new SocksAgent(proxyUrl);
+      rememberPerKeyDispatcher(proxyUrl, { dispatcher, isSocks: true, ts: now });
+      return { dispatcher, isSocks: true };
+    }
+    const ProxyAgentCtor = await loadHttpProxyAgent();
+    const dispatcher = new ProxyAgentCtor({ uri: proxyUrl });
+    rememberPerKeyDispatcher(proxyUrl, { dispatcher, isSocks: false, ts: now });
+    return { dispatcher, isSocks: false };
+  } catch (err: any) {
+    console.error(`[proxy] Failed to create per-key dispatcher for "${redactProxyUrl(proxyUrl)}": ${err.message}`);
+    rememberPerKeyDispatcher(proxyUrl, { dispatcher: undefined, isSocks: false, ts: now });
+    return undefined;
+  }
 }
 
 /**

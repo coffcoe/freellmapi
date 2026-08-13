@@ -4,7 +4,7 @@ import type {
   ChatCompletionChunk,
 } from '@freellmapi/shared/types.js';
 import { BaseProvider, providerHttpError, type CompletionOptions, type KeyValidationResult, type KeyValidationFailure } from './base.js';
-import { extendedBodyParams } from '../lib/sampling-params.js';
+import { extendedBodyParams, resolveMaxTokens } from '../lib/sampling-params.js';
 import { contentToString } from '../lib/content.js';
 import { extractThinkFromMessage } from '../lib/think-tags.js';
 import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
@@ -69,7 +69,7 @@ export class CloudflareProvider extends BaseProvider {
         model: modelId,
         messages: this.normalizeMessages(messages),
         temperature: options?.temperature,
-        max_tokens: options?.max_tokens,
+        max_tokens: resolveMaxTokens(this.platform, options?.max_tokens),
         top_p: options?.top_p,
         stop: options?.stop,
         tools: options?.tools,
@@ -91,7 +91,7 @@ export class CloudflareProvider extends BaseProvider {
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw providerHttpError(res, `Cloudflare API error ${res.status}: ${(err as any).error?.message ?? (err as any).errors?.[0]?.message ?? res.statusText}`);
+      throw providerHttpError(res, `Cloudflare API error ${res.status}: ${(err as any).error?.message ?? (err as any).errors?.[0]?.message ?? res.statusText}`, err);
     }
 
     const data = await res.json() as ChatCompletionResponse;
@@ -125,7 +125,7 @@ export class CloudflareProvider extends BaseProvider {
         model: modelId,
         messages: this.normalizeMessages(messages),
         temperature: options?.temperature,
-        max_tokens: options?.max_tokens,
+        max_tokens: resolveMaxTokens(this.platform, options?.max_tokens),
         top_p: options?.top_p,
         stop: options?.stop,
         tools: options?.tools,
@@ -148,7 +148,7 @@ export class CloudflareProvider extends BaseProvider {
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw providerHttpError(res, `Cloudflare API error ${res.status}: ${(err as any).error?.message ?? (err as any).errors?.[0]?.message ?? res.statusText}`);
+      throw providerHttpError(res, `Cloudflare API error ${res.status}: ${(err as any).error?.message ?? (err as any).errors?.[0]?.message ?? res.statusText}`, err);
     }
 
     // First-byte grace (#584): reuse the per-model chat timeout (GLM 4.7

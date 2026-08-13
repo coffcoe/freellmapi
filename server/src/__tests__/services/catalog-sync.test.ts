@@ -115,6 +115,28 @@ describe('applyCatalog', () => {
     expect(fb).toBeTruthy();
   });
 
+  it('infers and writes models.category from catalog capability + name hints (TD-027)', () => {
+    const models = existingAsCatalogModels();
+    // Vision flag outranks everything.
+    models.push(baseModel({ modelId: 'vision-capable', displayName: 'Vision Model', supportsVision: true, supportsTools: false }));
+    // Tool-capable with no stronger hint -> function-calling.
+    models.push(baseModel({ modelId: 'tool-model', displayName: 'Tool Model', supportsVision: false, supportsTools: true }));
+    // No hint at all -> category stays NULL (never guessed).
+    models.push(baseModel({ modelId: 'plain-model', displayName: 'Plain Model', supportsVision: false, supportsTools: false }));
+
+    applyCatalog(getDb(), catalogOf(models));
+
+    const cat = (modelId: string) => {
+      const r = getDb()
+        .prepare("SELECT category FROM models WHERE platform = 'groq' AND model_id = ?")
+        .get(modelId) as { category: string | null };
+      return r.category;
+    };
+    expect(cat('vision-capable')).toBe('vision');
+    expect(cat('tool-model')).toBe('function-calling');
+    expect(cat('plain-model')).toBeNull();
+  });
+
   it('caps GitHub GPT-4.1 catalog context at the routable free-tier limit (#426)', () => {
     const models = existingAsCatalogModels();
     const target = models.find((m) => m.platform === 'github' && m.modelId === 'openai/gpt-4.1');
@@ -562,6 +584,59 @@ describe('applyCatalog: transcriptionModels', () => {
     (catalog as any).transcriptionModels = [{ platform: 'groq' }]; // missing required fields
     setSetting('catalog_applied_json', JSON.stringify(catalog));
     // isCatalog gates both the network and the cached re-apply paths.
+    expect(reapplyCachedCatalog().reapplied).toBe(false);
+  });
+});
+
+// Generative media rows (image/audio) carry adapter metadata in meta_json the
+// same way transcription rows do — the flavour a platform's endpoint expects.
+// Cloudflare hosts both JSON-body image models and the FLUX.2 family, whose
+// schema takes multipart only, so the flag has to survive the sync.
+describe('applyCatalog: generative media meta', () => {
+  beforeAll(() => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    initDb(':memory:');
+  });
+
+  function imageCatalog(requestStyle?: string): AnyCatalog {
+    const models = existingAsCatalogModels();
+    models.push(baseModel({
+      platform: 'cloudflare',
+      modelId: '@cf/black-forest-labs/flux-2-klein-4b',
+      displayName: 'FLUX.2 [klein] 4B',
+      modality: 'image',
+      ...(requestStyle ? { requestStyle } : {}),
+    }));
+    models.push(baseModel({
+      platform: 'cloudflare',
+      modelId: '@cf/black-forest-labs/flux-1-schnell',
+      displayName: 'FLUX.1 [schnell]',
+      modality: 'image',
+    }));
+    return catalogOf(models);
+  }
+
+  function metaOf(modelId: string): string | null {
+    return (getDb().prepare('SELECT meta_json FROM media_models WHERE model_id = ?')
+      .get(modelId) as { meta_json: string | null }).meta_json;
+  }
+
+  it('carries requestStyle onto an image row, and leaves rows without one NULL', () => {
+    applyCatalog(getDb(), imageCatalog('multipart'));
+    expect(JSON.parse(metaOf('@cf/black-forest-labs/flux-2-klein-4b')!)).toEqual({ requestStyle: 'multipart' });
+    expect(metaOf('@cf/black-forest-labs/flux-1-schnell')).toBeNull();
+  });
+
+  it('clears meta when the catalog drops requestStyle (full-snapshot semantics)', () => {
+    applyCatalog(getDb(), imageCatalog('multipart'));
+    applyCatalog(getDb(), imageCatalog());
+    expect(metaOf('@cf/black-forest-labs/flux-2-klein-4b')).toBeNull();
+  });
+
+  it('a non-string requestStyle rejects the whole payload', () => {
+    const catalog = imageCatalog('multipart');
+    (catalog.models[catalog.models.length - 2] as any).requestStyle = 42;
+    setSetting('catalog_applied_json', JSON.stringify(catalog));
     expect(reapplyCachedCatalog().reapplied).toBe(false);
   });
 });
