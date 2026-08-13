@@ -135,6 +135,10 @@ export interface ChainRow {
   model_db_id: number;
   priority: number;
   enabled: number;
+  // Frontier/Large-tier free model whose upstream daily quota is scarce. The
+  // router avoids routing very large inputs onto these so their limited quota
+  // isn't burned on oversized requests (see filterHighValueIfLarge). 0/1.
+  is_high_value: number;
   platform: string;
   model_id: string;
   display_name: string;
@@ -238,6 +242,32 @@ export const OUTPUT_RESERVE_CAP = 2000;
 export function routingReserveTokens(requestedMaxTokens: number | null | undefined): number {
   const requested = requestedMaxTokens != null && requestedMaxTokens > 0 ? requestedMaxTokens : 1000;
   return Math.min(requested, OUTPUT_RESERVE_CAP);
+}
+
+// ── High-value model protection (P1-b) ──────────────────────────────────────
+// Frontier/Large-tier free models flagged `is_high_value=1` (see the
+// quota_guard_columns migration) carry a scarce upstream daily quota. A very
+// large input would burn that quota on one oversized request, so when the
+// estimated input is large the auto chain drops them first — preserving their
+// limited budget for smaller, high-value requests. This is a routing-only
+// guard: the models stay enabled, pinned/manual requests still reach them, and
+// if the filter would empty the chain the original is kept so a large request
+// never fails because we were too protective.
+export const HIGH_VALUE_INPUT_THRESHOLD = 20000;
+
+/**
+ * Drop `is_high_value=1` models from a chain once the estimated input exceeds
+ * HIGH_VALUE_INPUT_THRESHOLD. Returns the original chain unchanged when the
+ * estimate is small or when removing them would empty the chain (never let the
+ * guard turn a servable request into an exhausted one). Pure and exported for
+ * tests. `estimatedTokens` is the request's estimated token total (input +
+ * capped output reserve) — the only per-request size the router sees, and for
+ * the large inputs this guard targets it is dominated by the prompt.
+ */
+export function filterHighValueIfLarge(chain: ChainRow[], estimatedTokens: number): ChainRow[] {
+  if (estimatedTokens <= HIGH_VALUE_INPUT_THRESHOLD) return chain;
+  const withoutHighValue = chain.filter(e => !e.is_high_value);
+  return withoutHighValue.length > 0 ? withoutHighValue : chain;
 }
 
 // Round-robin index per platform
@@ -1062,6 +1092,7 @@ function getActiveChain(db: Db): ChainRow[] {
     const chain = db.prepare(`
       SELECT pm.model_db_id, pm.priority, pm.enabled,
              m.platform, m.model_id, m.display_name, m.intelligence_rank,
+             m.is_high_value,
              m.size_label, m.monthly_token_budget,
              m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
              m.supports_tools, m.context_window, m.category, m.network_tier, m.tags, m.key_id, m.endpoint_scope
@@ -1077,6 +1108,7 @@ function getActiveChain(db: Db): ChainRow[] {
   return db.prepare(`
     SELECT fc.model_db_id, fc.priority, fc.enabled,
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
+           m.is_high_value,
            m.size_label, m.monthly_token_budget,
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
            m.supports_tools, m.context_window, m.category, m.network_tier, m.tags, m.key_id, m.endpoint_scope
@@ -1093,6 +1125,7 @@ function getChainByProfileName(db: Db, name: string): ChainRow[] | null {
   return db.prepare(`
     SELECT pm.model_db_id, pm.priority, pm.enabled,
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
+           m.is_high_value,
            m.size_label, m.monthly_token_budget,
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
            m.supports_tools, m.context_window, m.category, m.network_tier, m.tags, m.key_id, m.endpoint_scope
@@ -1115,6 +1148,7 @@ function getChainByGlobalSort(db: Db, globalAxis: string): ChainRow[] {
   const allEnabled = db.prepare(`
     SELECT m.id as model_db_id, 0 as priority, 1 as enabled,
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
+           m.is_high_value,
            m.size_label, m.monthly_token_budget,
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
            m.supports_tools, m.context_window, m.category, m.network_tier, m.tags, m.key_id, m.endpoint_scope
@@ -1446,6 +1480,7 @@ function getModelChainRow(db: Db, modelDbId: number): ChainRow | undefined {
   return db.prepare(`
     SELECT m.id as model_db_id, 0 as priority, 1 as enabled,
            m.platform, m.model_id, m.display_name, m.intelligence_rank,
+           m.is_high_value,
            m.size_label, m.monthly_token_budget,
            m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
            m.supports_tools, m.context_window, m.category, m.network_tier, m.tags, m.key_id, m.endpoint_scope
@@ -1505,6 +1540,7 @@ export function resolveModelGroupCandidates(
       SELECT m.id as model_db_id, COALESCE(fc.priority, 0) as priority,
              1 as enabled,
              m.platform, m.model_id, m.display_name, m.intelligence_rank,
+             m.is_high_value,
              m.size_label, m.monthly_token_budget,
              m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
              m.supports_tools, m.context_window, m.category, m.network_tier, m.tags, m.key_id, m.endpoint_scope
@@ -1516,6 +1552,7 @@ export function resolveModelGroupCandidates(
       SELECT m.id as model_db_id, COALESCE(pm.priority, fc.priority, 0) as priority,
              1 as enabled,
              m.platform, m.model_id, m.display_name, m.intelligence_rank,
+             m.is_high_value,
              m.size_label, m.monthly_token_budget,
              m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
              m.supports_tools, m.context_window, m.category, m.network_tier, m.tags, m.key_id, m.endpoint_scope
@@ -1683,7 +1720,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
   const strategy = getRoutingStrategy();
   if (strategy !== 'priority') refreshStatsCache(db);
 
-  const chain = (prefetchedChain ?? getActiveChain(db)).filter(e => e.enabled);
+  const chain = filterHighValueIfLarge((prefetchedChain ?? getActiveChain(db)).filter(e => e.enabled), estimatedTokens);
 
   // Scene-routing soft preference (see lib/scene.ts): when a request carries a
   // scene signal and any chain row carries scene labels, load the labels and
@@ -1753,6 +1790,7 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
       const pinnedRow = db.prepare(`
         SELECT m.id as model_db_id, 0 as priority, 1 as enabled,
                m.platform, m.model_id, m.display_name, m.intelligence_rank,
+               m.is_high_value,
                m.size_label, m.monthly_token_budget,
                m.rpm_limit, m.rpd_limit, m.tpm_limit, m.tpd_limit, m.supports_vision,
                m.supports_tools, m.context_window, m.category, m.network_tier, m.tags, m.key_id, m.endpoint_scope
