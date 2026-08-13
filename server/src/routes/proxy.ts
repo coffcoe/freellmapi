@@ -10,7 +10,7 @@ import { runImageGeneration, runSpeech, runTranscription, MediaError, MAX_TRANSC
 import multer from 'multer';
 import { getDb } from '../db/index.js';
 import { resolveAuth, prependSystemPrompt, type ResolvedAuth } from '../lib/system-prompt.js';
-import { contentToString, messageHasImage, normalizeOutboundContent, sanitizeResponse } from '../lib/content.js';
+import { contentToString, messageHasImage, normalizeOutboundContent, sanitizeResponse, truncateMessagesForGithub } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { invalidToolArgumentsError, invalidToolCallReasons, isToolArgumentValidationEnabled } from '../lib/tool-validate.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
@@ -1001,6 +1001,14 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
         requestedModel: attempt === 0 ? requestedModelLabel : undefined,
       });
 
+      // GitHub input guardrail (CUSTOM-PATCHES §6.6): GitHub Models 413s on
+      // inputs above ~8000 tokens. Truncate the legacy completion's messages
+      // to GITHUB_MAX_INPUT_TOKENS before dispatch when routed to github; a
+      // no-op (same array) for other platforms / small inputs.
+      const dispatchMessages = route.platform === 'github'
+        ? truncateMessagesForGithub(messages)
+        : messages;
+
       if (stream) {
         let totalOutputTokens = 0;
         let headerSent = false;
@@ -1028,7 +1036,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
         try {
           const gen = route.provider.streamChatCompletion(
             route.apiKey,
-            messages,
+            dispatchMessages,
             route.modelId,
             { temperature, max_tokens, top_p, stop, signal: clientAbort.signal },
             quotaContextForRoute(route, 'chat/completions'),
@@ -1128,7 +1136,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
 
       const result = await route.provider.chatCompletion(
         route.apiKey,
-        messages,
+        dispatchMessages,
         route.modelId,
         { temperature, max_tokens, top_p, stop, signal: clientAbort.signal },
         quotaContextForRoute(route, 'chat/completions'),
@@ -1831,6 +1839,16 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     const rememberedReasoning = rememberedReasoningFor(reasoningSessionKey, modelKey);
     if (rememberedReasoning) {
       outboundMessages = restoreSessionReasoning(outboundMessages, rememberedReasoning, route.platform);
+    }
+
+    // GitHub input guardrail (CUSTOM-PATCHES §6.6): GitHub Models rejects
+    // inputs above ~8000 tokens with a 413, and the same oversized body would
+    // then ride every fallback candidate. Truncate the outbound copy to
+    // GITHUB_MAX_INPUT_TOKENS before dispatch so a github attempt reaches the
+    // upstream. No-op (returns the same array) when the request already fits or
+    // the platform isn't github, so non-github hops pay nothing.
+    if (route.platform === 'github') {
+      outboundMessages = truncateMessagesForGithub(outboundMessages);
     }
 
       if (stream) {

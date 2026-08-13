@@ -218,11 +218,24 @@ export interface PlatformParamPolicy {
   // effect once its adapter routes max_tokens through that helper (they all
   // do).
   defaultMaxTokens?: number;
+  // Output-token CEILING for this platform, applied by resolveMaxTokens()
+  // regardless of what the client asked for. A provider whose API rejects
+  // large max_tokens (GitHub Models 400s above ~400, see the github entry)
+  // would otherwise fail every request that carries an aggressive value;
+  // clamping to the ceiling lets those requests succeed instead of burning a
+  // fallback hop on a 400. The effective max_tokens is min(requested,
+  // platform cap, unified operator cap).
+  maxTokensCap?: number;
 }
 
 // Keyed by Platform (not string) so a typo'd platform id fails tsc instead of
 // silently no-op'ing the policy; the string-typed accessors below cast at the
 // boundary since routes carry platform ids as plain strings.
+
+/** GitHub Models' hard output-token ceiling (observed 400 above it). Wired
+ *  into the github policy's maxTokensCap below. */
+export const GITHUB_MAX_OUTPUT_TOKENS = 400;
+
 export const PLATFORM_PARAM_POLICIES: Partial<Record<Platform, PlatformParamPolicy>> = {
   // Mistral's API is strict (422 on unknown body keys) and names its seed
   // `random_seed`. It has no top_k/min_p/logit_bias/logprobs equivalents, and
@@ -237,8 +250,14 @@ export const PLATFORM_PARAM_POLICIES: Partial<Record<Platform, PlatformParamPoli
   // GitHub Models sits on Azure OpenAI, which 400s "Unrecognized request
   // argument" for knobs outside the OpenAI set. Its reasoning_effort enum is
   // the older low/medium/high one, so 'none'/'minimal' are clamped rather
-  // than sent.
-  github: { drop: ['top_k', 'min_p', 'repetition_penalty'], reasoningEfforts: ['low', 'medium', 'high'] },
+  // than sent. It also hard-rejects max_tokens above GITHUB_MAX_OUTPUT_TOKENS
+  // (observed 400) and caps input at ~8000 tokens, so both are clamped here
+  // and in the proxy's truncateMessagesForGithub (see CUSTOM-PATCHES §6.6).
+  github: {
+    drop: ['top_k', 'min_p', 'repetition_penalty'],
+    reasoningEfforts: ['low', 'medium', 'high'],
+    maxTokensCap: GITHUB_MAX_OUTPUT_TOKENS,
+  },
   // Gemini's generationConfig has no equivalents for these; the adapter
   // translates the rest natively (topK, seed, penalties, responseSchema, and
   // reasoning_effort → thinkingConfig — see toGeminiExtendedConfig).
@@ -314,6 +333,17 @@ export function defaultMaxTokensFor(platform: string): number | undefined {
   return PLATFORM_PARAM_POLICIES[platform as Platform]?.defaultMaxTokens;
 }
 
+/** GitHub Models' input-token cap its API enforces (~8000, 413 above it). It
+ *  drives the proxy's truncateMessagesForGithub guard (CUSTOM-PATCHES §6.6);
+ *  the output ceiling lives next to the policy as GITHUB_MAX_OUTPUT_TOKENS. */
+export const GITHUB_MAX_INPUT_TOKENS = 7500;
+
+/** This platform's hard output-token ceiling, or undefined when it accepts
+ *  arbitrary max_tokens. Applied alongside the operator-level unified cap. */
+export function maxTokensCapFor(platform: string): number | undefined {
+  return PLATFORM_PARAM_POLICIES[platform as Platform]?.maxTokensCap;
+}
+
 /**
  * The max_tokens to put on the wire for one request: whatever the client asked
  * for, or the platform's floor when the client asked for nothing (#553), then
@@ -329,7 +359,14 @@ export function defaultMaxTokensFor(platform: string): number | undefined {
 export function resolveMaxTokens(platform: string, requested: number | undefined): number | undefined {
   const resolved = requested ?? defaultMaxTokensFor(platform);
   if (resolved == null) return resolved;
-  const cap = unifiedMaxTokensCap();
+  const unifiedCap = unifiedMaxTokensCap();
+  const platformCap = maxTokensCapFor(platform);
+  // The tighter of the two ceilings wins: a platform's hard reject (GitHub 400
+  // above 400) applies even when the operator cap is off, and an operator cap
+  // below the platform's own ceiling applies to every platform.
+  const cap = unifiedCap != null && platformCap != null
+    ? Math.min(unifiedCap, platformCap)
+    : (unifiedCap ?? platformCap);
   return cap == null ? resolved : Math.min(resolved, cap);
 }
 
