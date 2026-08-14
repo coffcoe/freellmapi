@@ -93,7 +93,7 @@ function interpolate(template: string, vars?: Record<string, string | number>): 
   })
 }
 
-interface I18nContextValue {
+export interface I18nContextValue {
   locale: Locale
   setLocale: (next: Locale) => void
   t: (key: string, vars?: Record<string, string | number>) => string
