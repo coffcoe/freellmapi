@@ -280,6 +280,24 @@ PY
 
 ---
 
+## 7·5. 🔴 并发会话操作纪律（2026-08-14 灰狐 · .git 健康排查固化）
+
+> **背景**：2026-08-13/14 多次异常（`git rm` 单文件删整目录 180→0、`update-ref` 后 refs 实时消失、`merge --abort` 后 392 个 D 标记）经 `git fsck --full` 排查：**.git 对象库健康（0 错误、0 损坏）**，根因 = **多个 WorkBuddy 会话并发操作同一仓库**（多 git 进程竞争同一 index/refs，git 为单进程写模型）。详见 `shared/discussions/agent-grey-fox/2026-08-14-git-health-check-report.md`。
+
+**写操作前探并发（必做）**：
+```bash
+tasklist | grep -i WorkBuddy          # 多进程 = 可能多会话
+ls -dt /d/Users/Yin/WorkBuddy/*/      # 近 2 小时新建会话目录 = 有活跃会话
+```
+
+**防护纪律**：
+1. 探测到 >2 个近期会话时，写操作（merge/rm/checkout/reset/commit/push）前与领航员确认会话归属，避免双 git 进程同仓操作
+2. `update-ref` 后立即 `git rev-parse` 回读；refs 丢失时用对象 hash 操作（对象库完整不受 refs 影响）
+3. merge 预演/abort 后出现大量 D 标记 → `git checkout HEAD -- <dir>` 恢复（对象完整无损，数据零丢失）
+4. 服务器端状态以 `git ls-remote cnb main` / `cnb pulls get-pull` 为准（本地 refs 可能被并发污染）
+
+---
+
 ## 8. 其他核心 skill 台账（扩展位）
 
 本台账目前仅覆盖 freellmapi。web2kb / credential-vault / secure-credential-channel 等核心 skill 的自定义改动，复制下模板追加章节：
