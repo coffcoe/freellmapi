@@ -4,8 +4,7 @@ import {
   getMaxConsecutiveUpstreamFails,
   exceedsTokenBudget,
   newBreaker,
-  recordUpstreamFailure,
-  resetBreaker,
+  recordBreakerFailure,
 } from '../../lib/guardrails.js';
 
 // Mock the settings store so we can drive the getters deterministically.
@@ -55,35 +54,30 @@ describe('exceedsTokenBudget', () => {
   });
 });
 
-describe('circuit breaker state machine', () => {
+describe('circuit breaker state machine (v0.7.0 per-request contract)', () => {
   it('is a no-op when disabled (threshold 0)', () => {
     settingStore.set('max_consecutive_upstream_fails', '0');
     const b = newBreaker();
-    recordUpstreamFailure(b);
-    recordUpstreamFailure(b);
+    expect(recordBreakerFailure(b)).toBe(false);
+    expect(recordBreakerFailure(b)).toBe(false);
     expect(b.consecutive).toBe(0);
-    expect(b.tripped).toBe(false);
   });
 
   it('trips after N consecutive failures', () => {
     settingStore.set('max_consecutive_upstream_fails', '3');
     const b = newBreaker();
-    recordUpstreamFailure(b);
-    expect(b.tripped).toBe(false);
-    recordUpstreamFailure(b);
-    expect(b.tripped).toBe(false);
-    recordUpstreamFailure(b);
-    expect(b.tripped).toBe(true);
+    expect(recordBreakerFailure(b)).toBe(false);
+    expect(recordBreakerFailure(b)).toBe(false);
+    expect(recordBreakerFailure(b)).toBe(true);
   });
 
-  it('resetBreaker clears the consecutive count', () => {
+  it('a fresh newBreaker() starts at zero (per-request state, no shared reset)', () => {
     settingStore.set('max_consecutive_upstream_fails', '2');
     const b = newBreaker();
-    recordUpstreamFailure(b);
-    resetBreaker(b);
-    expect(b.consecutive).toBe(0);
-    expect(b.tripped).toBe(false);
-    recordUpstreamFailure(b);
-    expect(b.tripped).toBe(false);
+    expect(recordBreakerFailure(b)).toBe(false);
+    // New request → brand-new breaker: previous failures never carry over.
+    const fresh = newBreaker();
+    expect(fresh.consecutive).toBe(0);
+    expect(recordBreakerFailure(fresh)).toBe(false);
   });
 });

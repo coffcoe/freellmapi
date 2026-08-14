@@ -25,7 +25,11 @@ FAIL=0
 echo "== [1/4] sensitive-info scan =="
 # A light scan over committed source for obvious plaintext keys. This is a
 # guardrail, not a substitute for the CI secret scanner.
+# Test fixtures (__tests__/ / *.test.ts) are excluded: PR #7 audit found their
+# 32+ hex "sha" placeholders (e.g. update.test.ts LOCAL_SHA) trip the heuristic
+# while being obvious test data — see PR7-audit-report-2026-08-13.md §五.
 SCAN_HITS=$(grep -rInE --exclude-dir=node_modules --exclude-dir=dist --exclude-dir=.git \
+  --exclude='*.test.ts' --exclude='*.test.js' --exclude-dir='__tests__' \
   '(sk-[A-Za-z0-9]{20,}|AIza[A-Za-z0-9_-]{20,}|ghp_[A-Za-z0-9]{30,}|xox[baprs]-[A-Za-z0-9-]{10,})' \
   server/src client/src cli/src shared/src 2>/dev/null || true)
 if [ -n "$SCAN_HITS" ]; then

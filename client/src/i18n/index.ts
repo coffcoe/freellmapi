@@ -1,16 +1,14 @@
 export {
   I18nProvider,
-  type I18nProviderProps,
-} from './I18nProvider'
-export { useI18n, type I18nContextValue } from './context'
-// SUPPORTED_LOCALES / Locale / DEFAULT_LOCALE must stay in sync with what
-// I18nProvider actually loads (6 dictionaries). Exporting the 60-locale list
-// from locale-config here made the settings language dropdown offer 54
-// "ghost" languages whose setLocale() is silently rejected (e.g. zh-TW) —
-// users clicking 中文(繁體) saw no reaction. locale-config.ts is now unused;
-// keep it until a full locale set is actually bundled.
-export {
+  useI18n,
   SUPPORTED_LOCALES,
   DEFAULT_LOCALE,
   type Locale,
+  type I18nContextValue,
+  type I18nProviderProps,
 } from './I18nProvider'
+// NOTE: useI18n MUST come from I18nProvider — it reads the same context the
+// provider renders. context.ts previously declared its OWN createContext, so
+// every component's useContext() read a different (never-provided) context and
+// t() fell back to returning the raw key (界面全显示 settings.title 等).
+// locale-config.ts / context.ts are now unused; see 2026-08-13 memory.

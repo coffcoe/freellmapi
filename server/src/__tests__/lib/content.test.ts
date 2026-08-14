@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { contentToString, flattenMessageContent, messageHasImage, normalizeOutboundContent, sanitizeResponse } from '../../lib/content.js';
+import { contentToString, flattenMessageContent, messageHasImage, normalizeOutboundContent, sanitizeResponse, truncateMessagesForGithub } from '../../lib/content.js';
+import { GITHUB_MAX_INPUT_TOKENS } from '../../lib/sampling-params.js';
 
 describe('contentToString', () => {
   it('passes strings through', () => {
@@ -171,5 +172,62 @@ describe('sanitizeResponse', () => {
     expect(() => sanitizeResponse({ usage: { prompt_tokens: 1 } })).not.toThrow();
     expect(() => sanitizeResponse(null as unknown)).not.toThrow();
     expect(() => sanitizeResponse({} as unknown)).not.toThrow();
+  });
+});
+
+describe('truncateMessagesForGithub (input guardrail, CUSTOM-PATCHES §6.6)', () => {
+  const msg = (role: 'system' | 'user' | 'assistant', content: string) => ({ role, content });
+
+  it('returns the original array untouched when the request already fits', () => {
+    const messages = [msg('system', 'sys'), msg('user', 'short')];
+    const out = truncateMessagesForGithub(messages);
+    expect(out).toBe(messages); // same reference — no copy cost when nothing changes
+  });
+
+  it('trims older messages to fit the budget, keeping the system prompt and newest context', () => {
+    // Each big message ~= 4000 tokens (16000 chars / 4). system + 3 big turns
+    // total well over the 7500 budget, so the oldest big turns must be dropped
+    // while the system prompt and the newest context survive.
+    const big = 'x'.repeat(16000); // ~4000 tokens each
+    const messages = [
+      msg('system', 'sys'),
+      msg('user', big),
+      msg('assistant', big),
+      msg('user', big),
+      msg('user', 'newest question'),
+    ];
+    const out = truncateMessagesForGithub(messages);
+    // system + newest big turn + newest question fit; the older big turns drop
+    expect(out).not.toBe(messages);
+    expect(out[0].role).toBe('system');
+    expect(out[0].content).toBe('sys');
+    expect(out[out.length - 1].content).toBe('newest question');
+    expect(out.length).toBeLessThan(messages.length);
+  });
+
+  it('truncates a single oversized message when it alone exceeds the budget', () => {
+    const huge = 'y'.repeat(40000); // ~10000 tokens — over budget on its own
+    const out = truncateMessagesForGithub([msg('user', huge)]);
+    expect(out.length).toBe(1);
+    expect((out[0].content as string).length).toBe(GITHUB_MAX_INPUT_TOKENS * 4);
+  });
+
+  it('keeps the system prompt even when trimming the rest', () => {
+    const big = 'z'.repeat(16000); // ~4000 tokens
+    const messages = [msg('system', 'sys'), msg('user', big), msg('user', big)];
+    const out = truncateMessagesForGithub(messages);
+    expect(out[0].role).toBe('system');
+    expect(out[0].content).toBe('sys'); // system prompt preserved verbatim
+  });
+
+  it('leaves an empty message list untouched', () => {
+    expect(truncateMessagesForGithub([])).toEqual([]);
+  });
+
+  it('does not touch array (multimodal) content blocks', () => {
+    const imageMsg = { role: 'user', content: [{ type: 'image_url', image_url: { url: 'x' } }] } as any;
+    const messages = [msg('system', 'sys'), imageMsg];
+    const out = truncateMessagesForGithub(messages, 2);
+    expect(out).toBe(messages); // array content isn't truncatable text → untouched
   });
 });

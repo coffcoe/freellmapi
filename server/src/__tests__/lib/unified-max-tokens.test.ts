@@ -18,6 +18,7 @@ import {
   defaultMaxTokensFor,
   UNIFIED_MAX_TOKENS_SETTING,
   UNIFIED_MAX_TOKENS_AUTO,
+  GITHUB_MAX_OUTPUT_TOKENS,
 } from '../../lib/sampling-params.js';
 
 beforeEach(() => {
@@ -93,5 +94,36 @@ describe('resolveMaxTokens under the cap', () => {
     settingStore.set(UNIFIED_MAX_TOKENS_SETTING, '100000');
     expect(resolveMaxTokens('cloudflare', undefined)).toBe(defaultMaxTokensFor('cloudflare'));
     expect(resolveMaxTokens('groq', 16)).toBe(16);
+  });
+});
+
+describe('resolveMaxTokens github per-platform ceiling (CUSTOM-PATCHES §6.6)', () => {
+  it('clamps an aggressive client max_tokens to the github ceiling even with the operator cap off', () => {
+    // Operator cap is off by default — the github hard ceiling must still apply.
+    expect(resolveMaxTokens('github', 65536)).toBe(GITHUB_MAX_OUTPUT_TOKENS);
+    expect(resolveMaxTokens('github', 32768)).toBe(GITHUB_MAX_OUTPUT_TOKENS);
+  });
+
+  it('leaves a github request already at or below the ceiling alone', () => {
+    expect(resolveMaxTokens('github', 128)).toBe(128);
+    expect(resolveMaxTokens('github', GITHUB_MAX_OUTPUT_TOKENS)).toBe(GITHUB_MAX_OUTPUT_TOKENS);
+  });
+
+  it('still sends nothing for github when the client asked for nothing (no default floor)', () => {
+    expect(resolveMaxTokens('github', undefined)).toBeUndefined();
+  });
+
+  it('uses the tighter of the operator cap and the github ceiling', () => {
+    settingStore.set(UNIFIED_MAX_TOKENS_SETTING, String(GITHUB_MAX_OUTPUT_TOKENS + 100));
+    // operator cap higher than github ceiling → github wins
+    expect(resolveMaxTokens('github', 65536)).toBe(GITHUB_MAX_OUTPUT_TOKENS);
+    settingStore.set(UNIFIED_MAX_TOKENS_SETTING, '64');
+    // operator cap lower → operator cap wins
+    expect(resolveMaxTokens('github', 65536)).toBe(64);
+  });
+
+  it('does not clamp other platforms (no per-platform ceiling configured)', () => {
+    settingStore.clear();
+    expect(resolveMaxTokens('groq', 65536)).toBe(65536);
   });
 });
