@@ -41,9 +41,12 @@ try {
         Log "step1: no 3001 listener, skip"
     }
 
-    # 2. clean logs older than 7 days
-    Get-ChildItem $logDir -Filter "freellmapi-*.log" -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } | Remove-Item -Force -ErrorAction SilentlyContinue
+    # 2. clean logs older than 7 days (PS5.1: empty pipeline -> Remove-Item "missing path operand"; wrap in @() )
+    $oldLogs = @(Get-ChildItem $logDir -Filter "freellmapi-*.log" -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) })
+    if ($oldLogs.Count -gt 0) {
+        $oldLogs | Remove-Item -Force -ErrorAction SilentlyContinue
+    }
     Log "step2: old logs cleaned"
 
     # 3. start detached + redirect logs
@@ -54,9 +57,13 @@ try {
     $proc = Start-Process -FilePath $node -ArgumentList "server/dist/index.js" -WorkingDirectory $root -RedirectStandardOutput $outLog -RedirectStandardError $errLog -WindowStyle Hidden -PassThru
     Log "step3: Start-Process returned PID=$($proc.Id) HasExited=$($proc.HasExited)"
 
-    # 4. health check
-    Start-Sleep 5
-    $pid2 = (Get-NetTCPConnection -LocalPort 3001 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess
+    # 4. health check (allow up to 30s for first boot: migrations + catalog-sync replay can take >5s)
+    $pid2 = $null
+    for ($i = 0; $i -lt 30; $i++) {
+        Start-Sleep -Seconds 1
+        $pid2 = (Get-NetTCPConnection -LocalPort 3001 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess
+        if ($pid2) { break }
+    }
     if (-not $pid2) {
         Log "step4 FAIL: 3001 not listening, see $errLog"
         throw "start failed: 3001 not listening"
