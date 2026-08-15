@@ -1,4 +1,5 @@
 import type { ChatMessage } from '@freellmapi/shared/types.js';
+import { GITHUB_MAX_INPUT_TOKENS } from './sampling-params.js';
 
 // OpenAI-spec message content can be one of:
 //   - string                        (plain text)
@@ -110,3 +111,72 @@ export function normalizeOutboundContent<T>(payload: T): T {
   }
   return payload;
 }
+
+// Truncate a single message's string content to fit a token budget, using the
+// proxy's chars/4 estimate. Array content (multimodal / images) is left
+// untouched — we never fabricate or drop image blocks here, only trim plain
+// text. Returns the same object when nothing needs trimming.
+function truncateMessageText(m: ChatMessage, budget: number): ChatMessage {
+  if (typeof m.content !== 'string') return m;
+  const maxChars = budget * 4;
+  return m.content.length <= maxChars ? m : { ...m, content: m.content.slice(0, maxChars) };
+}
+
+/**
+ * GitHub Models enforces a hard input ceiling (~8000 tokens; a larger prompt is
+ * rejected with 413 — see CUSTOM-PATCHES §6.6). Free-relay clients often send
+ * long tool-calling histories or big pasted blocks that blow past it, and the
+ * same oversized body then rides every fallback candidate, a guaranteed 413 on
+ * each github hop. This guard trims the message list BEFORE dispatch so a
+ * github attempt actually reaches the upstream.
+ *
+ * Strategy mirrors the proxy's own token estimate (chars/4): always keep the
+ * opening system prompt (its instructions matter), then keep as many of the
+ * MOST RECENT messages as fit the budget, and finally truncate the oldest kept
+ * non-system message's text in place if a single oversized message still blows
+ * the budget. Returns a NEW array only when it changes something; returns the
+ * original array untouched when the request already fits (the common case, and
+ * the cost-free path for non-github platforms).
+ */
+export function truncateMessagesForGithub(
+  messages: ChatMessage[],
+  budget: number = GITHUB_MAX_INPUT_TOKENS,
+): ChatMessage[] {
+  if (messages.length === 0) return messages;
+  const estimate = (m: ChatMessage) => Math.ceil(contentToString(m.content).length / 4);
+  const total = messages.reduce((sum, m) => sum + estimate(m), 0);
+  if (total <= budget) return messages;
+
+  const systemIdx = messages.findIndex(m => m.role === 'system');
+  const systemMsg = systemIdx >= 0 ? messages[systemIdx] : null;
+  const rest = messages.filter((_, i) => i !== systemIdx);
+
+  const systemTokens = systemMsg ? estimate(systemMsg) : 0;
+  let kept: ChatMessage[] = [];
+  let used = systemTokens;
+  // Walk newest→oldest, keeping as many recent messages as fit under budget
+  // (the newest context is the most relevant for generation).
+  for (let i = rest.length - 1; i >= 0; i--) {
+    const est = estimate(rest[i]);
+    if (used + est > budget) {
+      // The first (newest) message we can't keep whole: if nothing has been
+      // kept yet AND this single message alone (plus the system prompt)
+      // overflows the budget, keep it truncated rather than drop the newest
+      // context entirely. Otherwise stop — everything older is dropped.
+      if (kept.length === 0 && used === systemTokens) {
+        kept.unshift(truncateMessageText(rest[i], budget - used));
+      }
+      break;
+    }
+    kept.unshift(rest[i]);
+    used += est;
+  }
+  // Guard: nothing fit alongside the system prompt — truncate the newest
+  // message so the turn is never sent with an empty body.
+  if (kept.length === 0 && rest.length > 0) {
+    const newest = rest[rest.length - 1];
+    kept = [truncateMessageText(newest, Math.max(0, budget - systemTokens))];
+  }
+  return systemMsg ? [systemMsg, ...kept] : kept;
+}
+
