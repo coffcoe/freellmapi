@@ -25,12 +25,18 @@
 //     REFERENCES clauses of every child table to the new name.
 //
 // Schema only — no catalog data.
+//
+// Column drift note: this migration rebuilds `models`, so it must carry *every*
+// column the table currently has — including columns added by migrations that
+// run AFTER it (e.g. 20260802 quota guard, 20260812 scene routing). Those are
+// derived at runtime from `PRAGMA table_info(models)` rather than hard-coded,
+// so a future ALTER downstream can never be silently dropped by this rebuild.
 
 import type { Db } from '../types.js';
 
-// The models table as of this migration, plus the new column. Written out in
-// full rather than derived, so the rebuilt schema is auditable here and
-// identical on every run.
+// The models table as of this migration, as the literal column block. Kept
+// verbatim (not derived) so the rebuilt schema is auditable here and identical
+// on every run. MUST stay in sync with BASE_COLUMN_NAMES below.
 const MODELS_COLUMNS = `
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       platform TEXT NOT NULL,
@@ -49,16 +55,41 @@ const MODELS_COLUMNS = `
       supports_vision INTEGER NOT NULL DEFAULT 0,
       key_id INTEGER,
       supports_tools INTEGER NOT NULL DEFAULT 0,
-      paid_input_per_m REAL,
-      paid_output_per_m REAL,
       source TEXT NOT NULL DEFAULT 'catalog'`;
 
-const CARRIED_COLUMNS = [
+// Names of the columns owned by this migration's "base" set. Anything not in
+// this list (and not endpoint_scope) is a column added by a later migration and
+// must be carried through the rebuild too.
+const BASE_COLUMN_NAMES = [
   'id', 'platform', 'model_id', 'display_name', 'intelligence_rank', 'speed_rank',
   'size_label', 'rpm_limit', 'rpd_limit', 'tpm_limit', 'tpd_limit',
   'monthly_token_budget', 'context_window', 'enabled', 'supports_vision', 'key_id',
-  'supports_tools', 'paid_input_per_m', 'paid_output_per_m', 'source',
-].join(', ');
+  'supports_tools', 'source',
+];
+
+interface ColumnInfo {
+  name: string;
+  type: string;
+  notnull: number;
+  dflt_value: string | null;
+}
+
+// Rebuild the column definition exactly as SQLite stores it in sqlite_master, so
+// the rebuilt table's schema SQL matches the one produced by the upstream ALTER
+// chain (and therefore the recorded schema string used by tests).
+function columnDefinition(col: ColumnInfo): string {
+  let def = `${col.name} ${col.type}`;
+  if (col.notnull === 1) def += ' NOT NULL';
+  if (col.dflt_value !== null && col.dflt_value !== undefined) def += ` DEFAULT ${col.dflt_value}`;
+  return def;
+}
+
+// Columns present on `models` that are neither the base set nor endpoint_scope
+// — i.e. columns added by migrations that run after this one.
+function extraColumnsOf(db: Db): ColumnInfo[] {
+  const all = db.prepare('PRAGMA table_info(models)').all() as ColumnInfo[];
+  return all.filter(c => !BASE_COLUMN_NAMES.includes(c.name) && c.name !== 'endpoint_scope');
+}
 
 // Tables whose rows must survive the DROP. Discovered from the schema rather
 // than hard-coded, so a table added later that references models is carried too.
@@ -74,7 +105,8 @@ function childTablesOfModels(db: Db): string[] {
     .map(t => t.name);
 }
 
-function rebuildModels(db: Db, extraColumns: string, copiedColumns: string, unique: string): void {
+function rebuildModels(db: Db, opts: { dropEndpointScope: boolean; unique: string }): void {
+  const extras = extraColumnsOf(db);
   const children = childTablesOfModels(db);
   // AUTOINCREMENT's high-water mark. DROP TABLE takes the sqlite_sequence row
   // with it, and copying rows back only pushes the counter to the highest id
@@ -84,20 +116,46 @@ function rebuildModels(db: Db, extraColumns: string, copiedColumns: string, uniq
   // then silently adopt an unrelated new one.
   const seqRow = db.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'models'")
     .get() as { seq: number } | undefined;
+
+  // endpoint_scope (when kept) and every later-added column are emitted on a
+  // single inline line right after the base block, mirroring the format
+  // SQLite itself produces when ALTER ADD COLUMN appends to this table.
+  const inlineTail: string[] = [];
+  if (!opts.dropEndpointScope) inlineTail.push("endpoint_scope TEXT NOT NULL DEFAULT ''");
+  inlineTail.push(...extras.map(columnDefinition));
+  const colBlock = `${MODELS_COLUMNS},\n      ${inlineTail.join(', ')}`;
+
+  // Columns copied verbatim from the old table: all base columns plus any later
+  // additions. endpoint_scope is never copied (it is re-derived via backfill in
+  // up(), and dropped entirely in down()).
+  const copyColumns = [...BASE_COLUMN_NAMES, ...extras.map(c => c.name)].join(', ');
+
   for (const child of children) {
     db.exec(`CREATE TEMP TABLE "_endpoint_identity_${child}" AS SELECT * FROM "${child}"`);
     db.exec(`DELETE FROM "${child}"`);
   }
 
-  db.exec(`
-    CREATE TABLE models_endpoint_identity (${MODELS_COLUMNS}${extraColumns},
-      ${unique}
-    );
-    INSERT INTO models_endpoint_identity (${copiedColumns})
-      SELECT ${copiedColumns} FROM models;
-    DROP TABLE models;
-    ALTER TABLE models_endpoint_identity RENAME TO models;
-  `);
+  if (opts.dropEndpointScope) {
+    db.exec(`
+      CREATE TABLE models_endpoint_identity (${colBlock},
+        ${opts.unique}
+      );
+      INSERT INTO models_endpoint_identity (${copyColumns})
+        SELECT ${copyColumns} FROM models;
+      DROP TABLE models;
+      ALTER TABLE models_endpoint_identity RENAME TO models;
+    `);
+  } else {
+    db.exec(`
+      CREATE TABLE models_endpoint_identity (${colBlock},
+        ${opts.unique}
+      );
+      INSERT INTO models_endpoint_identity (${copyColumns}, endpoint_scope)
+        SELECT ${copyColumns}, '' FROM models;
+      DROP TABLE models;
+      ALTER TABLE models_endpoint_identity RENAME TO models;
+    `);
+  }
 
   if (seqRow) {
     // sqlite_sequence has no unique index, so no upsert: update the row the
@@ -117,12 +175,7 @@ function rebuildModels(db: Db, extraColumns: string, copiedColumns: string, uniq
 }
 
 export function up(db: Db): void {
-  rebuildModels(
-    db,
-    `,\n      endpoint_scope TEXT NOT NULL DEFAULT ''`,
-    CARRIED_COLUMNS,
-    'UNIQUE(platform, model_id, endpoint_scope)',
-  );
+  rebuildModels(db, { dropEndpointScope: false, unique: 'UNIQUE(platform, model_id, endpoint_scope)' });
 
   // Backfill: a custom row's scope is the base_url of the key it is bound to.
   // Rows whose key is gone (or that predate per-endpoint binding) keep '' —
@@ -161,5 +214,5 @@ export function down(db: Db): void {
   }
 
   db.exec('DROP INDEX IF EXISTS idx_models_endpoint_scope;');
-  rebuildModels(db, '', CARRIED_COLUMNS, 'UNIQUE(platform, model_id)');
+  rebuildModels(db, { dropEndpointScope: true, unique: 'UNIQUE(platform, model_id)' });
 }
