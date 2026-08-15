@@ -110,9 +110,88 @@ export function logRequest(
     tx();
 
     pruneRequestAnalytics({ db });
+
+    // Best-effort tracker notification (CUSTOM-PATCHES §3.4): fire-and-forget
+    // a non-blocking POST to the local token tracker when a request succeeded
+    // and actually consumed tokens, so quota provenance has a live source.
+    // Runs AFTER the durable DB write and off the request's latency path;
+    // never throws (see notifyTracker). Defaults to the historical
+    // http://localhost:3003/api/log tracker, overridable via TOKEN_TRACKER_URL.
+    if (status === 'success' && inputTokens + outputTokens > 0) {
+      notifyTracker({ platform, modelId, keyId, inputTokens, outputTokens, clientTag: client.agent ?? null });
+    }
   } catch (e) {
     console.error('Failed to log request:', e);
   }
+}
+
+// ── Token tracker notification (P2-a) ───────────────────────────────────────
+// A lightweight, zero-dependency fan-out to an external usage tracker (the
+// historical localhost:3003 Flask tracker.py, CUSTOM-PATCHES §3.4). It lets
+// quota investigation attribute auto traffic to its source without polling the
+// DB. Deliberately non-blocking and best-effort:
+//   - fired asynchronously, NOT awaited, so the request path never waits on it;
+//   - a 300ms timeout bounds how long the socket may hang before it's dropped;
+//   - every failure (unreachable host, timeout, malformed body) is swallowed —
+//     a missing tracker must not break or slow the relay;
+//   - disabled entirely when TOKEN_TRACKER_URL is set to '' / 'off'.
+// The tracker is an external component and not required for the relay to work.
+const TRACKER_URL_ENV = 'TOKEN_TRACKER_URL';
+const DEFAULT_TRACKER_URL = 'http://localhost:3003/api/log';
+const TRACKER_TIMEOUT_MS = 300;
+
+function trackerUrl(): string | null {
+  const raw = process.env[TRACKER_URL_ENV];
+  if (raw === undefined) return DEFAULT_TRACKER_URL;
+  const v = raw.trim();
+  return v === '' || v.toLowerCase() === 'off' ? null : v;
+}
+
+export interface TrackerPayload {
+  platform: string;
+  modelId: string;
+  keyId: number | null;
+  inputTokens: number;
+  outputTokens: number;
+  clientTag: string | null;
+}
+
+/** Test seam: snapshot of the env override so tests can assert the effective
+ *  URL is read from TOKEN_TRACKER_URL (or the default) without hitting the
+ *  network. */
+export function effectiveTrackerUrl(): string | null {
+  return trackerUrl();
+}
+
+/** Fire-and-forget POST to the token tracker. Never throws; a timeout or any
+ *  network error is swallowed so the caller's flow is never disturbed. Exported
+ *  for tests, which pass an injectable `send` to assert the payload/headers
+ *  without real HTTP. */
+export function notifyTracker(
+  payload: TrackerPayload,
+  send: (url: string, body: string, signal: AbortSignal) => Promise<unknown> = (url, body, signal) =>
+    fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body, signal }),
+): void {
+  const url = trackerUrl();
+  if (url === null) return;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TRACKER_TIMEOUT_MS);
+  const body = JSON.stringify({
+    platform: payload.platform,
+    model: payload.modelId,
+    keyId: payload.keyId,
+    inputTokens: payload.inputTokens,
+    outputTokens: payload.outputTokens,
+    totalTokens: payload.inputTokens + payload.outputTokens,
+    clientTag: payload.clientTag,
+    ts: new Date().toISOString(),
+  });
+  // Fire-and-forget: we intentionally do not await. Errors and aborts are
+  // swallowed so a dead tracker can't surface anywhere on the relay.
+  void Promise.resolve()
+    .then(() => send(url, body, controller.signal))
+    .catch(() => {})
+    .finally(() => clearTimeout(timer));
 }
 
 // Persist a finished attempt trace as one small insert batch keyed to the
