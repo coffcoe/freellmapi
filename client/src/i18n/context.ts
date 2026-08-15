@@ -1,5 +1,5 @@
 import { createContext, useContext } from 'react'
-import { DEFAULT_LOCALE, type Locale } from './locale-config'
+import { DEFAULT_LOCALE, type Locale } from './I18nProvider'
 
 export interface I18nContextValue {
   locale: Locale
