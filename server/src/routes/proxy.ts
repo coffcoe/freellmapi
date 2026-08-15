@@ -4,6 +4,7 @@ import type { Request, Response } from 'express';
 import { z } from 'zod';
 import type { ChatMessage, ChatToolCall, ModelListRow, TokenUsage } from '@freellmapi/shared/types.js';
 import { routeRequest, resolveRoutingChain, resolveModelGroupCandidates, resolveStickyPreference, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, hasEnabledToolsModel, hasOtherUsableKey, routingReserveTokens, type RouteResult, type ResolvedChain, type ChainRow } from '../services/router.js';
+import { detectScene, normalizeNetworkTier } from '../lib/scene.js';
 import { recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit, PAYMENT_REQUIRED_COOLDOWN_MS, MODEL_FORBIDDEN_COOLDOWN_MS, learnLimitFromError } from '../services/ratelimit.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
 import { runImageGeneration, runSpeech, runTranscription, MediaError, MAX_TRANSCRIPTION_BYTES } from '../services/media.js';
@@ -1775,6 +1776,13 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   // here is /chat/completions-specific: the response-cache MISS store, the
   // context-handoff injection, group/unified-chain routing, and the OpenAI
   // stream turn-integrity framing.
+  // Scene-routing (C1): derive the client's scene from the request messages +
+  // X-Network-Tier header ONCE here so every retry sees the same scene. Folded
+  // into the router's chain ordering via routeRequest's scene argument; an
+  // empty scene is a no-op.
+  const scene = isAutoModel(requestedModel)
+    ? detectScene(messages, wantsTools, normalizeNetworkTier(req.headers['x-network-tier']))
+    : undefined;
   const state = newFallbackState();
   const attemptLog: AttemptRecord[] = [];
   // Client-disconnect fan-out: the flag stops the loop before the NEXT
