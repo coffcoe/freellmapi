@@ -138,6 +138,14 @@ export type Platform =
   // aihorde.net key raises queue priority. Has a dedicated AIHordeProvider that
   // normalizes the proxy's OpenAI divergences. See issue #345.
   | 'aihorde'
+  // Cline.bot — OpenAI-compatible gateway offering 1M context free models.
+  // Free tier requires registration at app.cline.bot (no card required).
+  // Models: minimax-m3, mimo-v2.5, deepseek-v4-flash.
+  | 'cline'
+  // ModelScope (魔搭社区) — OpenAI-compatible inference API.
+  // Free tier: 2000 requests/day (no card), requires Alibaba Cloud account + real-name verification.
+  // API: https://api-inference.modelscope.cn/v1
+  | 'modelscope'
   // User-configured OpenAI-compatible endpoint (llama.cpp, LM Studio, vLLM,
   // Ollama, any base_url). The endpoint URL lives on the api_keys row; see #117.
   | 'custom';

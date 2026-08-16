@@ -115,6 +115,28 @@ describe('applyCatalog', () => {
     expect(fb).toBeTruthy();
   });
 
+  it('infers and writes models.category from catalog capability + name hints (TD-027)', () => {
+    const models = existingAsCatalogModels();
+    // Vision flag outranks everything.
+    models.push(baseModel({ modelId: 'vision-capable', displayName: 'Vision Model', supportsVision: true, supportsTools: false }));
+    // Tool-capable with no stronger hint -> function-calling.
+    models.push(baseModel({ modelId: 'tool-model', displayName: 'Tool Model', supportsVision: false, supportsTools: true }));
+    // No hint at all -> category stays NULL (never guessed).
+    models.push(baseModel({ modelId: 'plain-model', displayName: 'Plain Model', supportsVision: false, supportsTools: false }));
+
+    applyCatalog(getDb(), catalogOf(models));
+
+    const cat = (modelId: string) => {
+      const r = getDb()
+        .prepare("SELECT category FROM models WHERE platform = 'groq' AND model_id = ?")
+        .get(modelId) as { category: string | null };
+      return r.category;
+    };
+    expect(cat('vision-capable')).toBe('vision');
+    expect(cat('tool-model')).toBe('function-calling');
+    expect(cat('plain-model')).toBeNull();
+  });
+
   it('caps GitHub GPT-4.1 catalog context at the routable free-tier limit (#426)', () => {
     const models = existingAsCatalogModels();
     const target = models.find((m) => m.platform === 'github' && m.modelId === 'openai/gpt-4.1');
@@ -296,6 +318,69 @@ describe('applyCatalog', () => {
     expect(all.map((q) => q.slug)).toEqual(['fresh-quirk']);
     const targets = getDb().prepare('SELECT platform, model_glob FROM quirk_targets').all();
     expect(targets).toEqual([{ platform: 'groq', model_glob: null }]);
+  });
+
+  // TD-027: models.category was never populated by the catalog, leaving the
+  // scene router's L2 layer dead for coding/audio. applyCatalog must derive a
+  // category from the metadata it already carries (capability flags + id/name
+  // hints), and leave un-inferable rows NULL — never invent a default.
+  it('derives models.category from catalog metadata (TD-027)', () => {
+    const models = existingAsCatalogModels();
+    models.push(baseModel({
+      modelId: 'qwen/qwen3-coder:free',
+      displayName: 'Qwen3 Coder (free)',
+      supportsVision: false,
+      supportsTools: true,
+    }));
+    models.push(baseModel({
+      platform: 'openrouter',
+      modelId: 'whisper-large-v3',
+      displayName: 'Whisper Large v3',
+      supportsVision: false,
+      supportsTools: false,
+    }));
+    models.push(baseModel({
+      platform: 'openrouter',
+      modelId: 'gemma-4-31b',
+      displayName: 'Gemma 4 31B',
+      supportsVision: false,
+      supportsTools: false,
+    }));
+    applyCatalog(getDb(), catalogOf(models));
+
+    const rows = getDb().prepare(`
+      SELECT model_id, category FROM models
+       WHERE model_id IN ('qwen/qwen3-coder:free', 'whisper-large-v3', 'gemma-4-31b')
+       ORDER BY model_id
+    `).all() as { model_id: string; category: string | null }[];
+    const byId = Object.fromEntries(rows.map(r => [r.model_id, r.category]));
+
+    // Code-tuned family -> coding; audio-capable family -> audio.
+    expect(byId['qwen/qwen3-coder:free']).toBe('coding');
+    expect(byId['whisper-large-v3']).toBe('audio');
+    // No strong signal -> stays NULL (never guessed).
+    expect(byId['gemma-4-31b']).toBeNull();
+  });
+
+  it('backfills category on pre-existing NULL catalog rows (TD-027)', () => {
+    // Force a known code-tuned row to NULL, simulating a legacy DB that
+    // predates inference; applyCatalog's backfill pass must restore it.
+    getDb().prepare("UPDATE models SET category = NULL WHERE model_id = 'qwen/qwen3-coder:free'").run();
+    applyCatalog(getDb(), catalogOf(existingAsCatalogModels()));
+
+    const row = getDb().prepare("SELECT category FROM models WHERE model_id = 'qwen/qwen3-coder:free'").get() as { category: string | null };
+    expect(row.category).toBe('coding');
+  });
+
+  it('does not touch user-owned rows when backfilling category (TD-027)', () => {
+    getDb().prepare(`
+      INSERT INTO models (platform, model_id, display_name, intelligence_rank, speed_rank, size_label, enabled, source, category)
+      VALUES ('groq', 'user-model', 'User Model', 50, 50, 'User', 1, 'user', NULL)
+    `).run();
+    applyCatalog(getDb(), catalogOf(existingAsCatalogModels()));
+
+    const row = getDb().prepare("SELECT category FROM models WHERE model_id = 'user-model'").get() as { category: string | null };
+    expect(row.category).toBeNull();
   });
 });
 

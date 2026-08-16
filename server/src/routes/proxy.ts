@@ -361,28 +361,6 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
   });
 });
 
-/** Detect the best category scene from request content for soft routing preference. */
-function detectCategoryScene(messages: any[], hasTools: boolean): string | null {
-  if (hasTools) return 'coding'; // tools tend to pair with code-capable models; routeRequest handles requireTools
-  for (const msg of messages) {
-    if (!msg.content) continue;
-    const blocks = Array.isArray(msg.content) ? msg.content : [msg.content];
-    for (const part of blocks) {
-      if (typeof part === 'object' && part !== null) {
-        if (part.type === 'image_url' || part.type === 'image') return 'vision';
-        if (part.type === 'input_audio') return 'audio';
-      }
-      const text: string = typeof part === 'string' ? part : (part?.text ?? '');
-      if (!text) continue;
-      const t = text.toLowerCase();
-      if (/\b(write|implement|refactor|debug|fix)\b/.test(t) && /\b(code|function|class|method|module)\b/.test(t) ||
-          t.includes('编程') || t.includes('写代码') || t.includes('实现算法') || t.includes('重构')) return 'coding';
-      if (/\b(reason about|analyze|deduce|why.*happen|explain.*mechanism)\b/.test(t) ||
-          t.includes('推理') || t.includes('逻辑分析')) return 'reasoning';
-    }
-  }
-  return null;
-}
 
 const MAX_RETRIES = 20;
 
@@ -998,6 +976,9 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
   // Legacy /completions is a thin adapter over the shared fallback loop
   // (lib/fallback-loop.ts): the cooldown/skip/penalty/exhaustion machinery is
   // shared; only the text_completion request/stream translation lives here.
+  const scene = isAutoModel(requestedModel)
+    ? detectScene(messages, false, normalizeNetworkTier(req.headers['x-network-tier']))
+    : undefined;
   await runFallbackLoop({
     maxRetries: MAX_RETRIES,
     state,
@@ -1014,6 +995,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
       groupChain ?? resolvedChain?.chain,
       false,
       state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined,
+      scene,
     ),
     dispatch: async (route, attempt, ctx) => {
       traceRouteEvent('Proxy', {
@@ -1024,6 +1006,14 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
         model: route.modelId,
         requestedModel: attempt === 0 ? requestedModelLabel : undefined,
       });
+
+      // GitHub input guardrail (CUSTOM-PATCHES §6.6): GitHub Models 413s on
+      // inputs above ~8000 tokens. Truncate the legacy completion's messages
+      // to GITHUB_MAX_INPUT_TOKENS before dispatch when routed to github; a
+      // no-op (same array) for other platforms / small inputs.
+      const dispatchMessages = route.platform === 'github'
+        ? truncateMessagesForGithub(messages)
+        : messages;
 
       if (stream) {
         let totalOutputTokens = 0;
@@ -1055,7 +1045,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
         try {
           const gen = route.provider.streamChatCompletion(
             route.apiKey,
-            messages,
+            dispatchMessages,
             route.modelId,
             { temperature, max_tokens, top_p, stop, signal: AbortSignal.any([clientAbort.signal, hedgeAbort.signal]) },
             quotaContextForRoute(route, 'chat/completions'),
@@ -1155,7 +1145,7 @@ proxyRouter.post('/completions', async (req: Request, res: Response) => {
 
       const result = await route.provider.chatCompletion(
         route.apiKey,
-        messages,
+        dispatchMessages,
         route.modelId,
         { temperature, max_tokens, top_p, stop, signal: AbortSignal.any([clientAbort.signal, hedgeAbort.signal]) },
         quotaContextForRoute(route, 'chat/completions'),
@@ -1677,22 +1667,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   if (isAutoModel(requestedModel)) {
     resolvedChain = resolveRoutingChain(requestedModel);
     strategyKey = resolvedChain.strategyKey;
-
-    // Scene-aware category reorder: when auto-routing and the request hints at a
-    // specific use-case, promote models in that category to the front of the chain.
-    // This is a "soft" preference — the full chain is still available as fallback.
-    const scene = detectCategoryScene(messages, wantsTools);
-    if (scene && resolvedChain.chain.length > 0) {
-      const db = getDb();
-      const placeholders = resolvedChain.chain.map(() => '?').join(',');
-      const dbIds = resolvedChain.chain.map(e => e.model_db_id);
-      const categories = db.prepare(
-        `SELECT id, category FROM models WHERE id IN (${placeholders})`
-      ).all(...dbIds) as { id: number; category: string | null }[];
-      const catMap = new Map(categories.map(c => [c.id, c.category]));
-      const boost = (e: ChainRow) => catMap.get(e.model_db_id) === scene ? 1 : 0;
-      resolvedChain.chain.sort((a, b) => boost(b) - boost(a));
-    }
   }
 
   // Context handoff only applies to auto-routed requests. Pinned-model requests
@@ -1856,7 +1830,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
       // model is on record). Turns where injection can't happen — every turn 1, and
       // sessions that never switched — pay no headroom tax.
       const routingEstimate = handoffPossible ? estimatedTotal + HANDOFF_MAX_TOKENS : estimatedTotal;
-      return routeRequest(routingEstimate, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain ?? resolvedChain?.chain, samplingParams.response_format !== undefined, state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined);
+      return routeRequest(routingEstimate, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain ?? resolvedChain?.chain, samplingParams.response_format !== undefined, state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined, scene);
     },
     dispatch: async (route, attempt, ctx) => {
     const modelKey = `${route.platform}:${route.modelId}`;
@@ -1892,6 +1866,16 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
     const rememberedReasoning = rememberedReasoningFor(reasoningSessionKey, modelKey);
     if (rememberedReasoning) {
       outboundMessages = restoreSessionReasoning(outboundMessages, rememberedReasoning, route.platform);
+    }
+
+    // GitHub input guardrail (CUSTOM-PATCHES §6.6): GitHub Models rejects
+    // inputs above ~8000 tokens with a 413, and the same oversized body would
+    // then ride every fallback candidate. Truncate the outbound copy to
+    // GITHUB_MAX_INPUT_TOKENS before dispatch so a github attempt reaches the
+    // upstream. No-op (returns the same array) when the request already fits or
+    // the platform isn't github, so non-github hops pay nothing.
+    if (route.platform === 'github') {
+      outboundMessages = truncateMessagesForGithub(outboundMessages);
     }
 
       if (stream) {
@@ -1956,8 +1940,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
           choices: [{ index: 0, delta, finish_reason: finish }],
         });
         const writeChunk = (c: unknown) => res.write(`data: ${JSON.stringify(c)}\n\n`);
-
-        let truncated = false; // set when the streaming budget cap trips mid-stream
 
         try {
           const gen = route.provider.streamChatCompletion(
@@ -2064,14 +2046,6 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             // analytics and rate-limit reflect real consumption of thinking
             // models (a chunk can carry both reasoning and text).
             totalOutputTokens += Math.ceil((text.length + reasoning.length) / 4);
-
-            // ── 策略 24 护栏：流内 token 预算提前截断（early stop） ──
-            // 累计输出 + 输入超预算即中止生成，避免单请求无限膨胀（与 413
-            // 预检互补：此处覆盖"边生成边超"的运行时场景）。
-            if (budget > 0 && estimatedInputTokens + injectedHandoffTokens + totalOutputTokens > budget) {
-              truncated = true;
-              break;
-            }
 
             if (mode === 'passthrough') {
               writeChunk({ ...anyChunk, choices: [{ ...choice, delta: { ...choice.delta, tool_calls: undefined }, finish_reason: null }] });

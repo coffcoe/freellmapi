@@ -262,31 +262,16 @@ export function createApp(config?: Config) {
   app.use('/v1/t/:token', createProxyRateLimiter(cfg.proxyRateLimitRpm));
   app.use('/v1/t/:token', urlTokenRouter);
 
-  // Per-IP rate limiting (#35 item #6) runs first so it throttles
-  // unauthenticated brute-force / flood attempts before any routing work.
-  // Tune via PROXY_RATE_LIMIT_RPM; 0 disables it.
+  // OpenAI-compatible proxy. Per-IP rate limiting (#35 item #6) runs first so
+  // it throttles unauthenticated brute-force / flood attempts before any
+  // routing work. Tune via PROXY_RATE_LIMIT_RPM; 0 disables it.
   app.use('/v1', createProxyRateLimiter(cfg.proxyRateLimitRpm));
-
   // Anthropic-compatible Messages API (`POST /v1/messages`, `/count_tokens`) for
   // Claude Code and anything else speaking the Anthropic SDK. Mounted BEFORE the
   // OpenAI router so it can content-negotiate `GET /v1/models` (Anthropic shape
   // when the caller sends `anthropic-version`, else it falls through). All other
   // paths it doesn't own fall through to the OpenAI router untouched.
   app.use('/v1', anthropicRouter);
-
-  // OpenAPI spec (static JSON) — must be BEFORE /v1 middleware to avoid being caught
-  app.get('/v1/openapi.json', (_req, res) => {
-    res.sendFile(path.resolve(__dirname, 'docs/openapi.json'));
-  });
-
-  // Swagger UI (served from CDN — zero server-side dependencies)
-  app.get('/v1/docs', (_req, res) => {
-    res.sendFile(path.resolve(__dirname, 'docs/swagger-ui.html'));
-  });
-
-  // OpenAI-compatible proxy. The new middleware chain is built with feature
-  // flags so each piece can be toggled independently.
-  app.use('/v1', ...buildProxyMiddlewareChain());
   app.use('/v1', proxyRouter);
   // OpenAI Responses API shim (Codex CLI requires wire_api="responses"; see #96)
   app.use('/v1', responsesRouter);

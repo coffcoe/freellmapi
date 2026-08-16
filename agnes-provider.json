@@ -1,0 +1,13 @@
+{
+  "customProviders": [
+    {
+      "baseUrl": "https://apihub.agnes-ai.cn/v1",
+      "apiKey": "<REPLACE_WITH_AGNES_API_KEY>",
+      "label": "Agnes AI",
+      "models": [
+        {"model": "agnes-2.5-flash", "displayName": "Agnes 2.5 Flash", "supportsTools": true, "supportsVision": false},
+        {"model": "agnes-2.0-flash", "displayName": "Agnes 2.0 Flash", "supportsTools": true, "supportsVision": false}
+      ]
+    }
+  ]
+}

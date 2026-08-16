@@ -40,8 +40,6 @@ export class CohereProvider extends BaseProvider {
     options?: CompletionOptions,
     quotaContext?: QuotaObservationContext,
   ): Promise<ChatCompletionResponse> {
-    // Build body defensively: skip null/undefined values to avoid sending
-    // null primitives to strict providers
     const body: Record<string, unknown> = {
       model: modelId,
       messages: flattenMessageContent(messages),
@@ -53,13 +51,6 @@ export class CohereProvider extends BaseProvider {
       tool_choice: options?.tool_choice,
       ...extendedBodyParams(this.platform, options),
     };
-    if (options?.temperature != null) body.temperature = options.temperature;
-    if (options?.max_tokens != null) body.max_tokens = options.max_tokens;
-    if (options?.top_p != null) body.top_p = options.top_p;
-    if (options?.stop != null) body.stop = options.stop;
-    const sanitizedTools = sanitizeCohereTools(options?.tools);
-    if (sanitizedTools != null && sanitizedTools.length > 0) body.tools = sanitizedTools;
-    if (options?.tool_choice != null) body.tool_choice = options.tool_choice;
 
     const res = await this.fetchWithTimeout(`${API_BASE}/chat/completions`, {
       method: 'POST',
@@ -109,13 +100,6 @@ export class CohereProvider extends BaseProvider {
       ...extendedBodyParams(this.platform, options),
       stream: true,
     };
-    if (options?.temperature != null) body.temperature = options.temperature;
-    if (options?.max_tokens != null) body.max_tokens = options.max_tokens;
-    if (options?.top_p != null) body.top_p = options.top_p;
-    if (options?.stop != null) body.stop = options.stop;
-    const sanitizedTools = sanitizeCohereTools(options?.tools);
-    if (sanitizedTools != null && sanitizedTools.length > 0) body.tools = sanitizedTools;
-    if (options?.tool_choice != null) body.tool_choice = options.tool_choice;
 
     const res = await this.fetchWithTimeout(`${API_BASE}/chat/completions`, {
       method: 'POST',

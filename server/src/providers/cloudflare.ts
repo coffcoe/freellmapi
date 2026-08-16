@@ -59,19 +59,6 @@ export class CloudflareProvider extends BaseProvider {
     const { accountId, token } = this.parseKey(apiKey);
     const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/v1/chat/completions`;
 
-    // Build body defensively: skip null/undefined values
-    const body: Record<string, unknown> = {
-      model: modelId,
-      messages: this.normalizeMessages(messages),
-    };
-    if (options?.temperature != null) body.temperature = options.temperature;
-    if (options?.max_tokens != null) body.max_tokens = options.max_tokens;
-    if (options?.top_p != null) body.top_p = options.top_p;
-    if (options?.stop != null) body.stop = options.stop;
-    if (options?.tools != null && options.tools.length > 0) body.tools = options.tools;
-    if (options?.tool_choice != null) body.tool_choice = options.tool_choice;
-    if (options?.parallel_tool_calls != null) body.parallel_tool_calls = options.parallel_tool_calls;
-
     const res = await this.fetchWithTimeout(url, {
       method: 'POST',
       headers: {
@@ -127,20 +114,6 @@ export class CloudflareProvider extends BaseProvider {
   ): AsyncGenerator<ChatCompletionChunk> {
     const { accountId, token } = this.parseKey(apiKey);
     const url = `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/v1/chat/completions`;
-
-    // Build body defensively: skip null/undefined values
-    const body: Record<string, unknown> = {
-      model: modelId,
-      messages: this.normalizeMessages(messages),
-      stream: true,
-    };
-    if (options?.temperature != null) body.temperature = options.temperature;
-    if (options?.max_tokens != null) body.max_tokens = options.max_tokens;
-    if (options?.top_p != null) body.top_p = options.top_p;
-    if (options?.stop != null) body.stop = options.stop;
-    if (options?.tools != null && options.tools.length > 0) body.tools = options.tools;
-    if (options?.tool_choice != null) body.tool_choice = options.tool_choice;
-    if (options?.parallel_tool_calls != null) body.parallel_tool_calls = options.parallel_tool_calls;
 
     const res = await this.fetchWithTimeout(url, {
       method: 'POST',
