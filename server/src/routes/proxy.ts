@@ -361,6 +361,28 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
   });
 });
 
+/** Detect the best category scene from request content for soft routing preference. */
+function detectCategoryScene(messages: any[], hasTools: boolean): string | null {
+  if (hasTools) return 'coding'; // tools tend to pair with code-capable models; routeRequest handles requireTools
+  for (const msg of messages) {
+    if (!msg.content) continue;
+    const blocks = Array.isArray(msg.content) ? msg.content : [msg.content];
+    for (const part of blocks) {
+      if (typeof part === 'object' && part !== null) {
+        if (part.type === 'image_url' || part.type === 'image') return 'vision';
+        if (part.type === 'input_audio') return 'audio';
+      }
+      const text: string = typeof part === 'string' ? part : (part?.text ?? '');
+      if (!text) continue;
+      const t = text.toLowerCase();
+      if (/\b(write|implement|refactor|debug|fix)\b/.test(t) && /\b(code|function|class|method|module)\b/.test(t) ||
+          t.includes('编程') || t.includes('写代码') || t.includes('实现算法') || t.includes('重构')) return 'coding';
+      if (/\b(reason about|analyze|deduce|why.*happen|explain.*mechanism)\b/.test(t) ||
+          t.includes('推理') || t.includes('逻辑分析')) return 'reasoning';
+    }
+  }
+  return null;
+}
 
 const MAX_RETRIES = 20;
 
@@ -1655,6 +1677,22 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   if (isAutoModel(requestedModel)) {
     resolvedChain = resolveRoutingChain(requestedModel);
     strategyKey = resolvedChain.strategyKey;
+
+    // Scene-aware category reorder: when auto-routing and the request hints at a
+    // specific use-case, promote models in that category to the front of the chain.
+    // This is a "soft" preference — the full chain is still available as fallback.
+    const scene = detectCategoryScene(messages, wantsTools);
+    if (scene && resolvedChain.chain.length > 0) {
+      const db = getDb();
+      const placeholders = resolvedChain.chain.map(() => '?').join(',');
+      const dbIds = resolvedChain.chain.map(e => e.model_db_id);
+      const categories = db.prepare(
+        `SELECT id, category FROM models WHERE id IN (${placeholders})`
+      ).all(...dbIds) as { id: number; category: string | null }[];
+      const catMap = new Map(categories.map(c => [c.id, c.category]));
+      const boost = (e: ChainRow) => catMap.get(e.model_db_id) === scene ? 1 : 0;
+      resolvedChain.chain.sort((a, b) => boost(b) - boost(a));
+    }
   }
 
   // Context handoff only applies to auto-routed requests. Pinned-model requests
@@ -1919,6 +1957,8 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         });
         const writeChunk = (c: unknown) => res.write(`data: ${JSON.stringify(c)}\n\n`);
 
+        let truncated = false; // set when the streaming budget cap trips mid-stream
+
         try {
           const gen = route.provider.streamChatCompletion(
             route.apiKey, outboundMessages, route.modelId,
@@ -2024,6 +2064,14 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             // analytics and rate-limit reflect real consumption of thinking
             // models (a chunk can carry both reasoning and text).
             totalOutputTokens += Math.ceil((text.length + reasoning.length) / 4);
+
+            // ── 策略 24 护栏：流内 token 预算提前截断（early stop） ──
+            // 累计输出 + 输入超预算即中止生成，避免单请求无限膨胀（与 413
+            // 预检互补：此处覆盖"边生成边超"的运行时场景）。
+            if (budget > 0 && estimatedInputTokens + injectedHandoffTokens + totalOutputTokens > budget) {
+              truncated = true;
+              break;
+            }
 
             if (mode === 'passthrough') {
               writeChunk({ ...anyChunk, choices: [{ ...choice, delta: { ...choice.delta, tool_calls: undefined }, finish_reason: null }] });

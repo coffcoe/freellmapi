@@ -320,6 +320,42 @@ settingsRouter.get('/proxy', (_req: Request, res: Response) => {
   });
 });
 
+// Get the routing guardrails (策略 24 / 循环工程：反 Goodhart 护栏).
+//  - request_max_tokens_budget: 单请求 token 成本天花板 (0 = 不限制)
+//  - max_consecutive_upstream_fails: 连续上游失败断路器阈值 (0 = 不启用)
+settingsRouter.get('/guardrails', (_req: Request, res: Response) => {
+  res.json({
+    requestMaxTokensBudget: getRequestMaxTokensBudget(),
+    maxConsecutiveUpstreamFails: getMaxConsecutiveUpstreamFails(),
+  });
+});
+
+// Set the routing guardrails. Both fields optional; send either to patch.
+settingsRouter.put('/guardrails', (req: Request, res: Response) => {
+  const { requestMaxTokensBudget, maxConsecutiveUpstreamFails } = req.body as {
+    requestMaxTokensBudget?: number;
+    maxConsecutiveUpstreamFails?: number;
+  };
+  if (typeof requestMaxTokensBudget === 'number') {
+    if (!Number.isFinite(requestMaxTokensBudget) || requestMaxTokensBudget < 0) {
+      res.status(400).json({ error: { message: 'requestMaxTokensBudget must be a non-negative integer', type: 'invalid_request_error' } });
+      return;
+    }
+    setSetting(SETTING_REQUEST_MAX_TOKENS_BUDGET, String(Math.floor(requestMaxTokensBudget)));
+  }
+  if (typeof maxConsecutiveUpstreamFails === 'number') {
+    if (!Number.isFinite(maxConsecutiveUpstreamFails) || maxConsecutiveUpstreamFails < 0) {
+      res.status(400).json({ error: { message: 'maxConsecutiveUpstreamFails must be a non-negative integer', type: 'invalid_request_error' } });
+      return;
+    }
+    setSetting(SETTING_MAX_CONSECUTIVE_UPSTREAM_FAILS, String(Math.floor(maxConsecutiveUpstreamFails)));
+  }
+  res.json({
+    requestMaxTokensBudget: getRequestMaxTokensBudget(),
+    maxConsecutiveUpstreamFails: getMaxConsecutiveUpstreamFails(),
+  });
+});
+
 // Set the proxy settings. Accepts partial updates: proxyUrl, enabled, bypassPlatforms.
 settingsRouter.put('/proxy', (req: Request, res: Response) => {
   const { proxyUrl, enabled, bypassPlatforms } = req.body as {

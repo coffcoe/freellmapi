@@ -1,9 +1,6 @@
 services:
   freellmapi:
-    image: ghcr.io/tashfeenahmed/freellmapi:latest
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.io/coffcoe/freellmapi:latest
     env_file:
       - .env
     environment:

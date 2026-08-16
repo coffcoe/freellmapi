@@ -277,11 +277,30 @@ function toGeminiTools(tools?: ChatToolDefinition[]): Array<Record<string, unkno
       grounding = true;
       continue;
     }
-    functionDeclarations.push({
+    // 构建 function declaration
+    const decl: Record<string, unknown> = {
       name: t.function.name,
-      description: t.function.description,
-      parameters: sanitizeForGemini(t.function.parameters),
-    });
+    };
+    if (t.function.description) {
+      decl.description = t.function.description;
+    }
+    // 只有当 parameters 是非 null 对象时才包含
+    // Gemini 要求 parameters 必须是有效的 JSON Schema (有 type + properties)
+    // 如果 parameters 为 null/undefined/{}，则不发送该字段
+    const params = t.function.parameters;
+    if (params != null && typeof params === 'object' && !Array.isArray(params)) {
+      // 检查是否有有效的 type 字段
+      const hasValidSchema = (p: Record<string, unknown>): boolean => {
+        return typeof p.type === 'string' && p.type.length > 0;
+      };
+      if (hasValidSchema(params as Record<string, unknown>)) {
+        decl.parameters = sanitizeForGemini(params);
+      } else {
+        // parameters 存在但缺少 type 字段，不发送 parameters
+        // Gemini 会认为该函数不需要参数
+      }
+    }
+    functionDeclarations.push(decl);
   }
 
   const out: Array<Record<string, unknown>> = [];
@@ -556,6 +575,14 @@ export class GoogleProvider extends BaseProvider {
     const request = contentsForModel(modelId, translated.contents, translated.systemInstruction);
 
     const tools = toGeminiTools(options?.tools);
+    // 构建 generationConfig，跳过 null/undefined 值
+    const generationConfig: Record<string, unknown> = {};
+    if (options?.temperature != null) generationConfig.temperature = options.temperature;
+    if (options?.max_tokens != null) generationConfig.maxOutputTokens = options.max_tokens;
+    if (options?.top_p != null) generationConfig.topP = options.top_p;
+    const stopSequences = toGeminiStopSequences(options?.stop);
+    if (stopSequences != null && stopSequences.length > 0) generationConfig.stopSequences = stopSequences;
+
     const body: Record<string, unknown> = {
       contents: request.contents,
       generationConfig: {
@@ -566,8 +593,6 @@ export class GoogleProvider extends BaseProvider {
         ...toGeminiExtendedConfig(options),
       },
       tools,
-      // functionCallingConfig is only valid when real function tools are present;
-      // a grounding-only request (just google_search) must omit it. (#59)
       toolConfig: hasFunctionDeclarations(tools) ? toGeminiToolConfig(options?.tool_choice) : undefined,
     };
     if (request.systemInstruction) body.systemInstruction = request.systemInstruction;
@@ -639,6 +664,14 @@ export class GoogleProvider extends BaseProvider {
     const request = contentsForModel(modelId, translated.contents, translated.systemInstruction);
 
     const tools = toGeminiTools(options?.tools);
+    // 构建 generationConfig，跳过 null/undefined 值
+    const generationConfig: Record<string, unknown> = {};
+    if (options?.temperature != null) generationConfig.temperature = options.temperature;
+    if (options?.max_tokens != null) generationConfig.maxOutputTokens = options.max_tokens;
+    if (options?.top_p != null) generationConfig.topP = options.top_p;
+    const stopSequences = toGeminiStopSequences(options?.stop);
+    if (stopSequences != null && stopSequences.length > 0) generationConfig.stopSequences = stopSequences;
+
     const body: Record<string, unknown> = {
       contents: request.contents,
       generationConfig: {
