@@ -299,11 +299,7 @@ register(new OpenAICompatProvider({
 // ModelScope (魔搭社区) — OpenAI-compatible inference API.
 // Free tier: 2000 requests/day (no card), requires Alibaba Cloud account + real-name verification.
 // API: https://api-inference.modelscope.cn/v1
-register(new OpenAICompatProvider({
-  platform: 'modelscope',
-  name: 'ModelScope',
-  baseUrl: 'https://api-inference.modelscope.cn/v1',
-}));
+register(new ModelScopeProvider());
 
 // ── Chinese domestic providers (#922/#923/#924) ─────────────────────
 // Plain OpenAI-compatible Bearer endpoints, so no dedicated provider class
