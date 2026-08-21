@@ -85,7 +85,9 @@ import ka from './locales/ka.json'
 import ptPT from './locales/pt-PT.json'
 import zhTW from './locales/zh-TW.json'
 
-export const SUPPORTED_LOCALES = [
+// Use Set instead of Array to prevent Vite 8 from optimizing to string.split()
+// which corrupts hyphenated locale codes like zh-CN -> zh, CN
+export const SUPPORTED_LOCALES: ReadonlySet<string> = new Set([
   'en', 'zh-CN', 'zh-TW', 'fr', 'es', 'pt-BR', 'pt-PT', 'it',
   'de', 'ja', 'ko', 'ru', 'ar', 'hi', 'tr', 'pl', 'nl', 'sv',
   'da', 'no', 'fi', 'cs', 'hu', 'ro', 'th', 'vi', 'id', 'ms',
@@ -93,10 +95,12 @@ export const SUPPORTED_LOCALES = [
   'ta', 'te', 'pa', 'or', 'si', 'ne', 'my', 'km', 'el', 'bg',
   'hr', 'sk', 'sr', 'lt', 'az', 'uz', 'sw', 'ha', 'yo', 'ig',
   'am', 'ka',
-] as const
-export type Locale = (typeof SUPPORTED_LOCALES)[number]
+])
+// Keep array for indexOf/toggleLocale usage
+const _SUPPORTED_LOCALES_ARRAY = Array.from(SUPPORTED_LOCALES) as readonly string[]
 
-export const DEFAULT_LOCALE: Locale = 'zh-CN'
+export type Locale = (typeof _SUPPORTED_LOCALES_ARRAY)[number]
+export const DEFAULT_LOCALE: Locale = 'en'
 
 // `navigator.language` returns values like `zh`, `zh-CN`, `fr-CA`, `pt-BR`,
 // `es-419`, `en-US`. We snap to the closest supported locale (match on the
@@ -175,7 +179,7 @@ function detectLocale(): Locale {
   const stored = window.localStorage.getItem('freellmapi.locale')
   // Only use stored locale if browser language is NOT detected
   // This ensures Chinese browser users always get Chinese UI
-  if (stored && (SUPPORTED_LOCALES as readonly string[]).includes(stored) && !browserLocale) {
+  if (stored && SUPPORTED_LOCALES.has(stored) && !browserLocale) {
     return stored as Locale
   }
 
@@ -232,7 +236,8 @@ export interface I18nProviderProps {
 }
 
 export function I18nProvider({ children, initialLocale }: I18nProviderProps) {
-  const [locale, setLocaleState] = useState<Locale>(() => initialLocale ?? detectLocale())
+  const detected = initialLocale ?? detectLocale()
+  const [locale, setLocaleState] = useState<Locale>(detected)
 
   // Persist + keep <html lang> in sync so screen readers and CSS `:lang()` rules
   // see the right language attribute.
@@ -243,15 +248,16 @@ export function I18nProvider({ children, initialLocale }: I18nProviderProps) {
   }, [locale])
 
   const setLocale = useCallback((next: Locale) => {
-    if ((SUPPORTED_LOCALES as readonly string[]).includes(next)) {
+    if (SUPPORTED_LOCALES.has(next)) {
       setLocaleState(next)
     }
   }, [])
 
   const toggleLocale = useCallback(() => {
     setLocaleState((cur) => {
-      const i = SUPPORTED_LOCALES.indexOf(cur)
-      return SUPPORTED_LOCALES[(i + 1) % SUPPORTED_LOCALES.length]
+      const arr = _SUPPORTED_LOCALES_ARRAY
+      const i = arr.indexOf(cur)
+      return arr[(i + 1) % arr.length]
     })
   }, [])
 
