@@ -190,6 +190,7 @@ export class OpenAICompatProvider extends BaseProvider {
     if (options?.tool_choice != null) body.tool_choice = options.tool_choice;
     const ptc = this.resolveParallelToolCalls(options);
     if (ptc != null) body.parallel_tool_calls = ptc;
+    Object.assign(body, extendedBodyParams(this.platform, options));
 
     const sampling = this.samplingForModel(modelId, options);
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
@@ -311,6 +312,7 @@ export class OpenAICompatProvider extends BaseProvider {
     if (options?.tool_choice != null) body.tool_choice = options.tool_choice;
     const ptc = this.resolveParallelToolCalls(options);
     if (ptc != null) body.parallel_tool_calls = ptc;
+    Object.assign(body, extendedBodyParams(this.platform, options));
 
     const sampling = this.samplingForModel(modelId, options);
     const res = await this.fetchWithTimeout(`${this.baseUrl}/chat/completions`, {
