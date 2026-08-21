@@ -248,3 +248,7 @@ export function supportedParametersForPlatforms(platforms: string[], caps: { too
   const restSets = rest.map(list => new Set(list));
   return first.filter(param => restSets.every(s => s.has(param)));
 }
+
+/** GitHub Models' input-token cap its API enforces (~8000, 413 above it). It
+ *  drives the proxy's truncateMessagesForGithub guard (CUSTOM-PATCHES §6.6). */
+export const GITHUB_MAX_INPUT_TOKENS = 7500;
