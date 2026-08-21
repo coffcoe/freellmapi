@@ -1,4 +1,4 @@
-import { detectScene } from '../lib/scene.js';
+import { detectScene, isEmptyScene } from '../lib/scene.js';
 import { getDb, getSetting, setSetting } from '../db/index.js';
 import { getProvider, hasProvider, resolveProvider } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
@@ -590,8 +590,8 @@ export function parseModelTags(raw: unknown): string[] {
 
 export function sceneBiasScore(
   entry: ChainRow,
-  scene: SceneSignal,
-  attrs: Map<number, ModelSceneAttrs>,
+  scene: SceneSignal | undefined,
+  attrs: Map<number, ModelSceneAttrs> | undefined,
 ): number {
   if (!scene || !attrs) return 0;
   const a = attrs.get(entry.model_db_id);
@@ -624,12 +624,12 @@ export function sceneBiasScore(
  * faithful reflection of the user's picked strategy, not a re-sampled draw each
  * request. Priority mode is deterministic either way.
  */
-function orderChain(chain: ChainRow[], strategy: RoutingStrategy, sampled = true): ChainRow[] {
+function orderChain(chain: ChainRow[], strategy: RoutingStrategy, sampled = true, scene?: SceneSignal, attrs?: Map<number, ModelSceneAttrs>): ChainRow[] {
   const weights = weightsFor(strategy);
   if (!weights) {
     // Legacy priority mode: base priority + 429 penalty, ascending.
     return chain
-      .map(e => ({ e, eff: e.priority + getPenalty(e.model_db_id) }))
+      .map(e => ({ e, eff: e.priority + getPenalty(e.model_db_id) - sceneBiasScore(e, scene, attrs) }))
       .sort((a, b) => a.eff - b.eff || a.e.priority - b.e.priority)
       .map(x => x.e);
   }
@@ -639,12 +639,8 @@ function orderChain(chain: ChainRow[], strategy: RoutingStrategy, sampled = true
   const intelMax = composites.length ? Math.max(...composites) : 0;
   const keyCounts = usableKeyCountsByPlatform(getDb());
 
-  // Load scene context for C1 scene-routing
-  const scene = detectScene(chain.map(e => ({ role: "user" as const, content: "" })), false, null);
-  const sceneAttrs = scene ? loadSceneAttrs(getDb(), chain) : undefined;
-
   return chain
-    .map(e => ({ e, s: scoreChainEntry(e, weights, intelMin, intelMax, sampled, keyCounts, scene, sceneAttrs).score }))
+    .map(e => ({ e, s: scoreChainEntry(e, weights, intelMin, intelMax, sampled, keyCounts, scene, attrs).score }))
     // Higher score first; manual priority breaks ties so the chain still matters.
     .sort((a, b) => b.s - a.s || a.e.priority - b.e.priority)
     .map(x => x.e);
@@ -1272,7 +1268,7 @@ function filterHighValueIfLarge(db: Db, chain: ChainRow[]): ChainRow[] {
   return filtered.length > 0 ? filtered : chain;
 }
 
-export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, requireTools = false, skipModels?: Set<number>, prefetchedChain?: ChainRow[], requireStructured = false): RouteResult {
+export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, preferredModelDbId?: number, requireVision = false, requireTools = false, skipModels?: Set<number>, prefetchedChain?: ChainRow[], requireStructured = false, skipPlatforms?: Set<string>, scene?: SceneSignal): RouteResult {
   const db = getDb();
 
   const strategy = getRoutingStrategy();
@@ -1292,7 +1288,16 @@ export function routeRequest(estimatedTokens = 1000, skipKeys?: Set<string>, pre
     if (graded.length > 0) chain = graded;
   }
 
-  const sortedChain = orderChain(chain, strategy);
+  // Scene-routing soft preference (see lib/scene.ts): when a request carries a
+  // scene signal and any chain row carries scene labels, load the labels and
+  // let orderChain fold them into the ordering. When the signal is empty or
+  // nothing carries labels the bias is a no-op, so the bandit keeps its exact
+  // prior behaviour.
+  const sceneAttrs = scene && !isEmptyScene(scene)
+    ? loadSceneAttrs(db, chain)
+    : undefined;
+
+  const sortedChain = orderChain(chain, strategy, true, scene, sceneAttrs);
 
   // Sticky session / Explicit pinning: move preferred model to front of chain
   if (preferredModelDbId) {
