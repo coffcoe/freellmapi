@@ -173,14 +173,13 @@ function detectLocale(): Locale {
   else if (lower.startsWith('en')) browserLocale = 'en'
 
   const stored = window.localStorage.getItem('freellmapi.locale')
-  // Use stored locale only if it's different from default AND matches browser
-  // This prevents English cache from overriding Chinese browser setting
-  if (stored && (SUPPORTED_LOCALES as readonly string[]).includes(stored)) {
-    // If user explicitly chose a locale, respect it
+  // Only use stored locale if browser language is NOT detected
+  // This ensures Chinese browser users always get Chinese UI
+  if (stored && (SUPPORTED_LOCALES as readonly string[]).includes(stored) && !browserLocale) {
     return stored as Locale
   }
 
-  // Fallback to browser locale or DEFAULT_LOCALE
+  // Return browser locale if detected, otherwise DEFAULT_LOCALE
   return browserLocale ?? DEFAULT_LOCALE
 }
 
