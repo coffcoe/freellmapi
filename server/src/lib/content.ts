@@ -110,3 +110,45 @@ export function normalizeOutboundContent<T>(payload: T): T {
   }
   return payload;
 }
+
+export const GITHUB_MAX_INPUT_TOKENS = 7500;
+
+export function truncateMessageText(message: ChatMessage, budget: number): ChatMessage {
+  const text = contentToString(message.content);
+  if (text.length <= budget * 4) return message;
+  return { ...message, content: text.slice(0, budget * 4) };
+}
+
+export function truncateMessagesForGithub(
+  messages: ChatMessage[],
+  budget: number = GITHUB_MAX_INPUT_TOKENS,
+): ChatMessage[] {
+  if (messages.length === 0) return messages;
+  const estimate = (m: ChatMessage) => Math.ceil(contentToString(m.content).length / 4);
+  const total = messages.reduce((sum, m) => sum + estimate(m), 0);
+  if (total <= budget) return messages;
+
+  const systemIdx = messages.findIndex(m => m.role === 'system');
+  const systemMsg = systemIdx >= 0 ? messages[systemIdx] : null;
+  const rest = messages.filter((_, i) => i !== systemIdx);
+
+  const systemTokens = systemMsg ? estimate(systemMsg) : 0;
+  let kept: ChatMessage[] = [];
+  let used = systemTokens;
+  for (let i = rest.length - 1; i >= 0; i--) {
+    const est = estimate(rest[i]);
+    if (used + est > budget) {
+      if (kept.length === 0 && used === systemTokens) {
+        kept.unshift(truncateMessageText(rest[i], budget - used));
+      }
+      break;
+    }
+    kept.unshift(rest[i]);
+    used += est;
+  }
+  if (kept.length === 0 && rest.length > 0) {
+    const newest = rest[rest.length - 1];
+    kept = [truncateMessageText(newest, Math.max(0, budget - systemTokens))];
+  }
+  return systemMsg ? [systemMsg, ...kept] : kept;
+}

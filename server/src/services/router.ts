@@ -1,3 +1,4 @@
+import { detectScene } from '../lib/scene.js';
 import { getDb, getSetting, setSetting } from '../db/index.js';
 import { getProvider, hasProvider, resolveProvider } from '../providers/index.js';
 import { decrypt } from '../lib/crypto.js';
@@ -491,6 +492,12 @@ function usableKeyCountsByPlatform(db: Db): Map<string, number> {
   return new Map(rows.map(r => [r.platform, r.count]));
 }
 
+import { inferModelCategory } from './model-category.js';
+import type { SceneSignal } from "../lib/scene.js";
+export interface ModelSceneAttrs { category: string | null; networkTier: string | null; tags: string[]; }
+
+// ... existing code ...
+
 function scoreChainEntry(
   entry: ChainRow,
   weights: RoutingWeights,
@@ -498,6 +505,8 @@ function scoreChainEntry(
   intelMax: number,
   sampled: boolean,
   keyCounts: Map<string, number>,
+  scene?: SceneSignal,
+  sceneAttrs?: Map<number, ModelSceneAttrs>,
 ): ScoredEntry {
   const stats = statsCache?.get(`${entry.platform}:${entry.model_id}`);
   const successes = stats?.successes ?? 0;
@@ -524,7 +533,82 @@ function scoreChainEntry(
   const rl = rateLimitFactor(getPenalty(entry.model_db_id));
 
   const score = combineScore({ reliability, speed, intelligence, headroom, rateLimit: rl }, weights);
+  // Scene bias: soft nudge toward client's preferred category/tag/tier
+  if (scene && sceneAttrs) {
+    return { axes: { reliability, speed, intelligence }, headroom, rateLimit: rl, score: score + sceneBiasScore(entry, scene, sceneAttrs) * SCENE_BIAS_UNIT };
+  }
   return { axes: { reliability, speed, intelligence }, headroom, rateLimit: rl, score };
+}
+
+const SCENE_BIAS_UNIT = 0.02;
+
+
+/** Per-model scene attributes, loaded on demand for the entries in one chain. */
+export function loadSceneAttrs(db: Db, chain: ChainRow[]): Map<number, ModelSceneAttrs> {
+  const out = new Map<number, ModelSceneAttrs>();
+  if (chain.length === 0) return out;
+  const ids = [...new Set(chain.map(e => e.model_db_id))];
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = db.prepare(
+    `SELECT id, category, network_tier, tags FROM models WHERE id IN (${placeholders})`,
+  ).all(...ids) as { id: number; category: string | null; network_tier: string | null; tags: string | null }[];
+  for (const r of rows) {
+    out.set(r.id, {
+      category: r.category,
+      networkTier: r.network_tier,
+      tags: parseModelTags(r.tags),
+    });
+  }
+  return out;
+}
+
+/**
+ * Parse the `models.tags` column defensively.
+ *
+ * The column has accumulated THREE incompatible shapes over time:
+ *   1. a JSON array of strings   — ["free-tier","long-context"]
+ *   2. a bare CSV                 — free-tier,long-context
+ *   3. a single object (legacy)   — {"tag":"free-tier"} (rare)
+ * All three must round-trip without a migration.
+ */
+export function parseModelTags(raw: unknown): string[] {
+  if (typeof raw !== 'string') return [];
+  const s = raw.trim();
+  if (!s) return [];
+  if (s.startsWith('[') || s.startsWith('{')) {
+    try {
+      const v = JSON.parse(s);
+      const arr = Array.isArray(v) ? v : [v];
+      // Objects carry provider metadata, not scene tags — keep only strings.
+      return arr.filter((x): x is string => typeof x === 'string').map(x => x.trim()).filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+  return s.split(',').map(x => x.trim()).filter(Boolean);
+}
+
+export function sceneBiasScore(
+  entry: ChainRow,
+  scene: SceneSignal,
+  attrs: Map<number, ModelSceneAttrs>,
+): number {
+  if (!scene || !attrs) return 0;
+  const a = attrs.get(entry.model_db_id);
+  if (!a) return 0;
+
+  let bias = 0;
+  // L1 — network tier
+  if (scene.networkTier && a.networkTier === scene.networkTier) bias += 4;
+  // L2 — capability category
+  if (scene.category && a.category === scene.category) bias += 2;
+  // L3 — declared tags
+  if (scene.tags.length && a.tags.length) {
+    for (const tag of scene.tags) {
+      if (a.tags.includes(tag)) bias += 1;
+    }
+  }
+  return bias;
 }
 
 /**
@@ -555,8 +639,12 @@ function orderChain(chain: ChainRow[], strategy: RoutingStrategy, sampled = true
   const intelMax = composites.length ? Math.max(...composites) : 0;
   const keyCounts = usableKeyCountsByPlatform(getDb());
 
+  // Load scene context for C1 scene-routing
+  const scene = detectScene(chain.map(e => ({ role: "user" as const, content: "" })), false, null);
+  const sceneAttrs = scene ? loadSceneAttrs(getDb(), chain) : undefined;
+
   return chain
-    .map(e => ({ e, s: scoreChainEntry(e, weights, intelMin, intelMax, sampled, keyCounts).score }))
+    .map(e => ({ e, s: scoreChainEntry(e, weights, intelMin, intelMax, sampled, keyCounts, scene, sceneAttrs).score }))
     // Higher score first; manual priority breaks ties so the chain still matters.
     .sort((a, b) => b.s - a.s || a.e.priority - b.e.priority)
     .map(x => x.e);
