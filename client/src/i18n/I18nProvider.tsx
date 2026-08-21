@@ -85,9 +85,9 @@ import ka from './locales/ka.json'
 import ptPT from './locales/pt-PT.json'
 import zhTW from './locales/zh-TW.json'
 
-// Use Set instead of Array to prevent Vite 8 from optimizing to string.split()
+// Use Set for fast lookup to prevent Vite 8 from optimizing to string.split()
 // which corrupts hyphenated locale codes like zh-CN -> zh, CN
-export const SUPPORTED_LOCALES: ReadonlySet<string> = new Set([
+export const SUPPORTED_LOCALES_SET: ReadonlySet<string> = new Set([
   'en', 'zh-CN', 'zh-TW', 'fr', 'es', 'pt-BR', 'pt-PT', 'it',
   'de', 'ja', 'ko', 'ru', 'ar', 'hi', 'tr', 'pl', 'nl', 'sv',
   'da', 'no', 'fi', 'cs', 'hu', 'ro', 'th', 'vi', 'id', 'ms',
@@ -96,10 +96,10 @@ export const SUPPORTED_LOCALES: ReadonlySet<string> = new Set([
   'hr', 'sk', 'sr', 'lt', 'az', 'uz', 'sw', 'ha', 'yo', 'ig',
   'am', 'ka',
 ])
-// Keep array for indexOf/toggleLocale usage
-const _SUPPORTED_LOCALES_ARRAY = Array.from(SUPPORTED_LOCALES) as readonly string[]
+// Keep array for iteration (settings dialog needs .map())
+export const SUPPORTED_LOCALES: readonly string[] = Array.from(SUPPORTED_LOCALES_SET)
 
-export type Locale = (typeof _SUPPORTED_LOCALES_ARRAY)[number]
+export type Locale = (typeof SUPPORTED_LOCALES)[number]
 export const DEFAULT_LOCALE: Locale = 'en'
 
 // `navigator.language` returns values like `zh`, `zh-CN`, `fr-CA`, `pt-BR`,
@@ -179,7 +179,7 @@ function detectLocale(): Locale {
   const stored = window.localStorage.getItem('freellmapi.locale')
   // Only use stored locale if browser language is NOT detected
   // This ensures Chinese browser users always get Chinese UI
-  if (stored && SUPPORTED_LOCALES.has(stored) && !browserLocale) {
+  if (stored && SUPPORTED_LOCALES_SET.has(stored) && !browserLocale) {
     return stored as Locale
   }
 
@@ -248,16 +248,15 @@ export function I18nProvider({ children, initialLocale }: I18nProviderProps) {
   }, [locale])
 
   const setLocale = useCallback((next: Locale) => {
-    if (SUPPORTED_LOCALES.has(next)) {
+    if (SUPPORTED_LOCALES_SET.has(next)) {
       setLocaleState(next)
     }
   }, [])
 
   const toggleLocale = useCallback(() => {
     setLocaleState((cur) => {
-      const arr = _SUPPORTED_LOCALES_ARRAY
-      const i = arr.indexOf(cur)
-      return arr[(i + 1) % arr.length]
+      const i = SUPPORTED_LOCALES.indexOf(cur)
+      return SUPPORTED_LOCALES[(i + 1) % SUPPORTED_LOCALES.length]
     })
   }, [])
 
