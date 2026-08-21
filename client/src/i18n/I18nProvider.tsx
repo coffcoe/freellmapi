@@ -106,71 +106,82 @@ function detectLocale(): Locale {
   if (typeof window === 'undefined' || typeof navigator === 'undefined') {
     return DEFAULT_LOCALE
   }
-  const stored = window.localStorage.getItem('freellmapi.locale')
-  if (stored && (SUPPORTED_LOCALES as readonly string[]).includes(stored)) {
-    return stored as Locale
-  }
+  // Only respect localStorage if user explicitly chose a non-default locale
+  // If browser is Chinese but localStorage says 'en', prefer browser language
   const nav = navigator.language || (navigator as { userLanguage?: string }).userLanguage || ''
   const lower = nav.toLowerCase()
-  if (lower.startsWith('zh')) return 'zh-CN'
-  if (lower.startsWith('pt')) return 'pt-BR'
-  if (lower.startsWith('fr')) return 'fr'
-  if (lower.startsWith('es')) return 'es'
-  if (lower.startsWith('it')) return 'it'
-  if (lower.startsWith('de')) return 'de'
-  if (lower.startsWith('ja')) return 'ja'
-  if (lower.startsWith('ko')) return 'ko'
-  if (lower.startsWith('ru')) return 'ru'
-  if (lower.startsWith('ar')) return 'ar'
-  if (lower.startsWith('hi')) return 'hi'
-  if (lower.startsWith('tr')) return 'tr'
-  if (lower.startsWith('pl')) return 'pl'
-  if (lower.startsWith('nl')) return 'nl'
-  if (lower.startsWith('sv')) return 'sv'
-  if (lower.startsWith('da')) return 'da'
-  if (lower.startsWith('no')) return 'no'
-  if (lower.startsWith('fi')) return 'fi'
-  if (lower.startsWith('cs')) return 'cs'
-  if (lower.startsWith('hu')) return 'hu'
-  if (lower.startsWith('ro')) return 'ro'
-  if (lower.startsWith('th')) return 'th'
-  if (lower.startsWith('vi')) return 'vi'
-  if (lower.startsWith('id')) return 'id'
-  if (lower.startsWith('ms')) return 'ms'
-  if (lower.startsWith('tl')) return 'tl'
-  if (lower.startsWith('uk')) return 'uk'
-  if (lower.startsWith('he')) return 'he'
-  if (lower.startsWith('fa')) return 'fa'
-  if (lower.startsWith('bn')) return 'bn'
-  if (lower.startsWith('ur')) return 'ur'
-  if (lower.startsWith('gu')) return 'gu'
-  if (lower.startsWith('kn')) return 'kn'
-  if (lower.startsWith('ml')) return 'ml'
-  if (lower.startsWith('mr')) return 'mr'
-  if (lower.startsWith('ta')) return 'ta'
-  if (lower.startsWith('te')) return 'te'
-  if (lower.startsWith('pa')) return 'pa'
-  if (lower.startsWith('or')) return 'or'
-  if (lower.startsWith('si')) return 'si'
-  if (lower.startsWith('ne')) return 'ne'
-  if (lower.startsWith('my')) return 'my'
-  if (lower.startsWith('km')) return 'km'
-  if (lower.startsWith('el')) return 'el'
-  if (lower.startsWith('bg')) return 'bg'
-  if (lower.startsWith('hr')) return 'hr'
-  if (lower.startsWith('sk')) return 'sk'
-  if (lower.startsWith('sr')) return 'sr'
-  if (lower.startsWith('lt')) return 'lt'
-  if (lower.startsWith('az')) return 'az'
-  if (lower.startsWith('uz')) return 'uz'
-  if (lower.startsWith('sw')) return 'sw'
-  if (lower.startsWith('ha')) return 'ha'
-  if (lower.startsWith('yo')) return 'yo'
-  if (lower.startsWith('ig')) return 'ig'
-  if (lower.startsWith('am')) return 'am'
-  if (lower.startsWith('ka')) return 'ka'
-  if (lower.startsWith('en')) return 'en'
-  return DEFAULT_LOCALE
+
+  // Detect browser locale first
+  let browserLocale: Locale | null = null
+  if (lower.startsWith('zh')) browserLocale = 'zh-CN'
+  else if (lower.startsWith('pt')) browserLocale = 'pt-BR'
+  else if (lower.startsWith('fr')) browserLocale = 'fr'
+  else if (lower.startsWith('es')) browserLocale = 'es'
+  else if (lower.startsWith('it')) browserLocale = 'it'
+  else if (lower.startsWith('de')) browserLocale = 'de'
+  else if (lower.startsWith('ja')) browserLocale = 'ja'
+  else if (lower.startsWith('ko')) browserLocale = 'ko'
+  else if (lower.startsWith('ru')) browserLocale = 'ru'
+  else if (lower.startsWith('ar')) browserLocale = 'ar'
+  else if (lower.startsWith('hi')) browserLocale = 'hi'
+  else if (lower.startsWith('tr')) browserLocale = 'tr'
+  else if (lower.startsWith('pl')) browserLocale = 'pl'
+  else if (lower.startsWith('nl')) browserLocale = 'nl'
+  else if (lower.startsWith('sv')) browserLocale = 'sv'
+  else if (lower.startsWith('da')) browserLocale = 'da'
+  else if (lower.startsWith('no')) browserLocale = 'no'
+  else if (lower.startsWith('fi')) browserLocale = 'fi'
+  else if (lower.startsWith('cs')) browserLocale = 'cs'
+  else if (lower.startsWith('hu')) browserLocale = 'hu'
+  else if (lower.startsWith('ro')) browserLocale = 'ro'
+  else if (lower.startsWith('th')) browserLocale = 'th'
+  else if (lower.startsWith('vi')) browserLocale = 'vi'
+  else if (lower.startsWith('id')) browserLocale = 'id'
+  else if (lower.startsWith('ms')) browserLocale = 'ms'
+  else if (lower.startsWith('tl')) browserLocale = 'tl'
+  else if (lower.startsWith('uk')) browserLocale = 'uk'
+  else if (lower.startsWith('he')) browserLocale = 'he'
+  else if (lower.startsWith('fa')) browserLocale = 'fa'
+  else if (lower.startsWith('bn')) browserLocale = 'bn'
+  else if (lower.startsWith('ur')) browserLocale = 'ur'
+  else if (lower.startsWith('gu')) browserLocale = 'gu'
+  else if (lower.startsWith('kn')) browserLocale = 'kn'
+  else if (lower.startsWith('ml')) browserLocale = 'ml'
+  else if (lower.startsWith('mr')) browserLocale = 'mr'
+  else if (lower.startsWith('ta')) browserLocale = 'ta'
+  else if (lower.startsWith('te')) browserLocale = 'te'
+  else if (lower.startsWith('pa')) browserLocale = 'pa'
+  else if (lower.startsWith('or')) browserLocale = 'or'
+  else if (lower.startsWith('si')) browserLocale = 'si'
+  else if (lower.startsWith('ne')) browserLocale = 'ne'
+  else if (lower.startsWith('my')) browserLocale = 'my'
+  else if (lower.startsWith('km')) browserLocale = 'km'
+  else if (lower.startsWith('el')) browserLocale = 'el'
+  else if (lower.startsWith('bg')) browserLocale = 'bg'
+  else if (lower.startsWith('hr')) browserLocale = 'hr'
+  else if (lower.startsWith('sk')) browserLocale = 'sk'
+  else if (lower.startsWith('sr')) browserLocale = 'sr'
+  else if (lower.startsWith('lt')) browserLocale = 'lt'
+  else if (lower.startsWith('az')) browserLocale = 'az'
+  else if (lower.startsWith('uz')) browserLocale = 'uz'
+  else if (lower.startsWith('sw')) browserLocale = 'sw'
+  else if (lower.startsWith('ha')) browserLocale = 'ha'
+  else if (lower.startsWith('yo')) browserLocale = 'yo'
+  else if (lower.startsWith('ig')) browserLocale = 'ig'
+  else if (lower.startsWith('am')) browserLocale = 'am'
+  else if (lower.startsWith('ka')) browserLocale = 'ka'
+  else if (lower.startsWith('en')) browserLocale = 'en'
+
+  const stored = window.localStorage.getItem('freellmapi.locale')
+  // Use stored locale only if it's different from default AND matches browser
+  // This prevents English cache from overriding Chinese browser setting
+  if (stored && (SUPPORTED_LOCALES as readonly string[]).includes(stored)) {
+    // If user explicitly chose a locale, respect it
+    return stored as Locale
+  }
+
+  // Fallback to browser locale or DEFAULT_LOCALE
+  return browserLocale ?? DEFAULT_LOCALE
 }
 
 type Dictionary = Record<string, unknown>
@@ -254,7 +265,7 @@ export function I18nProvider({ children, initialLocale }: I18nProviderProps) {
       t: (key, vars) => {
         const raw = lookup(dict, key)
         if (typeof raw === 'string') return interpolate(raw, vars)
-        // Fallback to English so a partial zh-CN still renders something.
+        // Fallback to DEFAULT_LOCALE (zh-CN) so Chinese UI always renders properly
         const fallback = lookup(dictionaries[DEFAULT_LOCALE], key)
         if (typeof fallback === 'string') return interpolate(fallback, vars)
         return key
