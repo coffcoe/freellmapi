@@ -115,7 +115,7 @@ export function logRequest(
     // Only for successful completions with actual token data; errors and
     // zero-token entries are skipped. Non-blocking — never slows the caller.
     if (status === 'success' && (inputTokens > 0 || outputTokens > 0)) {
-      notifyTracker(platform, modelId, inputTokens, outputTokens);
+      notifyTracker({ platform, modelId, keyId: null, inputTokens, outputTokens, clientTag: null });
     }
   } catch (e) {
     console.error('Failed to log request:', e);
@@ -128,30 +128,61 @@ export function logRequest(
  * timeout caps the overhead. If the tracker is not running, the request
  * silently fails after 300ms with zero impact on the proxy.
  */
-function notifyTracker(
-  platform: string,
-  modelId: string,
-  inputTokens: number,
-  outputTokens: number,
-): void {
-  const url = 'http://localhost:3003/api/log';
-  const body = JSON.stringify({
-    platform,
-    model: modelId,
-    prompt_tokens: inputTokens,
-    completion_tokens: outputTokens,
-  });
 
-  // Fire-and-forget via AbortController with a 300ms timeout.
-  // Promise is explicitly un-awaited — the caller never blocks.
+// Configurable tracker URL (CUSTOM-PATCHES §3.4).
+const TRACKER_URL_ENV = 'TOKEN_TRACKER_URL';
+const DEFAULT_TRACKER_URL = 'http://localhost:3003/api/log';
+const TRACKER_TIMEOUT_MS = 300;
+
+export interface TrackerPayload {
+  platform: string;
+  modelId: string;
+  keyId: number | null;
+  inputTokens: number;
+  outputTokens: number;
+  clientTag: string | null;
+}
+
+function trackerUrl(): string | null {
+  const raw = process.env[TRACKER_URL_ENV];
+  if (raw === undefined) return DEFAULT_TRACKER_URL;
+  const v = raw.trim();
+  return v === '' || v.toLowerCase() === 'off' ? null : v;
+}
+
+export function effectiveTrackerUrl(): string | null {
+  return trackerUrl();
+}
+
+/** Fire-and-forget POST to the token tracker. Never throws; a timeout or any
+ *  network error is swallowed so the caller's flow is never disturbed. Exported
+ *  for tests, which pass an injectable `send` to assert the payload/headers
+ *  without real HTTP. */
+export function notifyTracker(
+  payload: TrackerPayload,
+  send: (url: string, body: string, signal: AbortSignal) => Promise<unknown> = (url, body, signal) =>
+    fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body, signal }),
+): void {
+  const url = trackerUrl();
+  if (url === null) return;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 300);
-  fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body,
-    signal: controller.signal,
-  }).catch(() => {}).finally(() => clearTimeout(timer));
+  const timer = setTimeout(() => controller.abort(), TRACKER_TIMEOUT_MS);
+  const body = JSON.stringify({
+    platform: payload.platform,
+    model: payload.modelId,
+    keyId: payload.keyId,
+    inputTokens: payload.inputTokens,
+    outputTokens: payload.outputTokens,
+    totalTokens: payload.inputTokens + payload.outputTokens,
+    clientTag: payload.clientTag,
+    ts: new Date().toISOString(),
+  });
+  // Fire-and-forget: we intentionally do not await. Errors and aborts are
+  // swallowed so a dead tracker can't surface anywhere on the relay.
+  void Promise.resolve()
+    .then(() => send(url, body, controller.signal))
+    .catch(() => {})
+    .finally(() => clearTimeout(timer));
 }
 
 // Persist a finished attempt trace as one small insert batch keyed to the
