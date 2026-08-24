@@ -1,0 +1,82 @@
+name: Weekly Provider Verification
+
+on:
+  schedule:
+    # Run every Monday at 06:00 UTC (14:00 CST)
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      slice:
+        description: 'Provider slice to verify'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - no-card
+          - no-phone
+          - commercial
+
+jobs:
+  verify-providers:
+    name: Verify Free LLM Providers
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Fetch provider dataset
+        id: fetch
+        run: |
+          SLICE="${{ github.event.inputs.slice || 'all' }}"
+          echo "Fetching $SLICE slice..."
+          curl -sSL "https://freellmapihub.com/api/v1/${SLICE}.json" \
+            -o "server/data/providers-${SLICE}.json"
+          echo "slice=$SLICE" >> $GITHUB_OUTPUT
+          echo "file=server/data/providers-${SLICE}.json" >> $GITHUB_OUTPUT
+
+      - name: Validate schema
+        run: |
+          SLICE="${{ github.event.inputs.slice || 'all' }}"
+          node server/dist/scripts/validate-providers.js \
+            "server/data/providers-${SLICE}.json"
+
+      - name: Run import script
+        run: |
+          SLICE="${{ github.event.inputs.slice || 'all' }}"
+          node server/dist/scripts/import-provider-meta.js \
+            "server/data/providers-${SLICE}.json" \
+            "logs/weekly-verify-${SLICE}-$(date +%Y%m%d).log"
+
+      - name: Check database state
+        run: |
+          node -e "
+            const db = require('./server/node_modules/better-sqlite3')('./server/data/freeapi.db');
+            const r = db.prepare(\`
+              SELECT COUNT(*) as total,
+                     SUM(CASE WHEN card_required=1 THEN 1 ELSE 0 END) as with_card,
+                     SUM(CASE WHEN phone_required=1 THEN 1 ELSE 0 END) as with_phone,
+                     SUM(CASE WHEN commercial_ok=1 THEN 1 ELSE 0 END) as commercial_ok,
+                     SUM(CASE WHEN provider_slug IS NOT NULL THEN 1 ELSE 0 END) as mapped
+              FROM models
+            \`).get();
+            console.log(JSON.stringify(r, null, 2));
+          "
+
+      - name: Upload verification report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verification-report-${{ github.run_number }}
+          path: |
+            server/data/providers-*.json
+            logs/weekly-verify-*.log
