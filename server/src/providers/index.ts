@@ -5,6 +5,8 @@ import { OpenAICompatProvider } from './openai-compat.js';
 import { CohereProvider } from './cohere.js';
 import { CloudflareProvider } from './cloudflare.js';
 import { AIHordeProvider } from './aihorde.js';
+import { ModelScopeProvider } from './modelscope.js';
+import { PollinationsProvider } from './pollinations.js';
 
 const providers = new Map<Platform, BaseProvider>();
 
@@ -136,22 +138,15 @@ register(new OpenAICompatProvider({
   keyless: true,
 }));
 
-// Pollinations — OpenAI-compatible, anonymous tier. The chat completions
-// endpoint lives at `/openai/v1/chat/completions` (NOT `/v1/...` — the
-// `/openai` prefix is mandatory). Public model list returns one anonymous
-// model (`openai-fast` = GPT-OSS 20B on OVH, tools=true).
-// Registered keyless (June 2026): the legacy text API is deprecated for
-// AUTHENTICATED users (replacement enter.pollinations.ai is pay-as-you-go
-// "pollen"), while anonymous access is explicitly unaffected — so the anon
-// path is the only recurring-free one left. Anon is queue-limited to 1
-// concurrent request per IP (429 "Queue full" on overlap; live-probed
-// 2026-06-10).
-register(new OpenAICompatProvider({
-  platform: 'pollinations',
-  name: 'Pollinations',
-  baseUrl: 'https://text.pollinations.ai/openai/v1',
-  keyless: true,
-}));
+// Pollinations — OpenAI-compatible recurring shared-capacity tier. The legacy
+// text.pollinations.ai host returned 502 in the July 2026 audit; publishable
+// keys now use the unified gen.pollinations.ai endpoint. Free capacity accrues
+// at one pollen per IP per hour, so chat requires a real publishable key.
+// Dedicated PollinationsProvider (not plain OpenAICompatProvider) because
+// GET /v1/models is public — it answers 200 for a revoked key — so validation
+// probes the authenticated /account/key instead; see providers/pollinations.ts
+// and issue #608.
+register(new PollinationsProvider());
 
 // LLM7.io — OpenAI-compatible aggregator. 100 req/hr free; anonymous access
 // also works for basic models. Wraps a handful of upstream models behind one
