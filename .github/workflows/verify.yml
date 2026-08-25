@@ -33,6 +33,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Build server scripts
+        run: npm run build:server
+
       - name: Fetch provider dataset
         id: fetch
         run: |
