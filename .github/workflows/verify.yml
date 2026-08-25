@@ -69,8 +69,16 @@ jobs:
       - name: Validate schema
         run: |
           SLICE="${{ github.event.inputs.slice || 'no-card' }}"
+          echo "Validating $SLICE slice..."
+          echo "File exists: $(test -f server/data/providers-${SLICE}.json && echo YES || echo NO)"
+          echo "File size: $(wc -c < server/data/providers-${SLICE}.json) bytes"
+          echo "First 200 chars:"
+          head -c 200 server/data/providers-${SLICE}.json
+          echo ""
+          echo "Running validation..."
           npx tsx server/src/scripts/validate-providers.ts \
             "server/data/providers-${SLICE}.json"
+          echo "Validation completed with exit code: $?"
 
       - name: Run import script
         run: |
