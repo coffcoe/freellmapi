@@ -9,10 +9,9 @@ on:
       slice:
         description: 'Provider slice to verify'
         required: false
-        default: 'all'
+        default: 'no-card'
         type: choice
         options:
-          - all
           - no-card
           - no-phone
           - commercial
@@ -37,7 +36,7 @@ jobs:
       - name: Fetch provider dataset
         id: fetch
         run: |
-          SLICE="${{ github.event.inputs.slice || 'all' }}"
+          SLICE="${{ github.event.inputs.slice || 'no-card' }}"
           echo "Fetching $SLICE slice..."
           curl -sSL "https://freellmapihub.com/api/v1/${SLICE}.json" \
             -o "server/data/providers-${SLICE}.json"
@@ -46,13 +45,13 @@ jobs:
 
       - name: Validate schema
         run: |
-          SLICE="${{ github.event.inputs.slice || 'all' }}"
+          SLICE="${{ github.event.inputs.slice || 'no-card' }}"
           node server/dist/scripts/validate-providers.js \
             "server/data/providers-${SLICE}.json"
 
       - name: Run import script
         run: |
-          SLICE="${{ github.event.inputs.slice || 'all' }}"
+          SLICE="${{ github.event.inputs.slice || 'no-card' }}"
           node server/dist/scripts/import-provider-meta.js \
             "server/data/providers-${SLICE}.json" \
             "logs/weekly-verify-${SLICE}-$(date +%Y%m%d).log"
