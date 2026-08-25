@@ -49,11 +49,22 @@ jobs:
         id: fetch
         run: |
           SLICE="${{ github.event.inputs.slice || 'no-card' }}"
+          OUTPUT_FILE="server/data/providers-${SLICE}.json"
           echo "Fetching $SLICE slice..."
-          curl -sSL "https://freellmapihub.com/api/v1/${SLICE}.json" \
-            -o "server/data/providers-${SLICE}.json"
+
+          # Fetch from API with timeout and retry
+          curl -sSL --max-time 30 --retry 2 \
+            "https://freellmapihub.com/api/v1/${SLICE}.json" \
+            -o "$OUTPUT_FILE"
+
+          # Verify download succeeded
+          if [ ! -s "$OUTPUT_FILE" ]; then
+            echo "❌ Failed to fetch provider data"
+            exit 1
+          fi
+
           echo "slice=$SLICE" >> $GITHUB_OUTPUT
-          echo "file=server/data/providers-${SLICE}.json" >> $GITHUB_OUTPUT
+          echo "file=$OUTPUT_FILE" >> $GITHUB_OUTPUT
 
       - name: Validate schema
         run: |
