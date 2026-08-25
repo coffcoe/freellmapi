@@ -59,7 +59,7 @@ jobs:
       - name: Check database state
         run: |
           node -e "
-            const db = require('./server/node_modules/better-sqlite3')('./server/data/freeapi.db');
+            const db = require('./node_modules/better-sqlite3')('./server/data/freeapi.db');
             const r = db.prepare(\`
               SELECT COUNT(*) as total,
                      SUM(CASE WHEN card_required=1 THEN 1 ELSE 0 END) as with_card,
