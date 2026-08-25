@@ -1,6 +1,12 @@
 name: Weekly Provider Verification
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verify.yml'
+      - 'server/src/scripts/validate-providers.ts'
+      - 'server/src/scripts/import-provider-meta.ts'
   schedule:
     # Run every Monday at 06:00 UTC (14:00 CST)
     - cron: '0 6 * * 1'
