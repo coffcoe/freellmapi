@@ -36,6 +36,9 @@ jobs:
       - name: Create output directories
         run: mkdir -p server/data logs
 
+      - name: Initialize database with migrations
+        run: npx tsx server/src/db/migrate/cli.ts up
+
       - name: Fetch provider dataset
         id: fetch
         run: |
