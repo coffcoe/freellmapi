@@ -33,9 +33,6 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build server scripts
-        run: npm run build:server
-
       - name: Create output directories
         run: mkdir -p server/data logs
 
@@ -52,13 +49,13 @@ jobs:
       - name: Validate schema
         run: |
           SLICE="${{ github.event.inputs.slice || 'no-card' }}"
-          node server/dist/scripts/validate-providers.js \
+          npx tsx server/src/scripts/validate-providers.ts \
             "server/data/providers-${SLICE}.json"
 
       - name: Run import script
         run: |
           SLICE="${{ github.event.inputs.slice || 'no-card' }}"
-          node server/dist/scripts/import-provider-meta.js \
+          npx tsx server/src/scripts/import-provider-meta.ts \
             "server/data/providers-${SLICE}.json" \
             "logs/weekly-verify-${SLICE}-$(date +%Y%m%d).log"
 
