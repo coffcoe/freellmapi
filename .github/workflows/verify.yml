@@ -36,6 +36,9 @@ jobs:
       - name: Build server scripts
         run: npm run build:server
 
+      - name: Create output directories
+        run: mkdir -p server/data logs
+
       - name: Fetch provider dataset
         id: fetch
         run: |
