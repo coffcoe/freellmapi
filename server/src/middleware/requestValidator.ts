@@ -17,6 +17,22 @@ export function requestValidator() {
         return;
       }
 
+      // Multipart uploads (e.g. /v1/audio/transcriptions) are parsed and
+      // validated by their own route handlers via multer. Applying the chat
+      // schema here would reject them before multer ever sees the body.
+      const contentType = req.headers['content-type'] || '';
+      if (contentType.startsWith('multipart/form-data')) {
+        next();
+        return;
+      }
+
+      // Legacy /v1/completions takes `prompt`, not `messages`; proxyRouter
+      // adapts it to a chat request and validates it there.
+      if (req.path === '/completions') {
+        next();
+        return;
+      }
+
       const isEmbeddings = req.path === '/embeddings';
       const isResponses = req.path === '/responses';
 
