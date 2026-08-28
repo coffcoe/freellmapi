@@ -75,22 +75,25 @@ describe('local-endpoint cooldown cap (#592)', () => {
     expect(cooldownDecisionForError(route, err).durationMs).toBe(LOCAL_CAP_MS);
   });
 
-  it('public-IP base_url is NOT exempt: transient then ladder on real 429s', () => {
+  it('public-IP base_url is NOT exempt: transient then 10min cap on repeated real 429s', () => {
     const route = routeForKey(insertKey('http://203.0.113.10/v1'));
+    // 1st 429 → transient (no signal yet)
     expect(cooldownDecisionForError(route, real429()).durationMs).toBe(TRANSIENT);
-    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(2 * MINUTE);
+    // 2nd 429 crosses heuristic threshold → NO_LIMIT_COOLDOWN_CAP_MS (10min)
+    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(10 * MINUTE);
+    // Stays at cap, does not escalate further
     expect(cooldownDecisionForError(route, real429()).durationMs).toBe(10 * MINUTE);
   });
 
   it('non-literal hostname is treated as non-local (no DNS on the hot path)', () => {
     const route = routeForKey(insertKey('https://inference.example.com/v1'));
     expect(cooldownDecisionForError(route, real429()).durationMs).toBe(TRANSIENT);
-    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(2 * MINUTE);
+    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(10 * MINUTE);
   });
 
   it('a key with no base_url (built-in platform shape) keeps full behavior', () => {
     const route = routeForKey(insertKey(null));
     expect(cooldownDecisionForError(route, real429()).durationMs).toBe(TRANSIENT);
-    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(2 * MINUTE);
+    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(10 * MINUTE);
   });
 });

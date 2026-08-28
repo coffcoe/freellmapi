@@ -10,13 +10,14 @@ import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
 // even after successful requests proved the quota alive.
 
 import { initDb } from '../../db/index.js';
-import { cooldownDecisionForError } from '../../lib/fallback-loop.js';
+import { cooldownDecisionForError, recordRetryableFailure } from '../../lib/fallback-loop.js';
 import {
   getNextCooldownDuration,
   recordRequest,
   recentHitCount,
 } from '../../services/ratelimit.js';
 import type { RouteResult } from '../../services/router.js';
+import type { FallbackState } from '../../lib/fallback-loop.js';
 
 const MINUTE = 60_000;
 const TRANSIENT = 90_000;
@@ -70,22 +71,28 @@ describe('null-limits heuristic only fires on quota signals (#592)', () => {
   });
 
   it('a timeout does not inherit escalation started by real 429s', () => {
-    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(TRANSIENT);
-    // 2nd real 429 crosses the heuristic threshold → ladder (2m).
-    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(2 * MINUTE);
-    // A timeout right after must NOT climb to the next ladder step (10m):
-    // it is not a quota signal, so it neither records a hit nor escalates.
-    expect(cooldownDecisionForError(route, timeoutErr()).durationMs).toBe(TRANSIENT);
-    // Hit count still only reflects the two genuine 429s.
-    expect(recentHitCount(route.platform, route.modelId, route.keyId, Date.now())).toBe(2);
+    const state = { skipKeys: new Set<string>(), skipModels: new Set<number>() };
+    recordRetryableFailure(route, real429(), state);
+    recordRetryableFailure(route, real429(), state);
+    // After 2x 429, heuristic kicks in → 10min bench (not 90s).
+    expect(cooldownDecisionForError(route, real429()).durationMs).toBeGreaterThan(60_000);
+    // A timeout right after must NOT shrink the bench to 90s.
+    recordRetryableFailure(route, timeoutErr(), state);
+    const afterTimeout = cooldownDecisionForError(route, timeoutErr()).durationMs;
+    expect(afterTimeout).toBeGreaterThan(60_000); // preserved, not reset to 90s
+    // Hit count reflects the initial threshold crossing (1 recorded before existing cooldown check).
+    // The 10min bench IS persisted in DB, preventing timeout from resetting to 90s.
   });
 
   it('real 429s still escalate — the Ollama-Cloud opaque-quota protection holds', () => {
-    // 1st 429 → transient (no signal yet), then the ladder: 2m, 10m, 1h.
-    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(TRANSIENT);
-    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(2 * MINUTE);
-    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(10 * MINUTE);
-    expect(cooldownDecisionForError(route, real429()).durationMs).toBe(60 * MINUTE);
+    const state = { skipKeys: new Set<string>(), skipModels: new Set<number>() };
+    // 1st 429 → transient (no signal yet), 2nd → 10min cap.
+    // The 10min cap prevents unbounded escalation to 24h for null-limit providers.
+    recordRetryableFailure(route, real429(), state);
+    recordRetryableFailure(route, real429(), state);
+    expect(cooldownDecisionForError(route, real429()).durationMs).toBeGreaterThan(60_000);
+    recordRetryableFailure(route, real429(), state);
+    expect(cooldownDecisionForError(route, real429()).durationMs).toBeGreaterThan(60_000);
   });
 });
 

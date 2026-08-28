@@ -822,6 +822,18 @@ export function getCooldownDecisionForLimit(
   if (isLocalEndpointKey(keyId)) {
     return { durationMs: LOCAL_ENDPOINT_COOLDOWN_MS, source: 'heuristic' };
   }
+  // If the key is already benched, preserve the existing cooldown instead of
+  // resetting it. This keeps a timeout (or any non-quota error) from erasing a
+  // 10min cap that was earned by two prior real 429s — the bench should stick
+  // until it expires naturally, not shrink to 90s on every subsequent miss.
+  const existingExpiry = persistedCooldownExpiry(platform, modelId, keyId);
+  if (existingExpiry !== undefined && existingExpiry !== null) {
+    const remaining = existingExpiry - Date.now();
+    if (remaining > 0) {
+      return { durationMs: remaining, source: 'heuristic' as const };
+    }
+    // Expired — fall through to recompute.
+  }
   const quotaSignal = opts?.quotaSignal ?? true;
   const now = Date.now();
   const rpdExhausted =
