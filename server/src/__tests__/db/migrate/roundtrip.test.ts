@@ -24,6 +24,7 @@ const MEDIA_MODEL_META_FILENAME = '20260726_000004_media_model_meta.ts';
 const REQUEST_SERVED_MODEL_FILENAME = '20260726_000005_request_served_model.ts';
 const ATTEMPT_ERROR_SUMMARY_FILENAME = '20260726_000006_attempt_error_summary.ts';
 const SCENE_ROUTING_COLUMNS_FILENAME = '20260807_000001_scene_routing_columns.ts';
+const PROVIDER_VERIFICATION_META_FILENAME = '20260824_000001_provider_verification_meta.ts';
 
 /**
  * Hardcoded canonical list of applied-migration filenames, in the exact order
@@ -56,6 +57,7 @@ const EXPECTED_MIGRATION_FILENAMES = [
   REQUEST_SERVED_MODEL_FILENAME,
   ATTEMPT_ERROR_SUMMARY_FILENAME,
   SCENE_ROUTING_COLUMNS_FILENAME,
+  PROVIDER_VERIFICATION_META_FILENAME,
 ];
 
 interface SchemaRow {

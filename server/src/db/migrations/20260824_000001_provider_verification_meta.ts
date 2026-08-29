@@ -68,6 +68,11 @@ export function down(db: Db): void {
   // SQLite supports DROP COLUMN from 3.35.0; the bundled engine is newer.
   const modelColumns = db.prepare('PRAGMA table_info(models)').all() as { name: string }[];
 
+  // Drop the partial indexes first: they reference these columns, and SQLite
+  // rejects DROP COLUMN while a dependent index still exists.
+  db.exec('DROP INDEX IF EXISTS idx_models_no_card_no_phone;');
+  db.exec('DROP INDEX IF EXISTS idx_models_commercial;');
+
   if (modelColumns.some(col => col.name === 'card_required')) {
     db.prepare('ALTER TABLE models DROP COLUMN card_required').run();
   }
@@ -83,7 +88,4 @@ export function down(db: Db): void {
   if (modelColumns.some(col => col.name === 'provider_slug')) {
     db.prepare('ALTER TABLE models DROP COLUMN provider_slug').run();
   }
-
-  db.exec('DROP INDEX IF EXISTS idx_models_no_card_no_phone;');
-  db.exec('DROP INDEX IF EXISTS idx_models_commercial;');
 }
