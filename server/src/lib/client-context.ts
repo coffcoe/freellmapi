@@ -1,4 +1,4 @@
-﻿import { AsyncLocalStorage } from 'async_hooks';
+import { AsyncLocalStorage } from 'async_hooks';
 import type { NextFunction, Request, Response } from 'express';
 import { classifyClientAgent, type ClientAgent } from './client-classifier.js';
 
@@ -13,13 +13,14 @@ export interface ClientContext {
 // proxy, responses, anthropic, fusion, embeddings and media paths all log).
 const storage = new AsyncLocalStorage<ClientContext>();
 
-// First X-Forwarded-For hop when present (reverse-proxy deployments, e.g.
-// Traefik), otherwise the socket peer address. The server is LAN-only, so a
-// spoofable header is an acceptable trade for working behind a proxy.
+// Resolve the client IP. With Express's `trust proxy` disabled (the default),
+// this is the socket peer address and a spoofed X-Forwarded-For from a LAN
+// client is ignored. When TRUST_PROXY (#1024) opts into trusting a reverse
+// proxy, `req.ip` walks the configured trusted-proxy chain and returns the
+// first untrusted address — instead of trusting the leftmost caller-supplied
+// X-Forwarded-For value, which would let any direct caller spoof it.
 function resolveClientIp(req: Request): string | null {
-  const xff = req.headers['x-forwarded-for'];
-  const first = (Array.isArray(xff) ? xff[0] : xff)?.split(',')[0]?.trim();
-  const raw = first || req.socket.remoteAddress || null;
+  const raw = req.ip ?? req.socket.remoteAddress ?? null;
   // Normalize IPv4-mapped IPv6 ("::ffff:192.168.0.5" -> "192.168.0.5").
   return raw?.replace(/^::ffff:/i, '') ?? null;
 }
