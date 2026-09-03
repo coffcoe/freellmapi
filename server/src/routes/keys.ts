@@ -8,12 +8,16 @@ import { resolveProvider } from '../providers/index.js';
 import { encrypt, decrypt, maskKey } from '../lib/crypto.js';
 import { parseKeysFromFile, stripJsoncComments, stripTrailingCommas } from '../lib/key-parser.js';
 import { assessProviderUrl } from '../lib/url-guard.js';
-import { ensureModelInProfiles } from '../services/profile-models.js';
+import { verifyCredentials } from '../services/auth.js';
 import { getActiveCooldownsForKeys, clearCooldownsForKey } from '../services/ratelimit.js';
+import { ensureModelInProfiles } from '../services/profile-models.js';
 import { resolveCustomEndpointKey, customEndpointKeyIds, siblingEndpointKeyId } from '../services/custom-endpoint.js';
 import { customModelSeed } from '../services/custom-model-seed.js';
+import { registerCustomModels, registerCustomChatModels } from '../services/custom-model-register.js';
 import { discoverEndpointModels, ModelDiscoveryError } from '../services/model-discovery.js';
+import { probeEmbeddingDimensions } from '../services/embeddings.js';
 import { endpointScopeForBaseUrl, normalizeBaseUrl } from '../lib/endpoint-scope.js';
+import { recordCustomModelTombstone } from '../services/custom-model-tombstone.js';
 
 export const keysRouter = Router();
 
@@ -523,6 +527,83 @@ async function rejectUnsafeBaseUrl(baseUrl: string, res: Response): Promise<bool
   return true;
 }
 
+keysRouter.post('/custom', async (req: Request, res: Response) => {
+  const parsed = customProviderSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    return;
+  }
+
+  let endpoint: CustomEndpointRef;
+  try {
+    endpoint = resolveEndpointRef(parsed.data);
+  } catch (err: any) {
+    res.status(err.status ?? 400).json({ error: { message: err.message } });
+    return;
+  }
+  const baseUrl = endpoint.baseUrl;
+
+  if (await rejectUnsafeBaseUrl(baseUrl, res)) return;
+
+  // Local servers often need no key; keep a sentinel so there's always a bearer.
+  const providedKey = parsed.data.apiKey?.trim() || undefined;
+  const label = parsed.data.label?.trim() || undefined;
+
+  // Flatten singular + plural inputs into one list, dedupe by model id, drop
+  // blanks. The singular `displayName` only applies to a lone `model` (it can't
+  // sensibly fan out across many ids). Capability flags resolve per-entry first,
+  // then fall back to the submit-level defaults, then to undefined (DB default).
+  const topTools = parsed.data.supportsTools;
+  const topVision = parsed.data.supportsVision;
+  const entries: { modelId: string; displayName: string; supportsTools?: boolean; supportsVision?: boolean }[] = [];
+  const seen = new Set<string>();
+  const addEntry = (rawId: string, rawDisplay?: string, tools?: boolean, vision?: boolean) => {
+    const modelId = rawId.trim();
+    if (!modelId || seen.has(modelId)) return;
+    seen.add(modelId);
+    entries.push({
+      modelId,
+      displayName: (rawDisplay?.trim() || modelId),
+      supportsTools: tools ?? topTools,
+      supportsVision: vision ?? topVision,
+    });
+  };
+  if (parsed.data.model?.trim()) addEntry(parsed.data.model, parsed.data.displayName);
+  for (const m of parsed.data.models ?? []) {
+    if (typeof m === 'string') addEntry(m);
+    else addEntry(m.model, m.displayName, m.supportsTools, m.supportsVision);
+  }
+
+  if (entries.length === 0) {
+    res.status(400).json({ error: { message: 'model or models is required' } });
+    return;
+  }
+
+  const db = getDb();
+  const { keyId, storedKey, registered } = registerCustomModels(
+    db, baseUrl, providedKey, label, endpoint.keyId ?? undefined, entries,
+  );  // `model`/`displayName`/`modelDbId` echo the first model for older clients;
+  // `models` carries the full set registered in this call.
+  const first = registered[0]!;
+  res.status(201).json({
+    success: true,
+    keyId,
+    modelDbId: first.modelDbId,
+    platform: 'custom',
+    baseUrl,
+    model: first.model,
+    displayName: first.displayName,
+    supportsTools: first.supportsTools,
+    supportsVision: first.supportsVision,
+    models: registered,
+    // Bulk registration (#488) needs to tell the user what actually changed:
+    // picking a whole discovered list re-submits ids that are already there.
+    created: registered.filter(m => m.created).length,
+    alreadyRegistered: registered.filter(m => !m.created).length,
+    maskedKey: maskKey(storedKey),
+  });
+});
+
 // Ask a configured custom endpoint what models it currently serves (#488).
 // Relays add and drop models weekly, so re-typing the ids by hand goes stale
 // immediately. This reads ONLY the operator's own base_url with the operator's
@@ -587,171 +668,14 @@ keysRouter.post('/custom/discover-models', async (req: Request, res: Response) =
     });
   } catch (err: any) {
     if (err instanceof ModelDiscoveryError) {
-      res.status(err.status).json({ error: { message: err.message } });
+      // `upstream_error`, never `authentication_error`: this status is relayed
+      // from the operator's own endpoint, and a client that reads a bare 401 as
+      // "session expired" would sign the operator out for testing a bad key.
+      res.status(err.status).json({ error: { message: err.message, type: 'upstream_error' } });
       return;
     }
     res.status(502).json({ error: { message: `Model discovery failed: ${err?.message ?? 'unknown error'}` } });
   }
-});
-
-keysRouter.post('/custom', async (req: Request, res: Response) => {
-  const parsed = customProviderSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
-    return;
-  }
-
-  let endpoint: CustomEndpointRef;
-  try {
-    endpoint = resolveEndpointRef(parsed.data);
-  } catch (err: any) {
-    res.status(err.status ?? 400).json({ error: { message: err.message } });
-    return;
-  }
-  const baseUrl = endpoint.baseUrl;
-
-  if (await rejectUnsafeBaseUrl(baseUrl, res)) return;
-
-  // Local servers often need no key; keep a sentinel so there's always a bearer.
-  const providedKey = parsed.data.apiKey?.trim() || undefined;
-  const label = parsed.data.label?.trim() || undefined;
-
-  // Flatten singular + plural inputs into one list, dedupe by model id, drop
-  // blanks. The singular `displayName` only applies to a lone `model` (it can't
-  // sensibly fan out across many ids). Capability flags resolve per-entry first,
-  // then fall back to the submit-level defaults, then to undefined (DB default).
-  const topTools = parsed.data.supportsTools;
-  const topVision = parsed.data.supportsVision;
-  const entries: { modelId: string; displayName: string; supportsTools?: boolean; supportsVision?: boolean }[] = [];
-  const seen = new Set<string>();
-  const addEntry = (rawId: string, rawDisplay?: string, tools?: boolean, vision?: boolean) => {
-    const modelId = rawId.trim();
-    if (!modelId || seen.has(modelId)) return;
-    seen.add(modelId);
-    entries.push({
-      modelId,
-      displayName: (rawDisplay?.trim() || modelId),
-      supportsTools: tools ?? topTools,
-      supportsVision: vision ?? topVision,
-    });
-  };
-  if (parsed.data.model?.trim()) addEntry(parsed.data.model, parsed.data.displayName);
-  for (const m of parsed.data.models ?? []) {
-    if (typeof m === 'string') addEntry(m);
-    else addEntry(m.model, m.displayName, m.supportsTools, m.supportsVision);
-  }
-
-  if (entries.length === 0) {
-    res.status(400).json({ error: { message: 'model or models is required' } });
-    return;
-  }
-
-  const db = getDb();
-  const upsert = db.transaction(() => {
-    // Key rows are matched on (base_url, secret): a new secret for a known
-    // endpoint is a SECOND credential for it, not a replacement (#619), and a
-    // new base_url is a separate provider (#212). Re-submitting with a blank
-    // key preserves the stored one. A submitted keyId pins WHICH credential of
-    // the pool the new models bind to (#488 bulk registration).
-    const { keyId, storedKey: storedKeyForMask } = resolveCustomEndpointKey(
-      db, baseUrl, providedKey, label, endpoint.keyId ?? undefined,
-    );
-    const endpointKeyIds = customEndpointKeyIds(db, keyId);
-    // The identity discriminator for every row registered in this call (#651).
-    const endpointScope = endpointScopeForBaseUrl(baseUrl);
-    // Unknown ≠ worst: seed the routing ranks at the catalog median so a new
-    // custom model is explored instead of buried at intelligence 0 (#488).
-    const seed = customModelSeed(db);
-
-    const registered: { modelDbId: number; model: string; displayName: string; supportsTools: boolean; supportsVision: boolean; created: boolean }[] = [];
-    for (const { modelId, displayName, supportsTools, supportsVision } of entries) {
-      // Register each model bound to THIS endpoint's key. Custom models carry no
-      // rate limits and sort last in the intelligence preset (size_label tier).
-      // Identity is per endpoint (#651): the same model id on a DIFFERENT relay
-      // is a separate row with its own enabled flag, ranks and stats, instead of
-      // silently rebinding the other endpoint's row as it used to. A model
-      // already on THIS endpoint keeps the key it has, so adding a second
-      // credential doesn't re-bind it (#619).
-      // Capability flags: an unset flag binds NULL so COALESCE picks the insert
-      // default (tools 1, vision 0) on a new row and preserves the existing
-      // value on re-registration. (#470)
-      const bound = db.prepare(
-        "SELECT key_id FROM models WHERE platform = 'custom' AND model_id = ? AND endpoint_scope = ?",
-      ).get(modelId, endpointScope) as { key_id: number | null } | undefined;
-      const created = bound === undefined;
-      const bindKeyId = bound?.key_id != null && endpointKeyIds.has(bound.key_id) ? bound.key_id : keyId;
-      const toolsParam = supportsTools === undefined ? null : (supportsTools ? 1 : 0);
-      const visionParam = supportsVision === undefined ? null : (supportsVision ? 1 : 0);
-      // The seed applies on INSERT only: DO UPDATE deliberately leaves the rank
-      // columns alone so re-registering a model (or bulk-adding alongside it)
-      // never rewrites ranks the operator has since tuned by hand.
-      db.prepare(`
-        INSERT INTO models
-          (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
-           rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window, enabled, key_id,
-           supports_tools, supports_vision, source, endpoint_scope)
-        VALUES ('custom', @modelId, @displayName, @intelligenceRank, @speedRank, @sizeLabel,
-           NULL, NULL, NULL, NULL, '', NULL, 1, @keyId,
-           COALESCE(@tools, 1), COALESCE(@vision, 0), 'user', @endpointScope)
-        ON CONFLICT(platform, model_id, endpoint_scope)
-        DO UPDATE SET
-          display_name = excluded.display_name,
-          key_id = excluded.key_id,
-          enabled = 1,
-          supports_tools = COALESCE(@tools, supports_tools),
-          supports_vision = COALESCE(@vision, supports_vision)
-      `).run({
-        modelId, displayName, keyId: bindKeyId, tools: toolsParam, vision: visionParam,
-        intelligenceRank: seed.intelligenceRank, speedRank: seed.speedRank, sizeLabel: seed.sizeLabel,
-        endpointScope,
-      });
-
-      const modelRow = db.prepare(
-        "SELECT id, supports_tools, supports_vision FROM models WHERE platform = 'custom' AND model_id = ? AND endpoint_scope = ?",
-      ).get(modelId, endpointScope) as { id: number; supports_tools: number; supports_vision: number };
-
-      // Append to the fallback chain if not already present.
-      const inChain = db.prepare('SELECT 1 FROM fallback_config WHERE model_db_id = ?').get(modelRow.id);
-      if (!inChain) {
-        const max = db.prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config').get() as { m: number };
-        db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)').run(modelRow.id, max.m + 1);
-      }
-      ensureModelInProfiles(db, modelRow.id);
-
-      registered.push({
-        modelDbId: modelRow.id,
-        model: modelId,
-        displayName,
-        supportsTools: modelRow.supports_tools === 1,
-        supportsVision: modelRow.supports_vision === 1,
-        created,
-      });
-    }
-
-    return { keyId, registered, storedKeyForMask };
-  });
-
-  const { keyId, registered, storedKeyForMask } = upsert();
-  // `model`/`displayName`/`modelDbId` echo the first model for older clients;
-  // `models` carries the full set registered in this call.
-  const first = registered[0]!;
-  res.status(201).json({
-    success: true,
-    keyId,
-    modelDbId: first.modelDbId,
-    platform: 'custom',
-    baseUrl,
-    model: first.model,
-    displayName: first.displayName,
-    supportsTools: first.supportsTools,
-    supportsVision: first.supportsVision,
-    models: registered,
-    // Bulk registration (#488) needs to tell the user what actually changed:
-    // picking a whole discovered list re-submits ids that are already there.
-    created: registered.filter(m => m.created).length,
-    alreadyRegistered: registered.filter(m => !m.created).length,
-    maskedKey: maskKey(storedKeyForMask),
-  });
 });
 
 keysRouter.post('/import', (req: Request, res: Response, next: NextFunction) => {
@@ -941,6 +865,12 @@ keysRouter.delete('/:id', (req: Request, res: Response) => {
     // so they never linger in the fallback chain forever (#189).
     if (row.platform === 'custom') {
       const defaultEmbedding = db.prepare("SELECT value FROM settings WHERE key = 'embeddings_default_family'").get() as { value: string } | undefined;
+      // #926: the scheduled custom-model sync only knows a model by "is it in
+      // the table yet". Without a tombstone, a key the operator deleted to get
+      // rid of its models would have them all re-registered by the next pass.
+      const scope = endpointScopeForBaseUrl(row.base_url);
+      const doomed = db.prepare("SELECT model_id FROM models WHERE platform = 'custom' AND key_id = ?").all(id) as { model_id: string }[];
+      for (const m of doomed) recordCustomModelTombstone(db, scope, m.model_id);
       db.prepare("DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'custom' AND key_id = ?)").run(id);
       db.prepare("DELETE FROM models WHERE platform = 'custom' AND key_id = ?").run(id);
       db.prepare("DELETE FROM embedding_models WHERE platform = 'custom' AND key_id = ?").run(id);
