@@ -8,12 +8,14 @@ import { resolveProvider } from '../providers/index.js';
 import { encrypt, decrypt, maskKey } from '../lib/crypto.js';
 import { parseKeysFromFile, stripJsoncComments, stripTrailingCommas } from '../lib/key-parser.js';
 import { assessProviderUrl } from '../lib/url-guard.js';
-import { ensureModelInProfiles } from '../services/profile-models.js';
+import { verifyCredentials } from '../services/auth.js';
 import { getActiveCooldownsForKeys, clearCooldownsForKey } from '../services/ratelimit.js';
+import { ensureModelInProfiles } from '../services/profile-models.js';
 import { resolveCustomEndpointKey, customEndpointKeyIds, siblingEndpointKeyId } from '../services/custom-endpoint.js';
 import { customModelSeed } from '../services/custom-model-seed.js';
+import { registerCustomModels, registerCustomChatModels } from '../services/custom-model-register.js';
 import { discoverEndpointModels, ModelDiscoveryError } from '../services/model-discovery.js';
-import { endpointScopeForBaseUrl, normalizeBaseUrl } from '../lib/endpoint-scope.js';
+import { probeEmbeddingDimensions } from '../services/embeddings.js';import { endpointScopeForBaseUrl, normalizeBaseUrl } from '../lib/endpoint-scope.js';
 
 export const keysRouter = Router();
 
@@ -523,77 +525,6 @@ async function rejectUnsafeBaseUrl(baseUrl: string, res: Response): Promise<bool
   return true;
 }
 
-// Ask a configured custom endpoint what models it currently serves (#488).
-// Relays add and drop models weekly, so re-typing the ids by hand goes stale
-// immediately. This reads ONLY the operator's own base_url with the operator's
-// own key — it never reads or refreshes the published provider catalog. Nothing
-// is written: the picked ids come back through POST /custom to be registered.
-const discoverModelsSchema = z.object({
-  baseUrl: z.string().url('baseUrl must be a valid URL').optional(),
-  keyId: z.number().int().positive().optional(),
-  // Lets the Keys page fetch a list for an endpoint the user is still typing in,
-  // before it has been saved. Falls back to the endpoint's stored credential.
-  apiKey: z.string().optional(),
-}).refine(
-  d => d.baseUrl !== undefined || d.keyId !== undefined,
-  { message: 'baseUrl or keyId is required' },
-);
-
-keysRouter.post('/custom/discover-models', async (req: Request, res: Response) => {
-  const parsed = discoverModelsSchema.safeParse(req.body);
-  if (!parsed.success) {
-    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
-    return;
-  }
-
-  let endpoint: CustomEndpointRef;
-  try {
-    endpoint = resolveEndpointRef(parsed.data);
-  } catch (err: any) {
-    res.status(err.status ?? 400).json({ error: { message: err.message } });
-    return;
-  }
-
-  if (await rejectUnsafeBaseUrl(endpoint.baseUrl, res)) return;
-
-  // A submitted key wins (the user may be rotating it); otherwise use what the
-  // endpoint already has. Local servers with auth off keep the 'no-key'
-  // sentinel, which the bearer header carries harmlessly.
-  const apiKey = parsed.data.apiKey?.trim() || endpoint.storedKey || 'no-key';
-
-  try {
-    const discovered = await discoverEndpointModels(endpoint.baseUrl, apiKey);
-
-    // "Already registered" means bound to THIS endpoint — any key of the pool
-    // counts, since they all serve the same model list (#619).
-    const db = getDb();
-    const registeredIds = new Set<string>();
-    if (endpoint.keyId != null) {
-      const poolIds = [...customEndpointKeyIds(db, endpoint.keyId)];
-      const placeholders = poolIds.map(() => '?').join(', ');
-      const rows = db.prepare(
-        `SELECT model_id FROM models WHERE platform = 'custom' AND key_id IN (${placeholders})`,
-      ).all(...poolIds) as { model_id: string }[];
-      for (const row of rows) registeredIds.add(row.model_id);
-    }
-
-    const models = discovered.map(m => ({ ...m, registered: registeredIds.has(m.id) }));
-    res.json({
-      baseUrl: endpoint.baseUrl,
-      keyId: endpoint.keyId,
-      models,
-      total: models.length,
-      registeredCount: models.filter(m => m.registered).length,
-    });
-  } catch (err: any) {
-    if (err instanceof ModelDiscoveryError) {
-      res.status(err.status).json({ error: { message: err.message } });
-      return;
-    }
-    res.status(502).json({ error: { message: `Model discovery failed: ${err?.message ?? 'unknown error'}` } });
-  }
-});
-
 keysRouter.post('/custom', async (req: Request, res: Response) => {
   const parsed = customProviderSchema.safeParse(req.body);
   if (!parsed.success) {
@@ -647,92 +578,9 @@ keysRouter.post('/custom', async (req: Request, res: Response) => {
   }
 
   const db = getDb();
-  const upsert = db.transaction(() => {
-    // Key rows are matched on (base_url, secret): a new secret for a known
-    // endpoint is a SECOND credential for it, not a replacement (#619), and a
-    // new base_url is a separate provider (#212). Re-submitting with a blank
-    // key preserves the stored one. A submitted keyId pins WHICH credential of
-    // the pool the new models bind to (#488 bulk registration).
-    const { keyId, storedKey: storedKeyForMask } = resolveCustomEndpointKey(
-      db, baseUrl, providedKey, label, endpoint.keyId ?? undefined,
-    );
-    const endpointKeyIds = customEndpointKeyIds(db, keyId);
-    // The identity discriminator for every row registered in this call (#651).
-    const endpointScope = endpointScopeForBaseUrl(baseUrl);
-    // Unknown ≠ worst: seed the routing ranks at the catalog median so a new
-    // custom model is explored instead of buried at intelligence 0 (#488).
-    const seed = customModelSeed(db);
-
-    const registered: { modelDbId: number; model: string; displayName: string; supportsTools: boolean; supportsVision: boolean; created: boolean }[] = [];
-    for (const { modelId, displayName, supportsTools, supportsVision } of entries) {
-      // Register each model bound to THIS endpoint's key. Custom models carry no
-      // rate limits and sort last in the intelligence preset (size_label tier).
-      // Identity is per endpoint (#651): the same model id on a DIFFERENT relay
-      // is a separate row with its own enabled flag, ranks and stats, instead of
-      // silently rebinding the other endpoint's row as it used to. A model
-      // already on THIS endpoint keeps the key it has, so adding a second
-      // credential doesn't re-bind it (#619).
-      // Capability flags: an unset flag binds NULL so COALESCE picks the insert
-      // default (tools 1, vision 0) on a new row and preserves the existing
-      // value on re-registration. (#470)
-      const bound = db.prepare(
-        "SELECT key_id FROM models WHERE platform = 'custom' AND model_id = ? AND endpoint_scope = ?",
-      ).get(modelId, endpointScope) as { key_id: number | null } | undefined;
-      const created = bound === undefined;
-      const bindKeyId = bound?.key_id != null && endpointKeyIds.has(bound.key_id) ? bound.key_id : keyId;
-      const toolsParam = supportsTools === undefined ? null : (supportsTools ? 1 : 0);
-      const visionParam = supportsVision === undefined ? null : (supportsVision ? 1 : 0);
-      // The seed applies on INSERT only: DO UPDATE deliberately leaves the rank
-      // columns alone so re-registering a model (or bulk-adding alongside it)
-      // never rewrites ranks the operator has since tuned by hand.
-      db.prepare(`
-        INSERT INTO models
-          (platform, model_id, display_name, intelligence_rank, speed_rank, size_label,
-           rpm_limit, rpd_limit, tpm_limit, tpd_limit, monthly_token_budget, context_window, enabled, key_id,
-           supports_tools, supports_vision, source, endpoint_scope)
-        VALUES ('custom', @modelId, @displayName, @intelligenceRank, @speedRank, @sizeLabel,
-           NULL, NULL, NULL, NULL, '', NULL, 1, @keyId,
-           COALESCE(@tools, 1), COALESCE(@vision, 0), 'user', @endpointScope)
-        ON CONFLICT(platform, model_id, endpoint_scope)
-        DO UPDATE SET
-          display_name = excluded.display_name,
-          key_id = excluded.key_id,
-          enabled = 1,
-          supports_tools = COALESCE(@tools, supports_tools),
-          supports_vision = COALESCE(@vision, supports_vision)
-      `).run({
-        modelId, displayName, keyId: bindKeyId, tools: toolsParam, vision: visionParam,
-        intelligenceRank: seed.intelligenceRank, speedRank: seed.speedRank, sizeLabel: seed.sizeLabel,
-        endpointScope,
-      });
-
-      const modelRow = db.prepare(
-        "SELECT id, supports_tools, supports_vision FROM models WHERE platform = 'custom' AND model_id = ? AND endpoint_scope = ?",
-      ).get(modelId, endpointScope) as { id: number; supports_tools: number; supports_vision: number };
-
-      // Append to the fallback chain if not already present.
-      const inChain = db.prepare('SELECT 1 FROM fallback_config WHERE model_db_id = ?').get(modelRow.id);
-      if (!inChain) {
-        const max = db.prepare('SELECT COALESCE(MAX(priority), 0) AS m FROM fallback_config').get() as { m: number };
-        db.prepare('INSERT INTO fallback_config (model_db_id, priority, enabled) VALUES (?, ?, 1)').run(modelRow.id, max.m + 1);
-      }
-      ensureModelInProfiles(db, modelRow.id);
-
-      registered.push({
-        modelDbId: modelRow.id,
-        model: modelId,
-        displayName,
-        supportsTools: modelRow.supports_tools === 1,
-        supportsVision: modelRow.supports_vision === 1,
-        created,
-      });
-    }
-
-    return { keyId, registered, storedKeyForMask };
-  });
-
-  const { keyId, registered, storedKeyForMask } = upsert();
-  // `model`/`displayName`/`modelDbId` echo the first model for older clients;
+  const { keyId, storedKey, registered } = registerCustomModels(
+    db, baseUrl, providedKey, label, endpoint.keyId ?? undefined, entries,
+  );  // `model`/`displayName`/`modelDbId` echo the first model for older clients;
   // `models` carries the full set registered in this call.
   const first = registered[0]!;
   res.status(201).json({
@@ -750,7 +598,7 @@ keysRouter.post('/custom', async (req: Request, res: Response) => {
     // picking a whole discovered list re-submits ids that are already there.
     created: registered.filter(m => m.created).length,
     alreadyRegistered: registered.filter(m => !m.created).length,
-    maskedKey: maskKey(storedKeyForMask),
+    maskedKey: maskKey(storedKey),
   });
 });
 
