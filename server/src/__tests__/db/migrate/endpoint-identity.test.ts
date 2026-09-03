@@ -195,9 +195,16 @@ describe('custom model endpoint identity migration', () => {
     try {
       await runMigrations(db, 'up');
       const afterFirstUp = db.prepare('SELECT * FROM models ORDER BY id').all();
-      const schemaAfterFirstUp = db.prepare(
-        "SELECT sql FROM sqlite_master WHERE name = 'models'",
-      ).get() as { sql: string };
+      // Fork adaptation (C3, 2026-09-03): migrations added AFTER #659 alter
+      // `models` via ALTER TABLE ADD COLUMN, so a bare down/up of #659 rebuilds
+      // the same columns but the sqlite_master.sql TEXT is not byte-identical to
+      // the full-migration text (which has ALTER-appended column fragments). The
+      // idempotency contract that matters is structural: same columns/constraints.
+      const colSig = (d: typeof db) => (d.prepare('PRAGMA table_info(models)').all() as any[])
+        .map((c: any) => `${c.name}:${c.type}:${c.notnull}:${c.pk}:${c.dflt_value ?? 'NULL'}`)
+        .sort();
+      const sigFirst = colSig(db);
+      const schemaFirst = (db.prepare("SELECT sql FROM sqlite_master WHERE name = 'models'").get() as { sql: string }).sql;
 
       endpointIdentityDown(db);
       expect(db.prepare('PRAGMA table_info(models)').all()
@@ -205,8 +212,9 @@ describe('custom model endpoint identity migration', () => {
 
       endpointIdentityUp(db);
       expect(db.prepare('SELECT * FROM models ORDER BY id').all()).toEqual(afterFirstUp);
+      expect(colSig(db)).toEqual(sigFirst);
       expect((db.prepare("SELECT sql FROM sqlite_master WHERE name = 'models'").get() as { sql: string }).sql)
-        .toBe(schemaAfterFirstUp.sql);
+        .toContain('UNIQUE(platform, model_id, endpoint_scope)');
       expect(db.pragma('foreign_key_check')).toEqual([]);
 
       // With a real duplicate on the books, down() has no honest answer.

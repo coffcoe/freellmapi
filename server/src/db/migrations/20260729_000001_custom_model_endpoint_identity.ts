@@ -25,40 +25,66 @@
 //     REFERENCES clauses of every child table to the new name.
 //
 // Schema only — no catalog data.
+//
+// --- Fork-compatible rewrite (C3, 2026-09-03) ---
+// Upstream hard-codes the 20-column models schema in MODELS_COLUMNS, so a
+// rebuild there DROPs the fork's 11 custom columns (category, network_tier,
+// tags, is_high_value, card_required, phone_required, commercial_ok, docs_url,
+// provider_slug, last_verified_at, probe_status). This rewrite reads the live
+// schema via PRAGMA table_info and carries every existing column verbatim,
+// so no fork column is lost. It also guards with hasColumn() so up() is
+// idempotent and down() only removes the column when it actually exists.
 
 import type { Db } from '../types.js';
 
-// The models table as of this migration, plus the new column. Written out in
-// full rather than derived, so the rebuilt schema is auditable here and
-// identical on every run.
-const MODELS_COLUMNS = `
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      platform TEXT NOT NULL,
-      model_id TEXT NOT NULL,
-      display_name TEXT NOT NULL,
-      intelligence_rank INTEGER NOT NULL,
-      speed_rank INTEGER NOT NULL,
-      size_label TEXT NOT NULL DEFAULT '',
-      rpm_limit INTEGER,
-      rpd_limit INTEGER,
-      tpm_limit INTEGER,
-      tpd_limit INTEGER,
-      monthly_token_budget TEXT NOT NULL DEFAULT '',
-      context_window INTEGER,
-      enabled INTEGER NOT NULL DEFAULT 1,
-      supports_vision INTEGER NOT NULL DEFAULT 0,
-      key_id INTEGER,
-      supports_tools INTEGER NOT NULL DEFAULT 0,
-      paid_input_per_m REAL,
-      paid_output_per_m REAL,
-      source TEXT NOT NULL DEFAULT 'catalog'`;
+interface ModelColumn {
+  name: string;
+  type: string;
+  notnull: number;
+  dflt_value: string | null;
+  pk: number;
+}
 
-const CARRIED_COLUMNS = [
-  'id', 'platform', 'model_id', 'display_name', 'intelligence_rank', 'speed_rank',
-  'size_label', 'rpm_limit', 'rpd_limit', 'tpm_limit', 'tpd_limit',
-  'monthly_token_budget', 'context_window', 'enabled', 'supports_vision', 'key_id',
-  'supports_tools', 'paid_input_per_m', 'paid_output_per_m', 'source',
-].join(', ');
+function readModelColumns(db: Db): ModelColumn[] {
+  return db.prepare('PRAGMA table_info(models)').all() as ModelColumn[];
+}
+
+function hasColumn(db: Db, column: string): boolean {
+  return readModelColumns(db).some(c => c.name === column);
+}
+
+/** Column definitions for CREATE TABLE, excluding any names in `exclude`.
+ * When `extraAfter` names a column that exists, `extra` is inserted
+ * immediately after it (so a rebuilt table keeps the same column order as
+ * one built incrementally); otherwise `extra` is appended at the end. */
+function columnDefs(db: Db, exclude: string[] = [], extraAfter?: { after: string; extra: string }): string {
+  const cols = readModelColumns(db).filter(c => !exclude.includes(c.name));
+  const out: string[] = [];
+  let inserted = false;
+  for (const c of cols) {
+    if (c.pk > 0) out.push(`"${c.name}" ${c.type} PRIMARY KEY AUTOINCREMENT`);
+    else {
+      let def = `"${c.name}" ${c.type}`;
+      if (c.notnull) def += ' NOT NULL';
+      if (c.dflt_value !== null && c.dflt_value !== undefined) def += ` DEFAULT ${c.dflt_value}`;
+      out.push(def);
+    }
+    if (extraAfter && !inserted && c.name === extraAfter.after) {
+      out.push(extraAfter.extra);
+      inserted = true;
+    }
+  }
+  if (extraAfter && !inserted) out.push(extraAfter.extra);
+  return out.join(',\n');
+}
+
+/** Column names for the INSERT/SELECT copy, excluding any names in `exclude`. */
+function carriedColumns(db: Db, exclude: string[] = []): string {
+  return readModelColumns(db)
+    .filter(c => !exclude.includes(c.name))
+    .map(c => `"${c.name}"`)
+    .join(', ');
+}
 
 // Tables whose rows must survive the DROP. Discovered from the schema rather
 // than hard-coded, so a table added later that references models is carried too.
@@ -74,7 +100,7 @@ function childTablesOfModels(db: Db): string[] {
     .map(t => t.name);
 }
 
-function rebuildModels(db: Db, extraColumns: string, copiedColumns: string, unique: string): void {
+function rebuildModels(db: Db, extraColumns: string, unique: string, exclude: string[] = [], extraAfter?: { after: string; extra: string }): void {
   const children = childTablesOfModels(db);
   // AUTOINCREMENT's high-water mark. DROP TABLE takes the sqlite_sequence row
   // with it, and copying rows back only pushes the counter to the highest id
@@ -90,11 +116,11 @@ function rebuildModels(db: Db, extraColumns: string, copiedColumns: string, uniq
   }
 
   db.exec(`
-    CREATE TABLE models_endpoint_identity (${MODELS_COLUMNS}${extraColumns},
+    CREATE TABLE models_endpoint_identity (${columnDefs(db, exclude, extraAfter)}${extraColumns},
       ${unique}
     );
-    INSERT INTO models_endpoint_identity (${copiedColumns})
-      SELECT ${copiedColumns} FROM models;
+    INSERT INTO models_endpoint_identity (${carriedColumns(db, exclude)})
+      SELECT ${carriedColumns(db, exclude)} FROM models;
     DROP TABLE models;
     ALTER TABLE models_endpoint_identity RENAME TO models;
   `);
@@ -117,12 +143,15 @@ function rebuildModels(db: Db, extraColumns: string, copiedColumns: string, uniq
 }
 
 export function up(db: Db): void {
-  rebuildModels(
-    db,
-    `,\n      endpoint_scope TEXT NOT NULL DEFAULT ''`,
-    CARRIED_COLUMNS,
-    'UNIQUE(platform, model_id, endpoint_scope)',
-  );
+  if (!hasColumn(db, 'endpoint_scope')) {
+    rebuildModels(
+      db,
+      '',
+      'UNIQUE(platform, model_id, endpoint_scope)',
+      [],
+      { after: 'source', extra: '"endpoint_scope" TEXT NOT NULL DEFAULT \'\'' },
+    );
+  }
 
   // Backfill: a custom row's scope is the base_url of the key it is bound to.
   // Rows whose key is gone (or that predate per-endpoint binding) keep '' —
@@ -161,5 +190,7 @@ export function down(db: Db): void {
   }
 
   db.exec('DROP INDEX IF EXISTS idx_models_endpoint_scope;');
-  rebuildModels(db, '', CARRIED_COLUMNS, 'UNIQUE(platform, model_id)');
+  if (hasColumn(db, 'endpoint_scope')) {
+    rebuildModels(db, '', 'UNIQUE(platform, model_id)', ['endpoint_scope']);
+  }
 }
