@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { contentToString, flattenMessageContent, messageHasImage, normalizeOutboundContent, sanitizeResponse, truncateMessagesForGithub } from '../../lib/content.js';
+import { contentToString, flattenMessageContent, messageHasImage, normalizeOutboundContent, sanitizeResponse, truncateMessagesForGithub, stripImagesFromMessages } from '../../lib/content.js';
 import { GITHUB_MAX_INPUT_TOKENS } from '../../lib/sampling-params.js';
 
 describe('contentToString', () => {
@@ -91,6 +91,35 @@ describe('messageHasImage', () => {
       { role: 'user', content: [{ type: 'text', text: 'hello' }] },
     ])).toBe(false);
     expect(messageHasImage([{ role: 'assistant', content: null }])).toBe(false);
+  });
+});
+
+describe('stripImagesFromMessages', () => {
+  it('drops image blocks but keeps text blocks', () => {
+    const out = stripImagesFromMessages([
+      { role: 'user', content: [
+        { type: 'text', text: 'hello' },
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } },
+      ] },
+    ]);
+    expect(out[0].content).toEqual([{ type: 'text', text: 'hello' }]);
+  });
+
+  it('replaces an image-only message with an empty string', () => {
+    const out = stripImagesFromMessages([
+      { role: 'user', content: [
+        { type: 'image_url', image_url: { url: 'data:image/png;base64,AA==' } },
+      ] },
+    ]);
+    expect(out[0].content).toBe('');
+  });
+
+  it('leaves string content and plain messages untouched', () => {
+    const m1 = { role: 'user', content: 'plain text' };
+    const m2 = { role: 'assistant', content: null };
+    const out = stripImagesFromMessages([m1 as any, m2 as any]);
+    expect(out[0]).toBe(m1);  // identity preserved (no unnecessary copy)
+    expect(out[1]).toBe(m2);
   });
 });
 
