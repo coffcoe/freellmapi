@@ -220,7 +220,7 @@ proxyRouter.get('/models', (req: Request, res: Response) => {
   // conservative default and truncate long inputs before they reach us (#282).
   const { models: allListed, autoContextWindow } = buildModelListing();
 
-  const q = String(req.query.available ?? req.query.connected ?? '').toLowerCase();
+  const q = String(req.query.available ?? req.query.connected ?? req.query.ready ?? '').toLowerCase();
   const onlyAvailable = q === '1' || q === 'true' || q === 'yes';
   const listed = onlyAvailable ? allListed.filter(m => m.available === 1) : allListed;
 
