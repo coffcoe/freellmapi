@@ -2,7 +2,7 @@ import crypto from 'crypto';
 import { Router } from 'express';
 import type { Request, Response } from 'express';
 import { z } from 'zod';
-import type { ChatMessage, ChatToolCall, ModelListRow } from '@freellmapi/shared/types.js';
+import type { ChatMessage, ChatToolCall, ModelListRow, TokenUsage } from '@freellmapi/shared/types.js';
 import { routeRequest, resolveRoutingChain, resolveModelGroupCandidates, recordRateLimitHit, recordSuccess, hasEnabledVisionModel, hasEnabledToolsModel, hasOtherUsableKey, routingReserveTokens, type RouteResult, type ResolvedChain, type ChainRow } from '../services/router.js';
 import { recordRequest, recordTokens, setCooldown, getCooldownDurationForLimit, PAYMENT_REQUIRED_COOLDOWN_MS, MODEL_FORBIDDEN_COOLDOWN_MS, learnLimitFromError } from '../services/ratelimit.js';
 import { runEmbeddings, EmbeddingsError } from '../services/embeddings.js';
@@ -1832,7 +1832,7 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // Hold-window state: 'undecided' until the first text either matches
         // a dialect marker (→ 'dialect': buffer everything, rescue at end) or
         // provably cannot (→ 'passthrough': flush and stream normally).
-        let mode: 'undecided' | 'passthrough' | 'dialect' = 'undecided';
+        let mode: 'undecided' | 'passthrough' | 'dialect' | 'json' = 'undecided';
         let heldText = '';
         const preamble: unknown[] = []; // role-only chunks held until flush
         const toolCallAcc = new Map<number, { id?: string; name: string; args: string }>();
@@ -1915,13 +1915,20 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
 
             if (anyChunk.id) lastMeta = { id: anyChunk.id, model: anyChunk.model, created: anyChunk.created };
 
+                        // Usage arrives either on its own frame (OpenAI's
+            // stream_options.include_usage shape) or bundled onto the last
+            // choice-bearing frame — several providers do the latter, and
+            // reading it only off choice-less frames threw their real token
+            // counts away and left accounting on the chars/4 estimate. Capture
+            // it wherever it lands, reduced to a usage-only frame: the frame's
+            // deltas are re-emitted through our own framing below, so holding
+            // the original verbatim would duplicate content (or a finish_reason
+            // the client already saw) when it is written back after our finish
+            // chunk to preserve OpenAI ordering.
+            if (anyChunk.usage) usageChunk = { ...anyChunk, choices: [], usage: anyChunk.usage };
+
             const choice = anyChunk.choices?.[0];
-            if (!choice) {
-              // Usage-only frame (stream_options.include_usage) — held and
-              // re-emitted after our finish chunk to preserve OpenAI ordering.
-              if (anyChunk.usage) usageChunk = anyChunk;
-              continue;
-            }
+            if (!choice) continue;
 
             if (choice.finish_reason) upstreamFinish = choice.finish_reason;
 
@@ -1960,11 +1967,19 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             }
 
             heldText += text;
-            if (mode === 'dialect') continue;
+            if (mode === 'dialect' || mode === 'json') continue;
 
             const probe = heldText.trimStart();
             if (startsWithDialectMarker(probe)) {
               mode = 'dialect';
+            } else if (samplingParams.response_format) {
+              // Structured-output request (#933): hold ALL text until the
+              // stream ends, then enforce JSON (mirrors the non-stream check
+              // below). Streaming bytes are already committed once headers
+              // flush, so a model that answers in prose despite the forwarded
+              // response_format must be caught here, before any byte leaves —
+              // the client asked for machine-readable output, not an essay.
+              mode = 'json';
             } else if (!couldBecomeDialectMarker(probe) || probe.length > 256) {
               mode = 'passthrough';
               flushHeaders();
@@ -2032,6 +2047,28 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             );
           }
 
+          // Structured-output enforcement for streams (#933): the non-stream
+          // path checks JSON before returning; the stream path must too, or a
+          // model that answers in prose despite the forwarded response_format
+          // ships the essay as a "success" — the worst case for a
+          // machine-readable request. json mode held every byte (headers never
+          // flushed), so failing over here is free: skipBench (provider
+          // healthy, the MODEL misbehaved) + skipModelForRequest (a sibling
+          // key would misbehave identically). Mirrors proxy.ts non-stream.
+          if (mode === 'json' && samplingParams.response_format && completedCalls.length === 0) {
+            const enforced = enforceJsonContent(heldText);
+            if (!enforced.ok) {
+              const truncated = upstreamFinish === 'length';
+              throw Object.assign(
+                new Error(truncated
+                  ? `truncated JSON from ${route.displayName} (finish_reason=length — raise max_tokens for this ${samplingParams.response_format.type} request)`
+                  : `${route.displayName} ignored response_format (returned non-JSON despite ${samplingParams.response_format.type})`),
+                { skipBench: true, skipModelForRequest: true },
+              );
+            }
+            if (enforced.healed) heldText = enforced.content;
+          }
+
           flushHeaders();
           if (heldText.length > 0) {
             writeChunk(mkChunk({ content: heldText }, null));
@@ -2047,11 +2084,51 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             ? 'tool_calls'
             : (upstreamFinish && upstreamFinish !== 'tool_calls' ? upstreamFinish : 'stop');
           writeChunk(mkChunk({}, finish));
-          if (usageChunk) writeChunk(usageChunk);
+          // One prompt-token estimate for both the injected usage frame below
+          // and the accounting fallback after it, so a client that reads the
+          // frame and the row this request writes can never disagree. Images
+          // are billed at the same flat per-image estimate the routing budget
+          // uses (the chars/4 pass sees text only).
+          const estimatedPromptTokens = estimatedInputTokens + injectedHandoffTokens + imageCount * IMAGE_TOKEN_ESTIMATE;
+          if (usageChunk) {
+            writeChunk(usageChunk);
+          } else {
+            // Some OpenAI-compatible upstreams never echo a final usage
+            // frame — neither when stream_options.include_usage is requested
+            // nor otherwise. Strict clients (Hermes, Cline, Continue) treat a
+            // missing usage block as "no accounting happened" and skip
+            // per-call token/cost/billing_provider writes entirely; agents
+            // that read usage for context-window display show 0.
+            //
+            // So inject the estimate whenever the upstream never sent one —
+            // regardless of whether the client asked for include_usage. The
+            // numbers are this gateway's own chars/4 estimate (the same total
+            // the accounting below records), never the upstream's accounting,
+            // so the block is flagged `estimated: true` rather than passed
+            // off as real counts.
+            const completionTokens = totalOutputTokens;
+            writeChunk({
+              id: lastMeta.id ?? `chatcmpl-${Date.now()}`,
+              object: 'chat.completion.chunk',
+              created: lastMeta.created ?? Math.floor(Date.now() / 1000),
+              model: lastMeta.model ?? route.modelId,
+              choices: [],
+              usage: {
+                prompt_tokens: estimatedPromptTokens,
+                completion_tokens: completionTokens,
+                total_tokens: estimatedPromptTokens + completionTokens,
+                estimated: true,
+              },
+            });
+          }
           res.write('data: [DONE]\n\n');
           res.end();
 
-          recordUpstreamSuccess(route, estimatedInputTokens + injectedHandoffTokens + totalOutputTokens);
+          const upstreamUsage = (usageChunk as { usage?: TokenUsage } | null)?.usage;
+          const inputTokens = upstreamUsage?.prompt_tokens ?? estimatedPromptTokens;
+          const outputTokens = upstreamUsage?.completion_tokens ?? totalOutputTokens;
+          const totalTokens = upstreamUsage?.total_tokens ?? (inputTokens + outputTokens);
+          recordUpstreamSuccess(route, totalTokens);
           setStickyModel(messages, route.modelDbId, sessionIdHeader, stickyStrategyKey);
           if (handoffMode !== 'off' && sessionKey) recordSuccessfulModel({ sessionKey, modelKey });
           traceRouteEvent('Proxy', {
@@ -2061,10 +2138,10 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
             platform: route.platform,
             model: route.modelId,
             latencyMs: Date.now() - start,
-            inputTokens: estimatedInputTokens + injectedHandoffTokens,
-            outputTokens: totalOutputTokens,
+            inputTokens,
+            outputTokens,
           });
-          logRequest(route.platform, route.modelId, route.keyId, 'success', estimatedInputTokens + injectedHandoffTokens, totalOutputTokens, Date.now() - start, null, ttfbMs, pinnedModelId,
+          logRequest(route.platform, route.modelId, route.keyId, 'success', inputTokens, outputTokens, Date.now() - start, null, ttfbMs, pinnedModelId,
             observeServedModel({ platform: route.platform, requestedModel: route.modelId, servedModel: upstreamModel }), clientTag);
           return 'done';
         } catch (streamErr: any) {
@@ -2225,6 +2302,20 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
         // Normalize array-shaped message.content to a string on the way out (#166).
         const outboundBody = sanitizeResponse(normalizeOutboundContent(result));
         res.setHeader('X-FreeLLM-Cache', cacheKey ? 'MISS' : 'OFF');
+
+        // #1084: agents show zero context usage when the upstream omits
+        // `usage` (many free-tier providers do). Fall back to the same
+        // chars/4 estimate used for accounting above, flagged `estimated:
+        // true` so a cost-accounting client can tell it apart from the
+        // upstream's real counts.
+        if (!outboundBody.usage) {
+          outboundBody.usage = {
+            prompt_tokens: promptTokens,
+            completion_tokens: completionTokens,
+            total_tokens: totalTokens,
+            estimated: true,
+          };
+        }
 
         // Persist the completed response for Idempotency-Key replays. Only
         // non-streaming requests with a valid key reach here; a truncated turn

@@ -305,6 +305,7 @@ export class OpenAICompatProvider extends BaseProvider {
       messages,
       stream: true,
     };
+    if (options?.stream_options) body.stream_options = options.stream_options;
     if (options?.temperature != null) body.temperature = options.temperature;
     body.max_tokens = resolveMaxTokens(this.platform, options?.max_tokens);
     if (options?.top_p != null) body.top_p = options.top_p;

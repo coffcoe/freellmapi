@@ -320,6 +320,9 @@ export interface ChatCompletionRequest {
   temperature?: number;
   max_tokens?: number;
   stream?: boolean;
+  stream_options?: {
+    include_usage?: boolean;
+  };
   top_p?: number;
   stop?: string | string[];
   tools?: ChatToolDefinition[];
@@ -340,6 +343,10 @@ export interface TokenUsage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  // Gateway-synthesized block (upstream never sent usage): flagged so a
+  // cost-accounting client can tell it apart from the upstream's real
+  // counts. (#1084)
+  estimated?: boolean;
 }
 
 export interface ChatCompletionResponse {
@@ -370,6 +377,7 @@ export interface ChatCompletionChunk {
     };
     finish_reason: string | null;
   }[];
+  usage?: TokenUsage;
 }
 
 // ---- Analytics Types ----
