@@ -15,7 +15,9 @@ import { resolveCustomEndpointKey, customEndpointKeyIds, siblingEndpointKeyId } 
 import { customModelSeed } from '../services/custom-model-seed.js';
 import { registerCustomModels, registerCustomChatModels } from '../services/custom-model-register.js';
 import { discoverEndpointModels, ModelDiscoveryError } from '../services/model-discovery.js';
-import { probeEmbeddingDimensions } from '../services/embeddings.js';import { endpointScopeForBaseUrl, normalizeBaseUrl } from '../lib/endpoint-scope.js';
+import { probeEmbeddingDimensions } from '../services/embeddings.js';
+import { endpointScopeForBaseUrl, normalizeBaseUrl } from '../lib/endpoint-scope.js';
+import { recordCustomModelTombstone } from '../services/custom-model-tombstone.js';
 
 export const keysRouter = Router();
 
@@ -602,6 +604,80 @@ keysRouter.post('/custom', async (req: Request, res: Response) => {
   });
 });
 
+// Ask a configured custom endpoint what models it currently serves (#488).
+// Relays add and drop models weekly, so re-typing the ids by hand goes stale
+// immediately. This reads ONLY the operator's own base_url with the operator's
+// own key — it never reads or refreshes the published provider catalog. Nothing
+// is written: the picked ids come back through POST /custom to be registered.
+const discoverModelsSchema = z.object({
+  baseUrl: z.string().url('baseUrl must be a valid URL').optional(),
+  keyId: z.number().int().positive().optional(),
+  // Lets the Keys page fetch a list for an endpoint the user is still typing in,
+  // before it has been saved. Falls back to the endpoint's stored credential.
+  apiKey: z.string().optional(),
+}).refine(
+  d => d.baseUrl !== undefined || d.keyId !== undefined,
+  { message: 'baseUrl or keyId is required' },
+);
+
+keysRouter.post('/custom/discover-models', async (req: Request, res: Response) => {
+  const parsed = discoverModelsSchema.safeParse(req.body);
+  if (!parsed.success) {
+    res.status(400).json({ error: { message: parsed.error.errors.map(e => e.message).join(', ') } });
+    return;
+  }
+
+  let endpoint: CustomEndpointRef;
+  try {
+    endpoint = resolveEndpointRef(parsed.data);
+  } catch (err: any) {
+    res.status(err.status ?? 400).json({ error: { message: err.message } });
+    return;
+  }
+
+  if (await rejectUnsafeBaseUrl(endpoint.baseUrl, res)) return;
+
+  // A submitted key wins (the user may be rotating it); otherwise use what the
+  // endpoint already has. Local servers with auth off keep the 'no-key'
+  // sentinel, which the bearer header carries harmlessly.
+  const apiKey = parsed.data.apiKey?.trim() || endpoint.storedKey || 'no-key';
+
+  try {
+    const discovered = await discoverEndpointModels(endpoint.baseUrl, apiKey);
+
+    // "Already registered" means bound to THIS endpoint — any key of the pool
+    // counts, since they all serve the same model list (#619).
+    const db = getDb();
+    const registeredIds = new Set<string>();
+    if (endpoint.keyId != null) {
+      const poolIds = [...customEndpointKeyIds(db, endpoint.keyId)];
+      const placeholders = poolIds.map(() => '?').join(', ');
+      const rows = db.prepare(
+        `SELECT model_id FROM models WHERE platform = 'custom' AND key_id IN (${placeholders})`,
+      ).all(...poolIds) as { model_id: string }[];
+      for (const row of rows) registeredIds.add(row.model_id);
+    }
+
+    const models = discovered.map(m => ({ ...m, registered: registeredIds.has(m.id) }));
+    res.json({
+      baseUrl: endpoint.baseUrl,
+      keyId: endpoint.keyId,
+      models,
+      total: models.length,
+      registeredCount: models.filter(m => m.registered).length,
+    });
+  } catch (err: any) {
+    if (err instanceof ModelDiscoveryError) {
+      // `upstream_error`, never `authentication_error`: this status is relayed
+      // from the operator's own endpoint, and a client that reads a bare 401 as
+      // "session expired" would sign the operator out for testing a bad key.
+      res.status(err.status).json({ error: { message: err.message, type: 'upstream_error' } });
+      return;
+    }
+    res.status(502).json({ error: { message: `Model discovery failed: ${err?.message ?? 'unknown error'}` } });
+  }
+});
+
 keysRouter.post('/import', (req: Request, res: Response, next: NextFunction) => {
   upload.single('file')(req, res, (err: any) => {
     if (handleUploadError(err, res, next)) return;
@@ -789,6 +865,12 @@ keysRouter.delete('/:id', (req: Request, res: Response) => {
     // so they never linger in the fallback chain forever (#189).
     if (row.platform === 'custom') {
       const defaultEmbedding = db.prepare("SELECT value FROM settings WHERE key = 'embeddings_default_family'").get() as { value: string } | undefined;
+      // #926: the scheduled custom-model sync only knows a model by "is it in
+      // the table yet". Without a tombstone, a key the operator deleted to get
+      // rid of its models would have them all re-registered by the next pass.
+      const scope = endpointScopeForBaseUrl(row.base_url);
+      const doomed = db.prepare("SELECT model_id FROM models WHERE platform = 'custom' AND key_id = ?").all(id) as { model_id: string }[];
+      for (const m of doomed) recordCustomModelTombstone(db, scope, m.model_id);
       db.prepare("DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'custom' AND key_id = ?)").run(id);
       db.prepare("DELETE FROM models WHERE platform = 'custom' AND key_id = ?").run(id);
       db.prepare("DELETE FROM embedding_models WHERE platform = 'custom' AND key_id = ?").run(id);
