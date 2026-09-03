@@ -9,8 +9,9 @@ import type {
   ChatToolChoice,
   Platform,
 } from '@freellmapi/shared/types.js';
-import { routeRequest, hasEnabledToolsModel, routingReserveTokens, type RouteResult } from '../services/router.js';
-import { getUnifiedApiKey } from '../db/index.js';
+import { routeRequest, hasEnabledToolsModel, resolveStickyPreference, routingReserveTokens, resolveModelGroupCandidates, type RouteResult, type ChainRow } from '../services/router.js';
+import { getDb, getUnifiedApiKey } from '../db/index.js';
+import { isUnifyEnabled, getModelGroups, resolveRequestedIdForDispatch } from '../services/model-groups.js';
 import { contentToString } from '../lib/content.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
@@ -385,8 +386,56 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   // Optional client-managed session affinity (mirrors /chat/completions).
   const rawSessionId = req.headers['x-session-id'];
   const sessionIdHeader = Array.isArray(rawSessionId) ? rawSessionId[0] : rawSessionId;
-  const preferredModel = getStickyModel(messages, sessionIdHeader);
   const requestedModelLabel = reqData.model ?? 'auto';
+
+  // Explicit `model` field pins routing. If the catalog has no enabled row
+  // matching the requested id, return 400 — silently auto-routing to a
+  // different model would be surprising to Responses API clients.
+  // Priority: explicit model > sticky session > auto routing.
+  let preferredModel: number | undefined;
+  let groupChain: ChainRow[] | undefined;
+
+  if (isAutoModel(requestedModelLabel)) {
+    preferredModel = resolveStickyPreference(getStickyModel(messages, sessionIdHeader));
+  } else {
+    const db = getDb();
+    const resolved = isUnifyEnabled() ? resolveRequestedIdForDispatch(requestedModelLabel, getModelGroups()) : null;
+    const members = resolved?.memberDbIds ?? null;
+    if (members && members.length > 0) {
+      groupChain = resolveModelGroupCandidates(members, resolved!.demotedDbIds);
+      if (groupChain.length === 0) {
+        const placeholders = members.map(() => '?').join(',');
+        const anyEnabled = db.prepare(`SELECT 1 FROM models WHERE id IN (${placeholders}) AND enabled = 1 LIMIT 1`).get(...members);
+        const reason = anyEnabled ? 'has no providers with an enabled key' : 'is disabled';
+        res.status(400).json({
+          error: {
+            message: `Model '${requestedModelLabel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
+            type: 'invalid_request_error',
+            code: 'model_not_found',
+          },
+        });
+        return;
+      }
+      const sticky = getStickyModel(messages, sessionIdHeader, requestedModelLabel);
+      preferredModel = (sticky != null && groupChain.some(r => r.model_db_id === sticky)) ? sticky : undefined;
+    } else {
+      const enabled = db.prepare('SELECT id FROM models WHERE model_id = ? AND enabled = 1').get(requestedModelLabel) as { id: number } | undefined;
+      if (enabled) {
+        preferredModel = enabled.id;
+      } else {
+        const disabled = db.prepare('SELECT id FROM models WHERE model_id = ?').get(requestedModelLabel) as { id: number } | undefined;
+        const reason = disabled ? 'is disabled' : 'is not in the catalog';
+        res.status(400).json({
+          error: {
+            message: `Model '${requestedModelLabel}' ${reason}. Use 'auto' (or omit the 'model' field) to auto-route, or call /v1/models for the available list.`,
+            type: 'invalid_request_error',
+            code: 'model_not_found',
+          },
+        });
+        return;
+      }
+    }
+  }
 
   // Tool-bearing requests (the normal case for Codex/agent clients on this
   // endpoint) must stay on models that emit structured tool_calls. Make the
