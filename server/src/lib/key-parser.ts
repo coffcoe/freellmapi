@@ -14,6 +14,9 @@ export const PREFIX_MAP: Record<string, string> = {
   GEMINI_: 'google',
   GROQ_: 'groq',
   CEREBRAS_: 'cerebras',
+  SAIL_: 'sail',
+  SAILRESEARCH_: 'sail',
+  SAIL_RESEARCH_: 'sail',
   NVIDIA_: 'nvidia',
   MISTRAL_: 'mistral',
   OPENROUTER_: 'openrouter',
@@ -45,6 +48,17 @@ export const PREFIX_MAP: Record<string, string> = {
   SEALION_: 'sealion',
   SEA_LION_: 'sealion',
   AIHORDE_: 'aihorde',
+  QIANFAN_: 'qianfan',
+  BAIDU_: 'qianfan',
+  ERNIE_: 'qianfan',
+  VOLCENGINE_: 'volcengine',
+  VOLC_: 'volcengine',
+  ARK_: 'volcengine',
+  DOUBAO_: 'volcengine',
+  LONGCAT_: 'longcat',
+  XFYUN_: 'xfyun',
+  SPARK_: 'xfyun',
+  IFLYTEK_: 'xfyun',
 };
 
 export const AUTH_JSON_PROVIDER_MAP: Record<string, string> = {
@@ -69,6 +83,20 @@ export const AUTH_JSON_PROVIDER_MAP: Record<string, string> = {
   'nara-router': 'nara',
   sealion: 'sealion',
   'sea-lion': 'sealion',
+  qianfan: 'qianfan',
+  sail: 'sail',
+  'sail-research': 'sail',
+  sailresearch: 'sail',
+  baidu: 'qianfan',
+  ernie: 'qianfan',
+  volcengine: 'volcengine',
+  volc: 'volcengine',
+  ark: 'volcengine',
+  doubao: 'volcengine',
+  longcat: 'longcat',
+  xfyun: 'xfyun',
+  spark: 'xfyun',
+  iflytek: 'xfyun',
 };
 
 export function detectPlatform(prefix: string): string | null {

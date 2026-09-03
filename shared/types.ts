@@ -117,6 +117,14 @@ export type Platform =
   // Free tier: 2000 requests/day (no card), requires Alibaba Cloud account + real-name verification.
   // API: https://api-inference.modelscope.cn/v1
   | 'modelscope'
+  // ── Chinese domestic providers (#922/#923/#924) ────────────────────
+  // Plain OpenAI-compatible Bearer endpoints. All four need Chinese
+  // real-name verification before a key serves traffic (LongCat aside).
+  | 'qianfan'
+  | 'volcengine'
+  | 'longcat'
+  | 'xfyun'
+  | 'sail'
   // User-configured OpenAI-compatible endpoint (llama.cpp, LM Studio, vLLM,
   // Ollama, any base_url). The endpoint URL lives on the api_keys row; see #117.
   | 'custom';

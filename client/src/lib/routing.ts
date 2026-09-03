@@ -169,6 +169,11 @@ export const platformColors: Record<string, string> = {
   nara:         '#2563eb',
   sealion:     '#0ea5e9',
   aihorde:     '#dc2626',
+  sail:        '#0ea5e9',
+  qianfan:     '#2932e1',
+  volcengine:  '#00b8d9',
+  longcat:     '#ffd100',
+  xfyun:       '#1f6fd0',
 }
 
 // ── Grouped (unified) rendering ──────────────────────────────────────────────

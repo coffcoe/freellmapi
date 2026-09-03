@@ -42,6 +42,8 @@ describe('key parser', () => {
     expect(detectPlatform('REQUESTY_')).toBe('requesty');
     expect(detectPlatform('NAVYAI_')).toBe('navy');
     expect(detectPlatform('SEALION_')).toBe('sealion');
+    expect(detectPlatform('SAIL_')).toBe('sail');
+    expect(detectPlatform('SAIL_RESEARCH_')).toBe('sail');
     expect(detectPlatform('SAMBANOVA_')).toBeNull();
   });
 

@@ -1,6 +1,7 @@
 import type { Platform } from '@freellmapi/shared/types.js';
 import type { BaseProvider } from './base.js';
 import { GoogleProvider } from './google.js';
+import { SailProvider } from './sail.js';
 import { OpenAICompatProvider } from './openai-compat.js';
 import { CohereProvider } from './cohere.js';
 import { CloudflareProvider } from './cloudflare.js';
@@ -16,6 +17,14 @@ function register(provider: BaseProvider) {
 
 // Google - unique Gemini API format
 register(new GoogleProvider());
+
+// Sail Research — its stable API is /v1/responses and all calls are submitted
+// as background jobs, then polled. The dedicated adapter translates terminal
+// Responses objects back to Chat Completions and handles flex-only models.
+// Sail grants $5 in free credits every month when a payment method is attached;
+// usage beyond that grant is pay-as-you-go. Model rows stay in Oracle so the
+// existing Premium-now / Free-after-30-days gate applies.
+register(new SailProvider());
 
 // Groq - OpenAI-compatible
 register(new OpenAICompatProvider({
@@ -294,6 +303,32 @@ register(new OpenAICompatProvider({
   platform: 'modelscope',
   name: 'ModelScope',
   baseUrl: 'https://api-inference.modelscope.cn/v1',
+}));
+
+// ── Chinese domestic providers (#922/#923/#924) ─────────────────────
+// Plain OpenAI-compatible Bearer endpoints, so no dedicated provider class
+// is needed. Every one of these requires Chinese real-name verification on
+// the cloud account before a key serves traffic (LongCat aside). Catalog
+// rows live in the hosted catalog, never in a migration.
+register(new OpenAICompatProvider({
+  platform: 'qianfan',
+  name: 'Baidu Qianfan',
+  baseUrl: 'https://qianfan.baidubce.com/v2',
+}));
+register(new OpenAICompatProvider({
+  platform: 'volcengine',
+  name: 'Volcengine Ark',
+  baseUrl: 'https://ark.cn-beijing.volces.com/api/v3',
+}));
+register(new OpenAICompatProvider({
+  platform: 'longcat',
+  name: 'LongCat',
+  baseUrl: 'https://api.longcat.chat/openai/v1',
+}));
+register(new OpenAICompatProvider({
+  platform: 'xfyun',
+  name: 'iFlytek Spark',
+  baseUrl: 'https://spark-api-open.xf-yun.com/v1',
 }));
 
 // Placeholder so getProvider('custom')/hasProvider('custom')/getAllProviders()
