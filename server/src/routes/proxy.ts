@@ -10,6 +10,7 @@ import { runImageGeneration, runSpeech, runTranscription, MediaError, MAX_TRANSC
 import multer from 'multer';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { contentToString, messageHasImage, normalizeOutboundContent, sanitizeResponse } from '../lib/content.js';
+import { normalizeMessageImages } from '../lib/image-normalize.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
@@ -1353,6 +1354,11 @@ proxyRouter.post('/chat/completions', async (req: Request, res: Response) => {
   });
   messages = compressionResult.messages;
   res.setHeader('X-FreeLLM-Compress', formatCompressionHeader(compressionResult));
+
+  // Downscale over-threshold inline images before estimation/routing so the
+  // token budget, payload limits, and upstream transfer all see the shrunk
+  // bytes (see lib/image-normalize.ts). Mutates the image blocks in place.
+  await normalizeMessageImages(messages);
 
   // Token estimation is intentionally a heuristic (~4 chars per token). Used
   // for routing decisions (skip a model whose budget is too small) and for

@@ -1,5 +1,6 @@
 import type { Request, Response, NextFunction } from 'express';
 import { isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError } from '../lib/error-classify.js';
+import { logRequest } from '../lib/request-log.js';
 
 /**
  * Map an error to an OpenAI-compatible error type and code.
@@ -55,7 +56,7 @@ function classifyError(err: any): { status: number; type: string; code: string }
 
   // 6. 413 — Payload too large
   if (status === 413 || msg.includes('payload too large') || msg.includes('content too large') || msg.includes('request body too large')) {
-    return { status: 413, type: 'invalid_request_error', code: 'payload_too_large' };
+    return { status: 413, type: 'invalid_request_error', code: 'request_too_large' };
   }
 
   // 7. 400 — Invalid request
@@ -72,7 +73,12 @@ function classifyError(err: any): { status: number; type: string; code: string }
   return { status: 500, type: 'server_error', code: 'internal_error' };
 }
 
-export function errorHandler(err: Error, _req: Request, res: Response, next: NextFunction) {
+// The inference wire surfaces whose over-limit bodies deserve an analytics
+// row — the dashboard renders them like any failed request instead of the
+// rejection being visible only in the container log.
+const INFERENCE_PATH_PREFIXES = ['/v1', '/v1beta', '/mcp'];
+
+export function errorHandler(err: Error, req: Request, res: Response, next: NextFunction) {
   // Don't log full stack in production (may leak internal paths)
   const isDev = process.env.NODE_ENV === 'development';
   if (isDev) {
@@ -84,6 +90,31 @@ export function errorHandler(err: Error, _req: Request, res: Response, next: Nex
   if (res.headersSent) return next(err);
 
   const { status, type, code } = classifyError(err);
+
+  // body-parser rejects bodies over the configured limit with its own error
+  // shape ('PayloadTooLargeError', type 'entity.too.large'). Agents reading
+  // the OpenAI error contract saw an opaque 413; normalize it, and record the
+  // rejection in request analytics so it shows up in the dashboard like the
+  // upstream-413 path that the fallback loop already logs.
+  if ((err as any).type === 'entity.too.large' || status === 413) {
+    const limit = (err as any).limit;
+    const received = (err as any).length ?? (err as any).expected;
+    const message = `Request body too large${typeof received === 'number' ? ` (${received} bytes)` : ''}` +
+      `${typeof limit === 'number' ? ` for the ${limit}-byte limit` : ''}. ` +
+      'Vision requests embed base64 images in the body; raise REQUEST_BODY_LIMIT_MB (default 25) to accept larger payloads.';
+    if (INFERENCE_PATH_PREFIXES.some(prefix => req.path.startsWith(prefix))) {
+      logRequest('proxy', 'payload-too-large', null, 'error', 0, 0, 0, message);
+    }
+    res.status(413).json({
+      error: {
+        message,
+        type: 'invalid_request_error',
+        code: 'request_too_large',
+      },
+    });
+    return;
+  }
+
   res.status(status).json({
     error: {
       message: err.message,
