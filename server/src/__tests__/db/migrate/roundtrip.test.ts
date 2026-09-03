@@ -27,6 +27,7 @@ const TOMBSTONE_PROVENANCE_FILENAME = '20260728_000001_tombstone_provenance.ts';
 const CUSTOM_MODEL_ENDPOINT_IDENTITY_FILENAME = '20260729_000001_custom_model_endpoint_identity.ts';
 const SCENE_ROUTING_COLUMNS_FILENAME = '20260807_000001_scene_routing_columns.ts';
 const PROVIDER_VERIFICATION_META_FILENAME = '20260824_000001_provider_verification_meta.ts';
+const BACKUPS_TABLE_FILENAME = '20260823_000002_backups_table.ts';
 
 /**
  * Hardcoded canonical list of applied-migration filenames, in the exact order
@@ -62,6 +63,7 @@ const EXPECTED_MIGRATION_FILENAMES = [
   CUSTOM_MODEL_ENDPOINT_IDENTITY_FILENAME,
   SCENE_ROUTING_COLUMNS_FILENAME,
   PROVIDER_VERIFICATION_META_FILENAME,
+    BACKUPS_TABLE_FILENAME,
 ];
 
 interface SchemaRow {
