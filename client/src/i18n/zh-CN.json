@@ -1,9 +1,0 @@
-{
-  "fallbackChain": "降级链路(Fallback Chain)",
-  "modelRouting": "模型路由(Model Routing)",
-  "rateLimits": "速率限制(Rate Limits)",
-  "tokenUsage": "令牌用量(Token Usage)",
-  "apiKeys": "API密钥(API Keys)",
-  "quickStart": "快速开始(Quick Start)",
-  "degradationStrategy": "降级策略(Degradation Strategy)"
-}
