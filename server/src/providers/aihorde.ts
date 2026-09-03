@@ -8,6 +8,7 @@ import type {
 import { BaseProvider, providerHttpError, type CompletionOptions, type KeyValidationResult } from './base.js';
 import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
 import { providerTimeoutMs } from '../lib/provider-timeout.js';
+import { resolveMaxTokens } from '../lib/sampling-params.js';
 
 /**
  * AI Horde — free, community-powered inference served by volunteer workers and
@@ -91,7 +92,10 @@ export class AIHordeProvider extends BaseProvider {
       model: modelId,
       messages,
       // Floor at 16 (proxy 422s below it); default when omitted.
-      max_tokens: Math.max(MIN_MAX_TOKENS, options?.max_tokens ?? DEFAULT_MAX_TOKENS),
+      max_tokens: Math.max(
+        MIN_MAX_TOKENS,
+        resolveMaxTokens(this.platform, options?.max_tokens ?? DEFAULT_MAX_TOKENS) ?? DEFAULT_MAX_TOKENS,
+      ),
     };
     if (options?.temperature != null) body.temperature = options.temperature;
     if (options?.top_p != null) body.top_p = options.top_p;

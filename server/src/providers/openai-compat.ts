@@ -7,6 +7,7 @@ import type {
 } from '@freellmapi/shared/types.js';
 import { BaseProvider, providerHttpError, type CompletionOptions, type KeyValidationResult } from './base.js';
 import { extendedBodyParams } from '../lib/sampling-params.js';
+import { resolveMaxTokens } from '../lib/sampling-params.js';
 import { rescueInlineToolCalls } from '../lib/tool-call-rescue.js';
 import { extractThinkFromMessage } from '../lib/think-tags.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
@@ -183,7 +184,7 @@ export class OpenAICompatProvider extends BaseProvider {
       messages,
     };
     if (options?.temperature != null) body.temperature = options.temperature;
-    if (options?.max_tokens != null) body.max_tokens = options.max_tokens;
+    body.max_tokens = resolveMaxTokens(this.platform, options?.max_tokens);
     if (options?.top_p != null) body.top_p = options.top_p;
     if (options?.stop != null) body.stop = options.stop;
     if (options?.tools != null && options.tools.length > 0) body.tools = options.tools;
@@ -305,7 +306,7 @@ export class OpenAICompatProvider extends BaseProvider {
       stream: true,
     };
     if (options?.temperature != null) body.temperature = options.temperature;
-    if (options?.max_tokens != null) body.max_tokens = options.max_tokens;
+    body.max_tokens = resolveMaxTokens(this.platform, options?.max_tokens);
     if (options?.top_p != null) body.top_p = options.top_p;
     if (options?.stop != null) body.stop = options.stop;
     if (options?.tools != null && options.tools.length > 0) body.tools = options.tools;

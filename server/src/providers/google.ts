@@ -9,6 +9,7 @@ import type {
 } from '@freellmapi/shared/types.js';
 import { BaseProvider, providerHttpError, type CompletionOptions, type KeyValidationResult } from './base.js';
 import { contentToString } from '../lib/content.js';
+import { resolveMaxTokens } from '../lib/sampling-params.js';
 import { proxyFetch } from '../lib/proxy.js';
 import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
 import { providerTimeoutMs, streamStallTimeoutMs } from '../lib/provider-timeout.js';
@@ -566,7 +567,7 @@ export class GoogleProvider extends BaseProvider {
       contents: request.contents,
       generationConfig: {
         temperature: options?.temperature,
-        maxOutputTokens: options?.max_tokens,
+        maxOutputTokens: resolveMaxTokens(this.platform, options?.max_tokens),
         topP: options?.top_p,
         stopSequences: toGeminiStopSequences(options?.stop),
         ...toGeminiExtendedConfig(options),
@@ -649,7 +650,7 @@ export class GoogleProvider extends BaseProvider {
       contents: request.contents,
       generationConfig: {
         temperature: options?.temperature,
-        maxOutputTokens: options?.max_tokens,
+        maxOutputTokens: resolveMaxTokens(this.platform, options?.max_tokens),
         topP: options?.top_p,
         stopSequences: toGeminiStopSequences(options?.stop),
         ...toGeminiExtendedConfig(options),
