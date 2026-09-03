@@ -9,10 +9,11 @@ import type {
   ChatToolChoice,
   Platform,
 } from '@freellmapi/shared/types.js';
-import { routeRequest, hasEnabledToolsModel, resolveStickyPreference, routingReserveTokens, resolveModelGroupCandidates, type RouteResult, type ChainRow } from '../services/router.js';
+import { routeRequest, hasEnabledVisionModel, hasEnabledToolsModel, resolveStickyPreference, routingReserveTokens, resolveModelGroupCandidates, type RouteResult, type ChainRow } from '../services/router.js';
 import { getDb, getUnifiedApiKey } from '../db/index.js';
 import { isUnifyEnabled, getModelGroups, resolveRequestedIdForDispatch } from '../services/model-groups.js';
-import { contentToString } from '../lib/content.js';
+import { contentToString, messageHasImage } from '../lib/content.js';
+import { normalizeMessageImages } from '../lib/image-normalize.js';
 import { repairToolArguments, toolSchemaMap } from '../lib/tool-args.js';
 import { rescueInlineToolCalls, startsWithDialectMarker, couldBecomeDialectMarker, containsDialectMarker } from '../lib/tool-call-rescue.js';
 import {
@@ -157,68 +158,199 @@ function partsToString(content: string | Array<{ type: string; text?: unknown }>
     .join('');
 }
 
-// Image input via the Responses API isn't carried through translation yet
-// (partsToString flattens to text). Detect it so we can hard-fail with a clear
-// pointer to /v1/chat/completions rather than silently dropping the image
-// (#118, #125). Recognizes the Responses `input_image` part plus the
-// chat-style `image_url` / `image` parts some clients reuse here.
-export function responsesInputHasImage(req: ResponsesRequest): boolean {
-  if (typeof req.input === 'string') return false;
-  for (const item of req.input) {
-    const content = (item as { content?: unknown }).content;
-    if (!Array.isArray(content)) continue;
-    if (content.some((p) => {
-      const type = (p as { type?: string })?.type;
-      return type === 'input_image' || type === 'image_url' || type === 'image';
-    })) return true;
+function partsToChatContent(content: string | Array<{ type: string; [k: string]: unknown }>): string | Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string; detail?: string } }> {
+  if (typeof content === 'string') return content;
+  const blocks: Array<{ type: 'text'; text: string } | { type: 'image_url'; image_url: { url: string; detail?: string } }> = [];
+  for (const p of content) {
+    const type = p.type;
+    const text = p.text;
+    if (type === 'text' || type === 'input_text' || type === 'output_text' || type === 'summary_text' || (type === undefined && typeof text === 'string')) {
+      if (typeof text === 'string') blocks.push({ type: 'text', text });
+      continue;
+    }
+    if (type === 'refusal') {
+      // The model's refusal text on a replayed assistant turn; chat providers
+      // have no refusal concept, so carry it as ordinary text.
+      const refusal = (p as { refusal?: unknown }).refusal;
+      if (typeof refusal === 'string') blocks.push({ type: 'text', text: refusal });
+      continue;
+    }
+    if (type === 'input_image' || type === 'computer_screenshot' || type === 'image_url' || type === 'image') {
+      // The image lives under `image_url`, as a bare data URL string
+      // (Responses `input_image` / `computer_screenshot`) or as
+      // `{ url }` (chat-style `image_url`). The Responses `detail` hint
+      // (low/high/auto/original) rides along; adapters without an equivalent
+      // (Gemini inlineData) ignore it. Unresolvable shapes (missing/empty
+      // url, file_id-only) are rejected up front by the route's pre-check,
+      // so dropping here never answers blind.
+      const url = extractPartImageUrl(p);
+      if (url) {
+        const detail = (p as { detail?: unknown }).detail;
+        blocks.push({ type: 'image_url', image_url: { url, ...(typeof detail === 'string' ? { detail } : {}) } });
+      }
+      continue;
+    }
   }
-  return false;
+  if (blocks.every((b) => b.type === 'text')) {
+    return blocks.map((b) => (b as { type: 'text'; text: string }).text).join('');
+  }
+  return blocks;
+}
+
+// Shared url extraction so the translation and the pre-check below always
+// agree on what counts as a resolvable image.
+function extractPartImageUrl(p: { [k: string]: unknown }): string | undefined {
+  const raw = p.image_url;
+  const url = typeof raw === 'string' ? raw : (raw as { url?: unknown } | undefined)?.url;
+  return typeof url === 'string' && url.length > 0 ? url : undefined;
+}
+
+// Responses `input_image` references an image by `image_url` OR a Files API
+// `file_id`. This proxy has no OpenAI Files backend, and the schema is
+// deliberately lenient, so an image part with no resolvable url (file_id-only,
+// or no url at all) can't survive translation — reject up front instead of
+// silently dropping it and answering blind to an image the client believes
+// was sent. (`computer_screenshot` shares these forms but is intentionally
+// not checked: computer use is rejected wholesale up front, today and until
+// it's a supported feature.)
+export function responsesInputHasFileIdImage(req: ResponsesRequest): boolean {
+  if (typeof req.input === 'string') return false;
+  return req.input.some((item) => {
+    const content = (item as { content?: unknown }).content;
+    if (!Array.isArray(content)) return false;
+    return content.some((p) => {
+      const part = p as { type?: string; [k: string]: unknown };
+      if (part.type !== 'input_image') return false;
+      return extractPartImageUrl(part) === undefined;
+    });
+  });
+}
+
+// Computer use (the Responses `computer` / `computer_use_preview` tool + its
+// computer_call/computer_call_output items) has no chat-completions equivalent:
+// the harness loop needs the model's computer_actions and screenshot context,
+// neither of which survives translation. Fail clearly (mirroring the image 422)
+// rather than silently dropping the calls and breaking the tool loop.
+export function responsesInputRequestsComputerUse(req: ResponsesRequest): boolean {
+  if ((req.tools ?? []).some((t) => t.type === 'computer' || t.type === 'computer_use_preview')) return true;
+  if (typeof req.input === 'string' || req.input == null) return false;
+  return req.input.some((item) => {
+    const type = (item as { type?: string })?.type;
+    return type === 'computer_call' || type === 'computer_call_output';
+  });
 }
 
 // ── Translate a Responses request → internal chat messages + options ──────
+
+// ── Translate a Responses request → internal chat messages + options ──────
 export function toChatMessages(req: ResponsesRequest): ChatMessage[] {
-  const messages: ChatMessage[] = [];
+  const systemMessages: ChatMessage[] = [];
 
   if (req.instructions) {
-    messages.push({ role: 'system', content: req.instructions });
+    systemMessages.push({ role: 'system', content: req.instructions });
   }
 
   if (typeof req.input === 'string') {
-    messages.push({ role: 'user', content: req.input });
-    return messages;
+    const messages = [{ role: 'user' as const, content: req.input }];
+    return [...systemMessages, ...messages];
   }
 
-  for (const item of req.input) {
+  const messages: ChatMessage[] = [];
+
+  const items = req.input;
+  for (let i = 0; i < items.length; i++) {
+    const item = items[i];
+
     if ('type' in item && item.type === 'function_call') {
-      messages.push({
-        role: 'assistant',
-        content: null,
-        tool_calls: [{
-          id: item.call_id,
+      // Parallel tool calls replay as consecutive standalone function_call
+      // items (no preceding assistant message item). Fold the run into one
+      // assistant turn, for the same reason as the message+function_call
+      // merge below: consecutive assistant turns 400 on strict upstreams.
+      const toolCalls: ChatToolCall[] = [];
+      let j = i;
+      while (j < items.length && (items[j] as { type?: string }).type === 'function_call') {
+        const fc = items[j] as z.infer<typeof functionCallItemSchema>;
+        toolCalls.push({
+          id: fc.call_id,
           type: 'function',
-          function: { name: item.name, arguments: item.arguments },
-        }],
-      });
-    } else if ('type' in item && item.type === 'function_call_output') {
+          function: { name: fc.name, arguments: fc.arguments },
+        });
+        j++;
+      }
+      messages.push({ role: 'assistant', content: null, tool_calls: toolCalls });
+      i = j - 1;
+      continue;
+    }
+
+    if ('type' in item && item.type === 'function_call_output') {
       const output = typeof item.output === 'string'
         ? item.output
         : Array.isArray(item.output)
           ? partsToString(item.output as any)
           : JSON.stringify(item.output);
       messages.push({ role: 'tool', tool_call_id: item.call_id, content: output });
-    } else {
-      // message item
-      const m = item as z.infer<typeof messageItemSchema>;
-      // 'developer' is the Responses-era system role.
-      const role = m.role === 'developer' ? 'system' : m.role;
-      messages.push({ role, content: partsToString(m.content) });
+      continue;
     }
+
+    if ('type' in item && item.type !== 'message') {
+      // computer_call / computer_call_output / reasoning / local_shell_call:
+      // no chat-message equivalent (the route 422s computer use up front).
+      // Skip rather than mis-parse as a message item.
+      continue;
+    }
+
+    // message item
+    const m = item as z.infer<typeof messageItemSchema>;
+    // 'developer' is the Responses-era system role.
+    const role = m.role === 'developer' ? 'system' : m.role;
+    const content = partsToChatContent(m.content);
+
+    if (role === 'system') {
+      // Hoist system/developer messages to the start of the conversation:
+      // chat providers (Gemini, Claude, Mistral) reject a system message that
+      // appears after a user turn. Codex history replay often emits developer
+      // items mid-conversation.
+      systemMessages.push({ role: 'system', content });
+      continue;
+    }
+
+    if (role === 'assistant') {
+      // A Responses assistant turn is a message item followed by its
+      // function_call items. Merge them into a single chat assistant message
+      // (content + tool_calls); emitting consecutive assistant turns makes
+      // Gemini map them to consecutive model turns and strict upstreams
+      // (Mistral/Cohere) 400. Drop empty assistant items — an empty turn means
+      // nothing to a chat provider. (#96)
+      const toolCalls: ChatToolCall[] = [];
+      let j = i + 1;
+      while (j < items.length && (items[j] as { type?: string }).type === 'function_call') {
+        const fc = items[j] as z.infer<typeof functionCallItemSchema>;
+        toolCalls.push({
+          id: fc.call_id,
+          type: 'function',
+          function: { name: fc.name, arguments: fc.arguments },
+        });
+        j++;
+      }
+      if (toolCalls.length > 0) {
+        messages.push({
+          role: 'assistant',
+          content: content.length > 0 ? content : null,
+          tool_calls: toolCalls,
+        });
+        i = j - 1;
+        continue;
+      }
+      if (content.length === 0) continue;
+      messages.push({ role: 'assistant', content });
+      continue;
+    }
+
+    messages.push({ role, content });
   }
 
-  return messages;
-}
-
-export function toChatTools(tools?: ResponsesRequest['tools']): ChatToolDefinition[] | undefined {
+  return [...systemMessages, ...messages];
+}export function toChatTools(tools?: ResponsesRequest['tools']): ChatToolDefinition[] | undefined {
   if (!tools?.length) return undefined;
   // Forward only function tools — chat-completions upstreams reject other
   // Responses-API tool types (web_search, local_shell, etc.). Codex sends those
@@ -332,14 +464,29 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
 
   const reqData = parsed.data;
 
-  // Vision isn't carried through the Responses translation yet — fail clearly
-  // instead of answering blind to a dropped image (#118, #125).
-  if (responsesInputHasImage(reqData)) {
+  // Computer use can't survive the chat-completions translation either (no
+  // computer tool, no screenshot context). Fail clearly instead of silently
+  // dropping the calls and breaking Codex's computer-use tool loop.
+  if (responsesInputRequestsComputerUse(reqData)) {
     res.status(422).json({
       error: {
-        message: 'Image input is not yet supported on /v1/responses. Use /v1/chat/completions with an image_url content part instead.',
+        message: 'Computer use is not yet supported on /v1/responses (the computer / computer_use_preview tool and computer_call items have no chat-completions equivalent).',
         type: 'invalid_request_error',
-        code: 'no_vision_model',
+        code: 'no_computer_use_model',
+      },
+    });
+    return;
+  }
+
+  // Unresolvable image parts (file_id-only, or no usable url) can't survive
+  // translation — fail clearly rather than dropping the image and answering
+  // blind.
+  if (responsesInputHasFileIdImage(reqData)) {
+    res.status(422).json({
+      error: {
+        message: "This request contains an image part that can't be resolved: input_image needs an image_url (an https URL or a base64 data URL); Files API file_id references aren't supported by this proxy.",
+        type: 'invalid_request_error',
+        code: 'unsupported_image_input',
       },
     });
     return;
@@ -386,18 +533,43 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
   messages = compressionResult.messages;
   res.setHeader('X-FreeLLM-Compress', formatCompressionHeader(compressionResult));
 
+  // Downscale over-threshold inline images before estimation/routing so the
+  // token budget, payload limits, and upstream transfer all see the shrunk
+  // bytes (see lib/image-normalize.ts). Mutates the image blocks in place.
+  await normalizeMessageImages(messages);
+
   const estimatedInputTokens = messages.reduce(
     (sum, m) => sum + Math.ceil(contentToString(m.content).length / 4),
     0,
   );
+  // Image requests must route to a vision-capable model (mirrors
+  // /chat/completions, proxy.ts). Reject up front with a clear message when
+  // none is enabled; when vision models are available, requireVision routing
+  // skips text-only models — including a pinned/sticky one — and falls back to
+  // a vision-capable peer (#118, #125). A rough per-image token cost keeps
+  // budget routing from being skewed by content the text heuristic can't see.
+  const hasImage = messageHasImage(messages);
+  if (hasImage && !hasEnabledVisionModel()) {
+    res.status(422).json({
+      error: {
+        message: 'This request includes an image, but no vision-capable model is enabled. Enable a vision model (e.g. Gemini 2.5 Flash, Llama 4 Scout) in the Fallback Chain.',
+        type: 'invalid_request_error',
+        code: 'no_vision_model',
+      },
+    });
+    return;
+  }
+  const IMAGE_TOKEN_ESTIMATE = 1000;
+  const imageCount = messages.reduce((n, m) =>
+    n + (Array.isArray(m.content) ? m.content.filter(b => (b as { type?: string })?.type === 'image_url' || (b as { type?: string })?.type === 'image').length : 0), 0);
   // Capped output reserve so a large max_output_tokens can't falsely exclude the
   // model pool (#470); input counts in full.
-  const estimatedTotal = estimatedInputTokens + routingReserveTokens(reqData.max_output_tokens);
+  const estimatedTotal = estimatedInputTokens + imageCount * IMAGE_TOKEN_ESTIMATE + routingReserveTokens(reqData.max_output_tokens);
 
   // Guardrail: per-request token budget (request_max_tokens_budget, default
   // off). A request with no max_output_tokens gets its output capped to the
   // budget remainder instead of a rejection.
-  const budgetCheck = applyTokenBudget(estimatedInputTokens, completionOpts.max_tokens);
+  const budgetCheck = applyTokenBudget(estimatedInputTokens + imageCount * IMAGE_TOKEN_ESTIMATE, completionOpts.max_tokens);
   if (budgetCheck.rejection) {
     res.status(413).json({
       error: { message: tokenBudgetMessage(budgetCheck.rejection), type: 'invalid_request_error', code: 'request_token_budget' },
@@ -517,7 +689,7 @@ responsesRouter.post('/responses', async (req: Request, res: Response) => {
     attemptLog,
     clientGone: () => clientGone,
     abortInFlight: () => hedgeAbort.abort(newHedgeAbortError()),
-    route: () => routeRequest(estimatedTotal, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, false, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain, completionOpts.response_format !== undefined, state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined),
+    route: () => routeRequest(estimatedTotal, state.skipKeys.size > 0 ? state.skipKeys : undefined, preferredModel, hasImage, wantsTools, state.skipModels.size > 0 ? state.skipModels : undefined, groupChain, completionOpts.response_format !== undefined, state.skipPlatforms.size > 0 ? state.skipPlatforms : undefined),
     dispatch: async (route, attempt, ctx) => {
       traceRouteEvent('Responses', {
         event: attempt === 0 ? 'start' : 'next',
