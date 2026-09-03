@@ -284,7 +284,9 @@
     "disableAll": "Disable all",
     "enableAllHint": "Turn on every model shown, then Save",
     "disableAllHint": "Turn off every model shown, then Save",
-    "enabledOfShown": "{enabled} of {shown} shown models are in the chain"
+    "enabledOfShown": "{enabled} of {shown} shown models are in the chain",
+    "imageTitle": "Image models",
+    "audioTitle": "Audio models"
   },
   "strategies": {
     "explore": "Explore unmeasured models",
@@ -404,6 +406,8 @@
     "ollamaKeyRequired": "API key required",
     "claudeAliases": "Claude Code discovery aliases",
     "claudeAliasesHint": "Expose claude/<model> aliases so the gateway model picker can list the catalog.",
+    "mcpServer": "MCP server",
+    "mcpServerHint": "Expose the /mcp endpoint for agent clients. New installs start with it off.",
     "urlTokensTitle": "Revocable URL tokens",
     "urlTokensDesc": "For headerless clients only. URL tokens can leak into history and logs, so revoke them when no longer needed.",
     "urlTokenLabel": "Token label",
@@ -748,7 +752,10 @@
     "requestedModel": "Requested model",
     "ttft": "TTFT",
     "sortBy": "Sort by {column}",
-    "sortHint": "Sorting applies to the {count} loaded rows"
+    "sortHint": "Sorting applies to the {count} loaded rows",
+    "cacheHitRate": "Cache hit rate",
+    "cacheSavedTokens": "{tokens} tokens saved",
+    "cacheHitRateHint": "{hits} hits vs {misses} misses since the server started · {requests} provider calls avoided"
   },
   "logs": {
     "title": "Logs",

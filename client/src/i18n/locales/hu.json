@@ -284,7 +284,9 @@
     "disableAll": "Disable all",
     "enableAllHint": "Turn on every model shown, then Save",
     "disableAllHint": "Turn off every model shown, then Save",
-    "enabledOfShown": "{enabled} of {shown} shown models are in the chain"
+    "enabledOfShown": "{enabled} of {shown} shown models are in the chain",
+    "imageTitle": "Image models",
+    "audioTitle": "Audio models"
   },
   "strategies": {
     "explore": "Nem mért modellek felfedezése",
@@ -550,6 +552,8 @@
     "ollamaKeyRequired": "API kulcs szükséges",
     "claudeAliases": "Claude Code felderítési aliasok",
     "claudeAliasesHint": "Tedd elérhetővé a claude/<model> aliasokat, hogy az átjáró modellválasztója listázhassa a katalógust.",
+    "mcpServer": "MCP-kiszolgáló",
+    "mcpServerHint": "Elérhetővé teszi a /mcp végpontot az ügynökklienseknek. Új telepítéseknél alapból ki van kapcsolva.",
     "urlTokensTitle": "Visszavonható URL tokenek",
     "urlTokensDesc": "Csak fejléc nélküli kliensekhez. Az URL tokenek kiszivároghatnak az előzményekbe és a naplókba, ezért vond vissza őket, ha már nincs rájuk szükség.",
     "urlTokenLabel": "Token címke",
@@ -714,7 +718,10 @@
     "ttft": "TTFT",
     "requestsByAgent": "Kérések ügynökönként",
     "sortBy": "Rendezés: {column}",
-    "sortHint": "A rendezés a betöltött {count} sorra vonatkozik"
+    "sortHint": "A rendezés a betöltött {count} sorra vonatkozik",
+    "cacheHitRate": "Gyorsítótár-találati arány",
+    "cacheSavedTokens": "{tokens} token megtakarítva",
+    "cacheHitRateHint": "{hits} találat és {misses} tévesztés a szerver indítása óta · {requests} szolgáltatóhívás megspórolva"
   },
   "logs": {
     "title": "Napló",

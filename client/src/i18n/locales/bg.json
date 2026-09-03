@@ -284,7 +284,9 @@
     "disableAll": "Disable all",
     "enableAllHint": "Turn on every model shown, then Save",
     "disableAllHint": "Turn off every model shown, then Save",
-    "enabledOfShown": "{enabled} of {shown} shown models are in the chain"
+    "enabledOfShown": "{enabled} of {shown} shown models are in the chain",
+    "imageTitle": "Image models",
+    "audioTitle": "Audio models"
   },
   "strategies": {
     "explore": "Изследване на неизмерени модели",
@@ -550,6 +552,8 @@
     "ollamaKeyRequired": "Изисква се API ключ",
     "claudeAliases": "Псевдоними за откриване на Claude Code",
     "claudeAliasesHint": "Изложете псевдоними claude/<model>, за да може селекторът на модели на шлюза да покаже каталога.",
+    "mcpServer": "MCP сървър",
+    "mcpServerHint": "Отваря крайната точка /mcp за агентни клиенти. Новите инсталации започват изключени.",
     "urlTokensTitle": "Отменяеми URL токени",
     "urlTokensDesc": "Само за клиенти без хедъри. URL токените могат да изтекат в историята и логовете, затова ги отменяйте, когато вече не са нужни.",
     "urlTokenLabel": "Етикет на токена",
@@ -714,7 +718,10 @@
     "ttft": "TTFT",
     "requestsByAgent": "Заявки по агент",
     "sortBy": "Сортиране по {column}",
-    "sortHint": "Сортирането се прилага за {count} заредени реда"
+    "sortHint": "Сортирането се прилага за {count} заредени реда",
+    "cacheHitRate": "Процент попадения в кеша",
+    "cacheSavedTokens": "Спестени {tokens} токена",
+    "cacheHitRateHint": "{hits} попадения срещу {misses} пропуска от старта на сървъра · спестени {requests} заявки към доставчик"
   },
   "logs": {
     "title": "Логове",

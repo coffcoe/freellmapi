@@ -284,7 +284,9 @@
     "disableAll": "Disable all",
     "enableAllHint": "Turn on every model shown, then Save",
     "disableAllHint": "Turn off every model shown, then Save",
-    "enabledOfShown": "{enabled} of {shown} shown models are in the chain"
+    "enabledOfShown": "{enabled} of {shown} shown models are in the chain",
+    "imageTitle": "Image models",
+    "audioTitle": "Audio models"
   },
   "strategies": {
     "explore": "Ölçülməmiş modelləri araşdır",
@@ -550,6 +552,8 @@
     "ollamaKeyRequired": "API açarı tələb olunur",
     "claudeAliases": "Claude Code aşkarlama aliasları",
     "claudeAliasesHint": "Şlüzün model seçicisi kataloqu göstərə bilsin deyə claude/<model> aliaslarını açın.",
+    "mcpServer": "MCP serveri",
+    "mcpServerHint": "/mcp son nöqtəsini agent klientlərinə açır. Yeni quraşdırmalar sönülü başlayır.",
     "urlTokensTitle": "Ləğv edilə bilən URL tokenləri",
     "urlTokensDesc": "Yalnız başlıqsız müştərilər üçün. URL tokenləri tarixçəyə və loqlara sıza bilər, ona görə də artıq lazım olmadıqda onları ləğv edin.",
     "urlTokenLabel": "Token etiketi",
@@ -714,7 +718,10 @@
     "ttft": "TTFT",
     "requestsByAgent": "Agent üzrə sorğular",
     "sortBy": "{column} üzrə sırala",
-    "sortHint": "Sıralama yalnız yüklənmiş {count} sətrə tətbiq olunur"
+    "sortHint": "Sıralama yalnız yüklənmiş {count} sətrə tətbiq olunur",
+    "cacheHitRate": "Keş uğur nisbəti",
+    "cacheSavedTokens": "{tokens} token qənaət edildi",
+    "cacheHitRateHint": "Server başladığından bəri {hits} uğur, {misses} uğursuzluq · {requests} provayder sorğusundan qaçınıldı"
   },
   "logs": {
     "title": "Loglar",

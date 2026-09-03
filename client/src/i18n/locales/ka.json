@@ -284,7 +284,9 @@
     "disableAll": "Disable all",
     "enableAllHint": "Turn on every model shown, then Save",
     "disableAllHint": "Turn off every model shown, then Save",
-    "enabledOfShown": "{enabled} of {shown} shown models are in the chain"
+    "enabledOfShown": "{enabled} of {shown} shown models are in the chain",
+    "imageTitle": "Image models",
+    "audioTitle": "Audio models"
   },
   "strategies": {
     "explore": "გაუზომავი მოდელების შესწავლა",
@@ -550,6 +552,8 @@
     "ollamaKeyRequired": "საჭიროა API გასაღები",
     "claudeAliases": "Claude Code აღმოჩენის ალიასები",
     "claudeAliasesHint": "გამოაჩინეთ claude/<model> ალიასები, რომ გეითვეის მოდელის ამრჩევმა შეძლოს კატალოგის ჩამოთვლა.",
+    "mcpServer": "MCP სერვერი",
+    "mcpServerHint": "აქვეყნებს /mcp წერტილს აგენტური კლიენტებისთვის. ახალ ინსტალაციებზე თავიდან გამორთულია.",
     "urlTokensTitle": "გაუქმებადი URL ტოკენები",
     "urlTokensDesc": "მხოლოდ ჰედერების გარეშე კლიენტებისთვის. URL ტოკენები შეიძლება მოხვდეს ისტორიასა და ჟურნალებში, ამიტომ გააუქმეთ ისინი, როცა აღარ გჭირდებათ.",
     "urlTokenLabel": "ტოკენის ლეიბლი",
@@ -714,7 +718,10 @@
     "ttft": "TTFT",
     "requestsByAgent": "მოთხოვნები აგენტების მიხედვით",
     "sortBy": "დალაგება: {column}",
-    "sortHint": "დალაგება ვრცელდება მხოლოდ ჩატვირთულ {count} სტრიქონზე"
+    "sortHint": "დალაგება ვრცელდება მხოლოდ ჩატვირთულ {count} სტრიქონზე",
+    "cacheHitRate": "ქეშის მოხვედრის მაჩვენებელი",
+    "cacheSavedTokens": "დაზოგილია {tokens} ტოკენი",
+    "cacheHitRateHint": "{hits} მოხვედრა {misses} აცდენის წინააღმდეგ სერვერის გაშვებიდან · თავიდან აცილებულია {requests} მოთხოვნა პროვაიდერთან"
   },
   "logs": {
     "title": "ჟურნალი",

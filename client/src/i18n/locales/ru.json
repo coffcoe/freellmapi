@@ -284,7 +284,9 @@
     "disableAll": "Выключить все",
     "enableAllHint": "Включить все показанные модели, затем сохранить",
     "disableAllHint": "Выключить все показанные модели, затем сохранить",
-    "enabledOfShown": "В цепочке {enabled} из {shown} показанных моделей"
+    "enabledOfShown": "В цепочке {enabled} из {shown} показанных моделей",
+    "imageTitle": "Image models",
+    "audioTitle": "Audio models"
   },
   "strategies": {
     "explore": "Исследовать неизмеренные модели",
@@ -550,6 +552,8 @@
     "ollamaKeyRequired": "Требуется API-ключ",
     "claudeAliases": "Алиасы обнаружения Claude Code",
     "claudeAliasesHint": "Публикуйте алиасы claude/<model>, чтобы селектор моделей шлюза мог отобразить каталог.",
+    "mcpServer": "Сервер MCP",
+    "mcpServerHint": "Открывает эндпоинт /mcp для агентных клиентов. В новых установках он выключен.",
     "urlTokensTitle": "Отзываемые URL-токены",
     "urlTokensDesc": "Только для клиентов без заголовков. URL-токены могут попасть в историю и логи, поэтому отзывайте их, когда они больше не нужны.",
     "urlTokenLabel": "Метка токена",
@@ -714,7 +718,10 @@
     "ttft": "TTFT",
     "requestsByAgent": "Запросы по агентам",
     "sortBy": "Сортировать по: {column}",
-    "sortHint": "Сортировка применяется к {count} загруженным строкам"
+    "sortHint": "Сортировка применяется к {count} загруженным строкам",
+    "cacheHitRate": "Доля попаданий в кэш",
+    "cacheSavedTokens": "Сэкономлено {tokens} токенов",
+    "cacheHitRateHint": "{hits} попаданий против {misses} промахов с момента запуска сервера · сэкономлено {requests} запросов к провайдеру"
   },
   "logs": {
     "title": "Журнал",

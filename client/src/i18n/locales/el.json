@@ -284,7 +284,9 @@
     "disableAll": "Disable all",
     "enableAllHint": "Turn on every model shown, then Save",
     "disableAllHint": "Turn off every model shown, then Save",
-    "enabledOfShown": "{enabled} of {shown} shown models are in the chain"
+    "enabledOfShown": "{enabled} of {shown} shown models are in the chain",
+    "imageTitle": "Image models",
+    "audioTitle": "Audio models"
   },
   "strategies": {
     "explore": "Εξερεύνηση μη μετρημένων μοντέλων",
@@ -550,6 +552,8 @@
     "ollamaKeyRequired": "Απαιτείται κλειδί API",
     "claudeAliases": "Ψευδώνυμα ανακάλυψης Claude Code",
     "claudeAliasesHint": "Εκθέστε ψευδώνυμα claude/<model> ώστε ο επιλογέας μοντέλων της πύλης να εμφανίζει τον κατάλογο.",
+    "mcpServer": "Διακομιστής MCP",
+    "mcpServerHint": "Εκθέτει το endpoint /mcp σε πελάτες πρακτόρων. Οι νέες εγκαταστάσεις ξεκινούν απενεργοποιημένες.",
     "urlTokensTitle": "Ανακλητά token URL",
     "urlTokensDesc": "Μόνο για πελάτες χωρίς κεφαλίδες. Τα token URL μπορούν να διαρρεύσουν στο ιστορικό και στα αρχεία καταγραφής, γι' αυτό ανακαλέστε τα όταν δεν χρειάζονται πια.",
     "urlTokenLabel": "Ετικέτα token",
@@ -714,7 +718,10 @@
     "ttft": "TTFT",
     "requestsByAgent": "Αιτήματα ανά πράκτορα",
     "sortBy": "Ταξινόμηση κατά {column}",
-    "sortHint": "Η ταξινόμηση ισχύει για τις {count} φορτωμένες γραμμές"
+    "sortHint": "Η ταξινόμηση ισχύει για τις {count} φορτωμένες γραμμές",
+    "cacheHitRate": "Ποσοστό ευστοχίας cache",
+    "cacheSavedTokens": "Εξοικονομήθηκαν {tokens} tokens",
+    "cacheHitRateHint": "{hits} ευστοχίες έναντι {misses} αστοχιών από την εκκίνηση του διακομιστή · αποφεύχθηκαν {requests} κλήσεις παρόχου"
   },
   "logs": {
     "title": "Καταγραφές",
