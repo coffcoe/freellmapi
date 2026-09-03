@@ -27,6 +27,7 @@ import { platformDropsResponseFormat } from '../lib/sampling-params.js';
 import { isUnifyEnabled, getModelGroups, resolveRequestedIdForDispatch } from './model-groups.js';
 import { getActiveProfileId } from './profile-models.js';
 import { customEndpointKeyIds } from './custom-endpoint.js';
+import { isDegraded } from './degradation.js';
 import { modelStatsKey, endpointScopeForBaseUrl } from '../lib/endpoint-scope.js';
 import type { BaseProvider } from '../providers/base.js';
 import type { Platform } from '@freellmapi/shared/types.js';
