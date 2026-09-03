@@ -71,6 +71,8 @@ healthRouter.post('/check/:keyId', async (req: Request, res: Response) => {
 
 // Check all keys
 healthRouter.post('/check-all', async (_req: Request, res: Response) => {
-  await checkAllKeys();
+  // Forced: a dashboard button asks for the full picture right now, so the
+  // recency skip and provider spacing of a scheduled pass would only delay it.
+  await checkAllKeys({ force: true });
   res.json({ success: true });
 });
