@@ -1,6 +1,7 @@
 import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
+import { restrictToOwner } from './file-permissions.js';
 import type { Db } from '../db/types.js';
 
 const ALGORITHM = 'aes-256-gcm';
@@ -67,14 +68,19 @@ function keyFilePathFor(db: Db): string | null {
 }
 
 // Write the hex key with a temp-file-and-rename so a crash never leaves a
-// half-written key, and chmod 0600 so it isn't readable by other local users.
+// half-written key, and restrict it to the owner so it isn't readable by other
+// local users. The temp file is restricted BEFORE the rename so the key is
+// never briefly world-readable under its final name; a rename carries the DACL
+// with it, and the second call is idempotent belt-and-braces.
 function writeKeyFileAtomic(keyFile: string, hex: string): void {
   const dir = path.dirname(keyFile);
   const tmp = path.join(dir, `${KEY_FILE_NAME}.tmp-${crypto.randomBytes(6).toString('hex')}`);
   fs.writeFileSync(tmp, hex, { mode: 0o600 });
-  try { fs.chmodSync(tmp, 0o600); } catch { /* best effort — e.g. filesystems without POSIX modes */ }
+  restrictToOwner(tmp);
   fs.renameSync(tmp, keyFile);
-  try { fs.chmodSync(keyFile, 0o600); } catch { /* best effort */ }
+  if (!restrictToOwner(keyFile)) {
+    console.warn(`[crypto] could not restrict permissions on ${KEY_FILE_NAME} — it may be readable by other local accounts`);
+  }
 }
 
 /**
@@ -151,6 +157,22 @@ function getEncryptionKey(): Buffer {
     throw new Error('Encryption key not initialized. Call initEncryptionKey() first.');
   }
   return cachedKey;
+}
+
+/**
+ * A short, non-reversible identifier for the key currently in use.
+ *
+ * Database dumps record it in their header so a restore can tell, before it
+ * touches a row, whether the api_keys ciphertext in the file was written under
+ * this key. sha256 truncated to 64 bits: enough to catch a different key,
+ * nowhere near enough to help recover the key itself, and safe to show in an
+ * error message or write to a file an operator emails around.
+ *
+ * Returns null before initEncryptionKey() has run.
+ */
+export function encryptionKeyFingerprint(): string | null {
+  if (!cachedKey) return null;
+  return `sha256:${crypto.createHash('sha256').update(cachedKey).digest('hex').slice(0, 16)}`;
 }
 
 export function isEncryptionKeyInitialized(): boolean {

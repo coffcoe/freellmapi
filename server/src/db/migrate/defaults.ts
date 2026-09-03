@@ -21,6 +21,7 @@ import * as tombstoneProvenance from '../migrations/20260728_000001_tombstone_pr
 import * as customModelEndpointIdentity from '../migrations/20260729_000001_custom_model_endpoint_identity.js';
 import * as sceneRoutingColumns from '../migrations/20260807_000001_scene_routing_columns.js';
 import * as providerVerificationMeta from '../migrations/20260824_000001_provider_verification_meta.js';
+import * as backupsTable from '../migrations/20260823_000002_backups_table.js';
 
 export interface MigrationModule {
   up(db: Db): void;
@@ -54,6 +55,7 @@ export const TOMBSTONE_PROVENANCE_FILENAME = '20260728_000001_tombstone_provenan
 export const CUSTOM_MODEL_ENDPOINT_IDENTITY_FILENAME = '20260729_000001_custom_model_endpoint_identity.ts';
 export const SCENE_ROUTING_COLUMNS_FILENAME = '20260807_000001_scene_routing_columns.ts';
 export const PROVIDER_VERIFICATION_META_FILENAME = '20260824_000001_provider_verification_meta.ts';
+export const BACKUPS_TABLE_FILENAME = '20260823_000002_backups_table.ts';
 
 export const DEFAULT_MIGRATIONS: readonly DefaultMigration[] = [
   { filename: LEGACY_BASELINE_FILENAME, module: legacyBaseline },
@@ -78,4 +80,5 @@ export const DEFAULT_MIGRATIONS: readonly DefaultMigration[] = [
   { filename: CUSTOM_MODEL_ENDPOINT_IDENTITY_FILENAME, module: customModelEndpointIdentity },
   { filename: SCENE_ROUTING_COLUMNS_FILENAME, module: sceneRoutingColumns },
   { filename: PROVIDER_VERIFICATION_META_FILENAME, module: providerVerificationMeta },
+  { filename: BACKUPS_TABLE_FILENAME, module: backupsTable },
 ];

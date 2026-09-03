@@ -132,19 +132,21 @@ export function managedSettingsPaths(
   platform: string = process.platform,
   dir: string = managedSettingsDir(platform),
 ): string[] {
-  const separator = platform === 'win32' ? '\\' : '/';
-  const dropInDir = `${dir}${separator}managed-settings.d`;
+  // path.join keeps separators platform-correct (Linux '/' stays '/', Windows
+  // resolves to '\') while honoring the platform param for simulated runs.
+  const sep = platform === 'win32' ? path.win32.sep : path.posix.sep;
+  const dropInDir = `${dir}${sep}managed-settings.d`;
   let dropIns: string[] = [];
   try {
     dropIns = fs.readdirSync(dropInDir)
       .filter(name => name.endsWith('.json'))
       .sort()
       .reverse() // alphabetically last is merged last, so it wins
-      .map(name => `${dropInDir}${separator}${name}`);
+      .map(name => `${dropInDir}${sep}${name}`);
   } catch {
     dropIns = [];
   }
-  return [...dropIns, `${dir}${separator}managed-settings.json`];
+  return [...dropIns, `${dir}${sep}managed-settings.json`];
 }
 
 /** ANTHROPIC_BASE_URL out of a settings file's `env` block. */

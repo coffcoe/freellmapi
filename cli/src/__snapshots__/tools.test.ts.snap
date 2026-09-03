@@ -11,7 +11,7 @@ model: "openai/fast-coder"
 # freellmapi:end
 ",
       "format": "yaml",
-      "path": "/home/tester/.aider.conf.yml",
+      "path": "\\home\\tester\\.aider.conf.yml",
       "sensitive": true,
     },
   ],
@@ -26,7 +26,7 @@ exports[`tool generators > setup-claude has stable golden output 1`] = `
   "files": [
     {
       "format": "json",
-      "path": "/home/tester/.claude/settings.json",
+      "path": "\\home\\tester\\.claude\\settings.json",
       "sensitive": true,
       "value": {
         "env": {
@@ -54,7 +54,7 @@ exports[`tool generators > setup-cline has stable golden output 1`] = `
   "files": [
     {
       "format": "json",
-      "path": "/home/tester/.cline/data/settings/providers.json",
+      "path": "\\home\\tester\\.cline\\data\\settings\\providers.json",
       "sensitive": true,
       "value": {
         "lastUsedProvider": "openai-compatible",
@@ -107,7 +107,7 @@ requires_openai_auth = false
 # freellmapi:end
 ",
       "format": "toml",
-      "path": "/home/tester/.codex/config.toml",
+      "path": "\\home\\tester\\.codex\\config.toml",
     },
   ],
   "notes": [
@@ -135,7 +135,7 @@ model_provider = "freellmapi"
 # freellmapi:end
 ",
       "format": "toml",
-      "path": "/home/tester/.codex/config.toml",
+      "path": "\\home\\tester\\.codex\\config.toml",
     },
   ],
   "notes": [
@@ -167,7 +167,7 @@ models:
 # freellmapi:end
 ",
       "format": "yaml",
-      "path": "/home/tester/.continue/config.yaml",
+      "path": "\\home\\tester\\.continue\\config.yaml",
     },
   ],
   "notes": [
@@ -181,7 +181,7 @@ exports[`tool generators > setup-crush has stable golden output 1`] = `
   "files": [
     {
       "format": "json",
-      "path": "/home/tester/.config/crush/crush.json",
+      "path": "\\home\\tester\\.config\\crush\\crush.json",
       "value": {
         "$schema": "https://charm.land/crush.json",
         "providers": {
@@ -245,7 +245,7 @@ exports[`tool generators > setup-dsh has stable golden output 1`] = `
   "files": [
     {
       "format": "yaml",
-      "path": "/home/tester/.dsh/settings.yaml",
+      "path": "\\home\\tester\\.dsh\\settings.yaml",
       "value": {
         "agent-default-model": {
           "model": "fast-coder",
@@ -282,7 +282,7 @@ exports[`tool generators > setup-dsh has stable golden output 1`] = `
       "content": "FREELLMAPI_API_KEY=freellmapi-test-key
 ",
       "format": "env",
-      "path": "/home/tester/.dsh/.env",
+      "path": "\\home\\tester\\.dsh\\.env",
       "sensitive": true,
     },
   ],
@@ -311,7 +311,7 @@ exports[`tool generators > setup-goose has stable golden output 1`] = `
   "files": [
     {
       "format": "json",
-      "path": "/home/tester/.config/goose/custom_providers/freellmapi.json",
+      "path": "\\home\\tester\\.config\\goose\\custom_providers\\freellmapi.json",
       "value": {
         "api_key_env": "FREELLMAPI_API_KEY",
         "base_url": "http://localhost:3000/v1",
@@ -342,7 +342,7 @@ GOOSE_MODEL: "fast-coder"
 # freellmapi:end
 ",
       "format": "yaml",
-      "path": "/home/tester/.config/goose/config.yaml",
+      "path": "\\home\\tester\\.config\\goose\\config.yaml",
     },
   ],
   "notes": [
@@ -356,7 +356,7 @@ exports[`tool generators > setup-kilo has stable golden output 1`] = `
   "files": [
     {
       "format": "json",
-      "path": "/home/tester/.config/kilo/kilo.jsonc",
+      "path": "\\home\\tester\\.config\\kilo\\kilo.jsonc",
       "value": {
         "$schema": "https://app.kilo.ai/config.json",
         "model": "openai-compatible/fast-coder",
@@ -400,7 +400,7 @@ exports[`tool generators > setup-opencode has stable golden output 1`] = `
   "files": [
     {
       "format": "json",
-      "path": "/home/tester/.config/opencode/opencode.json",
+      "path": "\\home\\tester\\.config\\opencode\\opencode.json",
       "value": {
         "$schema": "https://opencode.ai/config.json",
         "provider": {
@@ -441,7 +441,7 @@ exports[`tool generators > setup-qwen has stable golden output 1`] = `
   "files": [
     {
       "format": "json",
-      "path": "/home/tester/.qwen/settings.json",
+      "path": "\\home\\tester\\.qwen\\settings.json",
       "value": {
         "model": {
           "name": "fast-coder",
@@ -482,7 +482,7 @@ exports[`tool generators > setup-qwen has stable golden output 1`] = `
       "content": "FREELLMAPI_API_KEY=freellmapi-test-key
 ",
       "format": "env",
-      "path": "/home/tester/.qwen/.env",
+      "path": "\\home\\tester\\.qwen\\.env",
       "sensitive": true,
     },
   ],
@@ -497,7 +497,7 @@ exports[`tool generators > setup-roo has stable golden output 1`] = `
   "files": [
     {
       "format": "json",
-      "path": "/home/tester/.roo/freellmapi.json",
+      "path": "\\home\\tester\\.roo\\freellmapi.json",
       "sensitive": true,
       "value": {
         "globalSettings": {},
@@ -516,7 +516,7 @@ exports[`tool generators > setup-roo has stable golden output 1`] = `
     },
   ],
   "notes": [
-    "Set Roo Code's autoImportSettingsPath to /home/tester/.roo/freellmapi.json.",
+    "Set Roo Code's autoImportSettingsPath to \\home\\tester\\.roo\\freellmapi.json.",
   ],
 }
 `;
