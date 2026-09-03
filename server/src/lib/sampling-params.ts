@@ -23,6 +23,7 @@
 
 import { z } from 'zod';
 import type { Platform } from '@freellmapi/shared/types.js';
+import { getSetting } from '../db/index.js';
 
 // OpenAI's request-side reasoning knob. Wire values as of the current OpenAI
 // API: 'minimal'|'low'|'medium'|'high', plus 'none' (gpt-5.1). Forwarded
@@ -145,6 +146,14 @@ export interface PlatformParamPolicy {
   // are 'text' and 'json_schema'."). Upgrade json_object to a permissive
   // json_schema on the wire instead of dropping structured output entirely.
   jsonObjectToSchema?: boolean;
+  // Output-token floor sent when — and ONLY when — the client omitted
+  // max_tokens entirely (#553). Some providers apply a tiny server-side
+  // default in that case and cut the answer off mid-sentence. A
+  // client-supplied value always wins, larger or smaller. Applied by the
+  // adapters through resolveMaxTokens(), so a platform added here only takes
+  // effect once its adapter routes max_tokens through that helper (they all
+  // do).
+  defaultMaxTokens?: number;
 }
 
 // Keyed by Platform (not string) so a typo'd platform id fails tsc instead of
@@ -173,8 +182,16 @@ export const PLATFORM_PARAM_POLICIES: Partial<Record<Platform, PlatformParamPoli
   // `thinking` object) have no mapping there.
   cohere: { drop: ['top_k', 'min_p', 'repetition_penalty', 'logit_bias', 'logprobs', 'top_logprobs', 'reasoning_effort'] },
   // Workers AI's OpenAI-compat endpoint parses a known subset; send only what
-  // it understands.
-  cloudflare: { drop: ['min_p', 'logit_bias', 'logprobs', 'top_logprobs', 'reasoning_effort'] },
+  // it understands. It also applies a small server-side max_tokens default
+  // when the request omits one, so an SDK client that never sets max_tokens
+  // (the common case) sees answers stop a couple of seconds in — reported on
+  // @cf/openai/gpt-oss-120b, where the model's own reasoning trace eats the
+  // default before any visible text lands (#553). 8192 is the floor we send
+  // instead.
+  cloudflare: {
+    drop: ['min_p', 'logit_bias', 'logprobs', 'top_logprobs', 'reasoning_effort'],
+    defaultMaxTokens: 8192,
+  },
   // AI Horde builds its own payload format; none of the extended set maps.
   aihorde: { drop: [...EXTENDED_SAMPLING_KEYS] },
   // Kilo's anonymous gateway 400s ("Provider returned error") whenever
@@ -217,6 +234,66 @@ export function extendedBodyParams(platform: string, options: ExtendedSamplingOp
     out[policy?.rename?.[key] ?? key] = value;
   }
   return out;
+}
+
+/** The output-token floor this platform sends for a request that carries no
+ *  max_tokens at all, or undefined when the provider's own default is fine. */
+export function defaultMaxTokensFor(platform: string): number | undefined {
+  return PLATFORM_PARAM_POLICIES[platform as Platform]?.defaultMaxTokens;
+}
+
+/**
+ * The max_tokens to put on the wire for one request: whatever the client asked
+ * for, or the platform's floor when the client asked for nothing (#553), then
+ * lowered to the unified output cap when the operator configured one. With the
+ * cap off (the default) nothing is clamped — a client-set value passes through
+ * untouched in both directions, and the gateway's own guardrails (token budget,
+ * routing reserve) have already had their say by the time an adapter calls this.
+ *
+ * EVERY adapter must send max_tokens through here, or the cap is not unified:
+ * openai-compat (and its subclasses), cloudflare, cohere, google and aihorde
+ * all do.
+ */
+export function resolveMaxTokens(platform: string, requested: number | undefined): number | undefined {
+  const resolved = requested ?? defaultMaxTokensFor(platform);
+  if (resolved == null) return resolved;
+  const cap = unifiedMaxTokensCap();
+  return cap == null ? resolved : Math.min(resolved, cap);
+}
+
+// ── Unified output-token cap ─────────────────────────────────────────────────
+// Optional operator-level ceiling on max_tokens for EVERY client. Aggressive
+// clients (Open WebUI sends max_tokens=65536 by default) 400 against free
+// models whose output limit is 32768 (CF qwen3-30b, zhipu glm), and without a
+// ceiling the same invalid value rides every fallback candidate — the chain
+// cannot rescue the request. The cap only LOWERS an
+// excessive value; a client value at or below it is untouched, and clients that
+// send nothing still get today's platform floor. 'off' (default) keeps the
+// historical pass-through behaviour.
+export const UNIFIED_MAX_TOKENS_SETTING = 'unified_max_tokens';
+/** The ceiling 'auto' clamps to: the output limit of the largest common free
+ *  catalog models. */
+export const UNIFIED_MAX_TOKENS_AUTO = 32768;
+
+/** The configured unified output cap, or null when disabled ('off'/unset).
+ *  'auto' resolves to UNIFIED_MAX_TOKENS_AUTO; an explicit integer is used
+ *  verbatim; anything else is treated as disabled so a bad value can't 400
+ *  requests. Reads the settings table on every call — cheap (better-sqlite3
+ *  sync read) and picks up dashboard changes without a restart, mirroring
+ *  guardrails.ts. */
+export function unifiedMaxTokensCap(): number | null {
+  let raw: string | undefined;
+  try {
+    raw = getSetting(UNIFIED_MAX_TOKENS_SETTING);
+  } catch {
+    return null; // DB not ready — never throw on the proxy hot path
+  }
+  if (!raw) return null;
+  const value = raw.trim().toLowerCase();
+  if (value === '' || value === 'off' || value === '0') return null;
+  if (value === 'auto') return UNIFIED_MAX_TOKENS_AUTO;
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? n : null;
 }
 
 /** True when this platform's policy strips response_format before send — the
