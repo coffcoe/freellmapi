@@ -46,6 +46,11 @@ function parseOverrides(raw: string | undefined): StoredOverrides {
   }
 }
 
+export function overriddenFieldNames(overridesJson: string | null | undefined): Array<keyof ModelOverridePatch> {
+  const stored = parseOverrides(overridesJson ?? undefined);
+  return (Object.keys(stored) as Array<keyof ModelOverridePatch>).filter(key => key in OVERRIDE_COLUMNS);
+}
+
 function toDbValue(key: keyof ModelOverridePatch, value: unknown): unknown {
   if (key === 'supportsVision' || key === 'supportsTools' || key === 'enabled') return value ? 1 : 0;
   return value;

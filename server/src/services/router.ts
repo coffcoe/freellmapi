@@ -864,6 +864,14 @@ function filterExhaustedQuota(db: Db, chain: ChainRow[]): ChainRow[] {
   return filtered.length > 0 ? filtered : chain;
 }
 
+export function resolveStickyPreference(stickyModelDbId: number | undefined, chain?: ChainRow[]): number | undefined {
+  if (stickyModelDbId == null) return undefined;
+  const rows = chain ?? getActiveChain(getDb());
+  return rows.some(entry => entry.model_db_id === stickyModelDbId && entry.enabled)
+    ? stickyModelDbId
+    : undefined;
+}
+
 function getActiveChain(db: Db): ChainRow[] {
   const profileId = getActiveProfileId(db);
   if (profileId != null) {

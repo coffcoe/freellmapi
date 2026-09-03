@@ -32,6 +32,14 @@ import { sanitizeProviderErrorMessage } from '../lib/error-redaction.js';
 import { isClientAbortError, newClientAbortError } from '../lib/error-classify.js';
 import { inferQuotaPoolKey, type QuotaObservationContext } from '../services/provider-quota.js';
 
+const AUTO_MODEL_ID = 'auto';
+
+function isAutoModel(modelId: string | undefined): boolean {
+  if (!modelId) return true;
+  const lower = modelId.toLowerCase();
+  return lower === AUTO_MODEL_ID || lower.startsWith(`${AUTO_MODEL_ID}:`);
+}
+
 export const responsesRouter = Router();
 
 // ─────────────────────────────────────────────────────────────────────────
