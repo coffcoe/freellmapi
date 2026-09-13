@@ -1,0 +1,19 @@
+# Normalize line endings to LF on checkout/commit (2026-09-13).
+# Isolates CRLF noise from business diffs; applied via `git add --renormalize .`.
+* text=auto eol=lf
+
+# Common binary-ish artifacts that must never be re-encoded.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.pdf binary
+*.zip binary
+*.gz binary
+*.sqlite binary
+*.db binary
