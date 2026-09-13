@@ -16,7 +16,12 @@
 
 $ErrorActionPreference = "Stop"
 $root   = "D:\Users\Yin\freellmapi"
-$node   = "C:\Users\coffcoe\.workbuddy\binaries\node\versions\22.22.2\node.exe"
+# Node version guard (2026-09-12): resolve-path.ps1 now returns node 24.14.0 first, but the
+# better-sqlite3 native binding is compiled for Node 22 (NODE_MODULE_VERSION 127 vs 137), so
+# starting under Node 24 aborts with "was compiled against a different Node.js version".
+# Keep auto-discovery but restrict it to a Node 22 binary; fallback below stays 22.22.2-2.
+$node   = (powershell -NoProfile -ExecutionPolicy Bypass -File "D:\tools\scripts\resolve-path.ps1" -Tool node 2>$null | Where-Object { $_ -match 'versions\\22\.' -or $_ -match 'node22' } | Select-Object -First 1)
+if (-not $node -or -not (Test-Path $node)) { $node = "D:\Users\Yin\.workbuddy\binaries\node\versions\22.22.2-2\node.exe" }
 $logDir = Join-Path $root "server\logs"
 $debug  = Join-Path $logDir "restart-debug.log"
 
@@ -42,9 +47,13 @@ try {
     }
 
     # 2. clean logs older than 7 days
-    Get-ChildItem $logDir -Filter "freellmapi-*.log" -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } | Remove-Item -Force -ErrorAction SilentlyContinue
-    Log "step2: old logs cleaned"
+    # PS5.1 trap: piping an EMPTY collection into Remove-Item throws "Remove-Item: missing
+    # path operand", which is fatal under $ErrorActionPreference='Stop' (this killed the
+    # 2026-09-12 restart: the first run deleted the old logs, every later run then died here).
+    $oldLogs = @(Get-ChildItem $logDir -Filter "freellmapi-*.log" -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) })
+    if ($oldLogs.Count -gt 0) { $oldLogs | Remove-Item -Force -ErrorAction SilentlyContinue }
+    Log "step2: old logs cleaned (removed=$($oldLogs.Count))"
 
     # 3. start detached + redirect logs
     $ts     = Get-Date -Format "yyyyMMdd-HHmmss"
