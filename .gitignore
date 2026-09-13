@@ -27,3 +27,18 @@ add-*.js
 freellmapi-*.user.js
 README-AUTOSTART.md
 README-CHINESE-USERSCRIPT.md
+
+# --- Local backups / secret-bearing artifacts (2026-09-13) -----------------
+# Never commit: these contain real API keys or are throwaway restore copies.
+# NOTE: the `*.bak` rule above does NOT match them — they end with a timestamp
+# suffix (e.g. `.env.bak-20260907`), not with `.bak`.
+.env.bak-*
+.fix-backup-*/
+*.c1-backup
+restart-freellmapi.ps1.bak-*
+server/dist.bak-*/
+
+# --- Local code-graph tooling output (2026-09-13) --------------------------
+# Regenerable analysis artifacts, ~31M / 77 files (graph.json 12M, graph.html,
+# GRAPH_REPORT.md x4, cache/ast/*.json). Never commit.
+graphify-out/
