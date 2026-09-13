@@ -3,6 +3,8 @@ import { initDb, getDb } from '../../db/index.js';
 import { encrypt } from '../../lib/crypto.js';
 import {
   getAllPenalties,
+  getRoutingScores,
+  platformHealthFactors,
   recordRateLimitHit,
   routeRequest,
   setRoutingStrategy,
@@ -274,5 +276,57 @@ describe('Router exhaustion diagnostics (issue _1)', () => {
     try { routeRequest(); } catch (e) { caught = e; }
     expect(caught).toBeDefined();
     expect(caught.diagnostics.some((d: string) => /cooldown/.test(d))).toBe(true);
+  });
+
+  // ── B-1 health-signal demotion (2026-09-07 T1) ───────────────────────────
+  it('platformHealthFactors: hard: error demotes 0.9, soft: is a near-no-op', () => {
+    const db = getDb();
+    const seedKey = (platform: string, err: string | null) => {
+      const { encrypted, iv, authTag } = encrypt('test-key');
+      db.prepare(`
+        INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled, last_health_error)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(platform, 'test', encrypted, iv, authTag, 'healthy', 1, err);
+    };
+    seedKey('plat-hard', 'hard: provider not registered: plat-hard');
+    seedKey('plat-soft', 'soft: transport error: fetch failed');
+    seedKey('plat-mixed', 'soft: transport error: fetch failed');
+    seedKey('plat-mixed', 'hard: provider not registered: plat-mixed');
+    seedKey('plat-clean', null);
+
+    const factors = platformHealthFactors(db);
+    expect(factors.get('plat-hard')).toBe(0.9);
+    expect(factors.get('plat-soft')).toBe(0.98);
+    expect(factors.get('plat-mixed')).toBe(0.9); // hard wins over soft
+    expect(factors.has('plat-clean')).toBe(false); // no signal → neutral
+  });
+
+  // B-1 health-signal demotion, verified deterministically: a `hard:` error on a
+  // key lowers that model's combined routing score — the 0.9 factor folds into the
+  // reliability axis inside scoreChainEntry. getRoutingScores() scores with
+  // sampled=false, so the comparison is exact (no Thompson-sampling noise) and
+  // isolates the health effect by re-scoring the *same* model before/after.
+  it('hard: health error lowers the model routing score (B-1, deterministic)', () => {
+    const db = getDb();
+    const target = db.prepare(
+      `SELECT id, platform FROM models WHERE platform = 'groq' AND key_id IS NULL ORDER BY id LIMIT 1`
+    ).get() as { id: number; platform: string };
+    const { encrypted, iv, authTag } = encrypt('test-key');
+    db.prepare(
+      `INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+       VALUES (?, 'test', ?, ?, ?, 'healthy', 1)`
+    ).run(target.platform, encrypted, iv, authTag);
+    const keyId = (db.prepare('SELECT last_insert_rowid() AS id').get() as { id: number }).id;
+
+    const clean = getRoutingScores().scores.find(s => s.modelDbId === target.id);
+    expect(clean).toBeDefined();
+
+    db.prepare('UPDATE api_keys SET last_health_error = ? WHERE id = ?')
+      .run(`hard: provider not registered: ${target.platform}`, keyId);
+    const hard = getRoutingScores().scores.find(s => s.modelDbId === target.id);
+    expect(hard).toBeDefined();
+
+    // The hard: signal must reduce the score (reliability axis × 0.9).
+    expect(hard!.score).toBeLessThan(clean!.score);
   });
 });

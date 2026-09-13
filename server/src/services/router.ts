@@ -652,6 +652,36 @@ function usableKeyCountsByPlatform(db: Db): Map<string, number> {
   return new Map(rows.map(r => [r.platform, r.count]));
 }
 
+/**
+ * Health-signal factors per platform (T1 · 2026-09-07, B-1).
+ *
+ * Consumes the severity protocol written by health.ts (hard:/soft: prefix on
+ * last_health_error). hard: = permanent (provider not registered / confirmed
+ * 401-403) — a real demotion signal; soft: = transient network (DNS/timeout/
+ * TLS) — informational, near-no-op. One query before ordering, then pure map
+ * lookups in scoreChainEntry (no per-model DB access). A platform with any
+ * hard: error is demoted regardless of soft entries; a platform seen only with
+ * soft: entries gets the gentler factor. Models with no signal keep 1 (neutral).
+ */
+export function platformHealthFactors(db: Db): Map<string, number> {
+  const rows = db.prepare(`
+    SELECT platform, last_health_error FROM api_keys
+     WHERE enabled = 1
+       AND last_health_error IS NOT NULL
+       AND last_health_error != ''
+  `).all() as { platform: string; last_health_error: string }[];
+  const out = new Map<string, number>();
+  for (const r of rows) {
+    const hard = r.last_health_error.startsWith('hard:');
+    if (hard) {
+      out.set(r.platform, 0.9); // hard demotion (won't be downgraded by later soft)
+    } else if (!out.has(r.platform)) {
+      out.set(r.platform, 0.98); // soft: informational, near-no-op
+    }
+  }
+  return out;
+}
+
 import { inferModelCategory } from './model-category.js';
 import type { SceneSignal } from "../lib/scene.js";
 export interface ModelSceneAttrs { category: string | null; networkTier: string | null; tags: string[]; }
@@ -665,6 +695,7 @@ function scoreChainEntry(
   intelMax: number,
   sampled: boolean,
   keyCounts: Map<string, number>,
+  healthFactors: Map<string, number>,
   scene?: SceneSignal,
   sceneAttrs?: Map<number, ModelSceneAttrs>,
 ): ScoredEntry {
@@ -679,6 +710,12 @@ function scoreChainEntry(
   } else {
     reliability = expectedReliability(successes, failures);
   }
+
+  // Health-signal demotion (B-1): hard errors sink the platform's reliability
+  // slightly (0.9); soft/transient errors are a near-no-op (0.98). Folded into
+  // the reliability axis so combineScore keeps its 2 multiplicative dampers.
+  const healthFactor = healthFactors.get(entry.platform) ?? 1;
+  reliability = reliability * healthFactor;
 
   const speed = speedScore(stats?.tokPerSec ?? 0, stats?.avgTtfbMs ?? null);
   const intelligence = intelligenceScore(
@@ -802,9 +839,10 @@ function orderChain(chain: ChainRow[], strategy: RoutingStrategy, sampled = true
   const intelMin = composites.length ? Math.min(...composites) : 0;
   const intelMax = composites.length ? Math.max(...composites) : 0;
   const keyCounts = usableKeyCountsByPlatform(getDb());
+  const healthFactors = platformHealthFactors(getDb());
 
   return chain
-    .map(e => ({ e, s: scoreChainEntry(e, weights, intelMin, intelMax, sampled, keyCounts, scene, attrs).score }))
+    .map(e => ({ e, s: scoreChainEntry(e, weights, intelMin, intelMax, sampled, keyCounts, healthFactors, scene, attrs).score }))
     // Higher score first WITHIN a tier; manual priority breaks ties so the chain
     // still matters.
     .sort((a, b) => tier(a.e) - tier(b.e) || b.s - a.s || a.e.priority - b.e.priority)
@@ -1654,9 +1692,10 @@ export function getRoutingScores(): { strategy: RoutingStrategy; weights: Routin
   const intelMin = composites.length ? Math.min(...composites) : 0;
   const intelMax = composites.length ? Math.max(...composites) : 0;
   const keyCounts = usableKeyCountsByPlatform(db);
+  const healthFactors = platformHealthFactors(db);
 
   const scores: RoutingScore[] = chain.map(entry => {
-    const scored = scoreChainEntry(entry, weights, intelMin, intelMax, false, keyCounts);
+    const scored = scoreChainEntry(entry, weights, intelMin, intelMax, false, keyCounts, healthFactors);
     const stats = statsCache?.get(modelStatsKey(entry.platform, entry.model_id, entry.endpoint_scope));
     return {
       modelDbId: entry.model_db_id,

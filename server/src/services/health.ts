@@ -74,7 +74,20 @@ export async function checkKeyHealth(keyId: number): Promise<KeyStatus> {
   if (!row) return 'error';
 
   const provider = resolveProvider(row.platform as Platform, row.base_url);
-  if (!provider) return 'error';
+  if (!provider) {
+    // Platform not registered (key whose provider was never added, or removed
+    // upstream — e.g. a local-only DIRECT_PROVIDERS entry like xunfei). This
+    // used to silently return 'error' with no bookkeeping, freezing
+    // last_checked_at and leaving status stale ('healthy' forever) while the
+    // router still picked the key and failed at request time. Now record the
+    // diagnostic + timestamp (visibility, not verdict): status is left
+    // untouched so we neither claim health we cannot verify nor silently
+    // remove capacity; the dashboard/audit can see the key is unverifiable.
+    db.prepare(
+      "UPDATE api_keys SET last_health_error = ?, last_checked_at = datetime('now') WHERE id = ?",
+    ).run(`hard: provider not registered: ${row.platform}`, keyId);
+    return 'error';
+  }
 
   try {
     // Keyless providers (kilo, pollinations anon tier) store a sentinel encrypted
@@ -100,7 +113,7 @@ export async function checkKeyHealth(keyId: number): Promise<KeyStatus> {
     const status: KeyStatus = isValid ? 'healthy' : 'invalid';
 
     db.prepare("UPDATE api_keys SET status = ?, last_health_error = ?, last_checked_at = datetime('now') WHERE id = ?")
-      .run(status, lastError, keyId);
+      .run(status, lastError ? `hard: ${lastError}` : null, keyId);
 
     if (isValid) {
       failureCount.delete(keyId);
@@ -135,7 +148,7 @@ export async function checkKeyHealth(keyId: number): Promise<KeyStatus> {
     // and the timestamp; leave the verdict to a probe that actually reached the
     // provider. Confirmed 401/403 (the isValid=false path above) still demotes.
     db.prepare("UPDATE api_keys SET last_health_error = ?, last_checked_at = datetime('now') WHERE id = ?")
-      .run(lastError, keyId);
+      .run(`soft: ${lastError}`, keyId);
     return row.status as KeyStatus;
   }
 }

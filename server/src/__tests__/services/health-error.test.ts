@@ -52,7 +52,7 @@ describe('persisted key health diagnostics', () => {
     expect(await checkKeyHealth(id)).toBe('invalid');
     expect(row(id)).toEqual({
       status: 'invalid',
-      last_health_error: 'Mistral key validation failed (HTTP 401): token expired',
+      last_health_error: 'hard: Mistral key validation failed (HTTP 401): token expired',
     });
     expect(warn).toHaveBeenCalledWith(expect.stringContaining('token expired'));
   });
@@ -63,11 +63,12 @@ describe('persisted key health diagnostics', () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => {});
 
     // Seeded as 'unknown', and a transport error preserves that rather than
-    // demoting to 'error' — the diagnostic is still recorded either way.
+    // demoting to 'error' — the diagnostic is still recorded either way. The
+    // health-grading protocol (B-1) prefixes the persisted error with `soft:`.
     expect(await checkKeyHealth(id)).toBe('unknown');
     expect(row(id)).toMatchObject({
       status: 'unknown',
-      last_health_error: 'Bearer [redacted] failed at [redacted-url]',
+      last_health_error: 'soft: Bearer [redacted] failed at [redacted-url]',
     });
     expect(String(error.mock.calls[0][0])).not.toContain('secret-token-value');
   });
