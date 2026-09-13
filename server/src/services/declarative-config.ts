@@ -134,15 +134,18 @@ function encryptedKey(raw: string) {
   return { encrypted, iv, authTag };
 }
 
-// Boot-time skip guard for `keys` entries (#600). When a platform stops being
-// keyless (pollinations lost `keyless: true` in #573), a legacy declarative
-// config still carries an entry with no `key` — applyDeclarativeConfigFromEnv()
-// runs in main(), so throwing here used to brick the whole install at startup.
-// Such entries degrade to a warning + skip; the rest of the config still
+// Boot-time skip guard for `keys` entries (#600). A non-keyless platform whose
+// legacy declarative config still carries an entry with no `key` used to brick
+// the install at startup (applyDeclarativeConfigFromEnv() runs in main()), so
+// such entries degrade to a warning + skip and the rest of the config still
 // applies. Platform-specific remediation hints live here.
-const MISSING_KEY_HINTS: Record<string, string> = {
-  pollinations: 'pollinations now requires an API key — get one at enter.pollinations.ai',
-};
+//
+// NOTE (2026-09-08): pollinations *regained* `keyless: true` (anonymous
+// text.pollinations.ai/openai/v1 endpoint), so a legacy keyless pollinations
+// entry is now VALID and becomes a sentinel key rather than being skipped. The
+// guard below returns null for any keyless provider (see missingKeyWarning),
+// which is exactly the correct path for pollinations now.
+const MISSING_KEY_HINTS: Record<string, string> = {};
 
 function missingKeyWarning(input: z.infer<typeof keySchema>): string | null {
   const platform = input.platform.trim();

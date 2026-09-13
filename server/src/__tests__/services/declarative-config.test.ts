@@ -109,7 +109,7 @@ describe('declarative config import', () => {
   // config with a keyless-era pollinations entry (no `key`) used to throw at
   // boot and brick the install. Missing-key entries must now degrade to a
   // per-entry skip + warning instead of killing the apply.
-  it('skips a legacy keyless entry without a key, warns, and still applies the rest', () => {
+  it('applies a legacy keyless pollinations entry as a sentinel and still applies the rest', () => {
     const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     try {
       const result = applyDeclarativeConfig({
@@ -118,14 +118,12 @@ describe('declarative config import', () => {
           { platform: 'groq', key: 'gsk_config_key', label: 'config' },
         ],
       });
+      // pollinations is keyless again (2026-09-08), so a no-key entry is valid
+      // and becomes a sentinel row rather than being skipped.
       expect(result.applied).toBe(true);
-      expect(result.keys).toBe(1);
-      expect(result.warnings).toHaveLength(1);
-      expect(result.warnings[0]).toContain('pollinations');
-      expect(result.warnings[0]).toContain('enter.pollinations.ai');
-      expect(result.warnings[0]).toContain('entry skipped');
-      expect(warn).toHaveBeenCalledWith(expect.stringContaining('pollinations'));
-      expect((getDb().prepare("SELECT COUNT(*) AS n FROM api_keys WHERE platform = 'pollinations'").get() as { n: number }).n).toBe(0);
+      expect(result.keys).toBe(2);
+      expect(result.warnings).toHaveLength(0);
+      expect((getDb().prepare("SELECT COUNT(*) AS n FROM api_keys WHERE platform = 'pollinations'").get() as { n: number }).n).toBe(1);
       expect((getDb().prepare("SELECT COUNT(*) AS n FROM api_keys WHERE platform = 'groq'").get() as { n: number }).n).toBe(1);
     } finally {
       warn.mockRestore();
@@ -143,7 +141,8 @@ describe('declarative config import', () => {
       });
       expect(() => applyDeclarativeConfigFromEnv()).not.toThrow();
       expect((getDb().prepare("SELECT COUNT(*) AS n FROM api_keys WHERE platform = 'groq'").get() as { n: number }).n).toBe(1);
-      expect((getDb().prepare("SELECT COUNT(*) AS n FROM api_keys WHERE platform = 'pollinations'").get() as { n: number }).n).toBe(0);
+      // keyless pollinations entry now creates a sentinel (not skipped)
+      expect((getDb().prepare("SELECT COUNT(*) AS n FROM api_keys WHERE platform = 'pollinations'").get() as { n: number }).n).toBe(1);
     } finally {
       warn.mockRestore();
     }
