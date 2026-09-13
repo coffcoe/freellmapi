@@ -190,6 +190,14 @@ git stash pop                                      # 取回自定义改动
 - `.env.bak-*`、`_pscheck.tmp`、`server/_tmp_query*.cjs`、`server/src/providers/index.ts.bak-agnes`、`server/dist.bak-20260721-111406/`
 - 这些不是自定义改动，是调试/备份产物，勿入台账、勿随 sync 提交。
 
+### 4.9 ✅ `server/src/db/migrations/20260907_000001_probe_logs_cascade.ts`（已注册 2026-09-07，macOS 根治 FK 卡死）
+- 背景：§4.2 `probe_logs` 外键 `REFERENCES models(id)` **无 ON DELETE CASCADE**；catalog-sync（上游逻辑，catalog-sync.ts:505/522）prune 时 `DELETE FROM models WHERE id=?`，待删 model 存在探测记录即 `FOREIGN KEY constraint failed` → 事务回滚 → `catalog_applied_version` 卡死（Windows 08.11 / macOS 08.01，2026-08-13 起，双端同源同病）。
+- 作用：重建 `probe_logs` 表，外键改为 `ON DELETE CASCADE`（SQLite 不支持 ALTER 改外键，需重建表）；`up()/down()` 均带 `PRAGMA foreign_key_list` 幂等守卫。数据无损（83 行全量迁移）。
+- 状态：2026-09-07 已注册 `DEFAULT_MIGRATIONS`（`PROBE_LOGS_CASCADE_FILENAME`）。**注意**：macOS 服务跑 dist 旧版（defaults 仅 5 迁移），迁移未走 CLI，系直接手动重建表生效；src 迁移文件供未来 build 后自动执行（幂等跳过）。
+- 验证：`PRAGMA foreign_key_list(probe_logs)` → on_delete=CASCADE ✅；`PRAGMA foreign_key_check` 空 ✅；catalog_applied_version 08.01 → **2026.09.04**（推进 1 个月+）；catalog_last_error 清空 ✅；HTTP 200。
+- **上游 merge 纪律**：probe_logs 为本地独有表（上游无此迁移），本修复为本地 fork 维护点，merge 上游时**必须保留**。
+- 漂移：`grep -n "probe_logs_cascade" server/src/db/migrate/defaults.ts`
+
 ---
 
 ## 5. DB 自定义数据（非代码，不受代码同步影响，但全新 clone 不带）
@@ -297,3 +305,181 @@ PY
 - 回滚：<命令>
 - 漂移检测：<命令>
 ```
+
+---
+
+## 4.13 健康检查错误分级协议（hard:/soft:）+ 评分健康降权（B-1）· T1 · 2026-09-07
+
+- 文件：server/src/services/health.ts（3 处）+ server/src/services/router.ts（4 处）
+- 作用：
+  1. health.ts 写 last_health_error 统一加严重度前缀协议：
+     - hard: = 永真错误（provider not registered / 确认 401-403）→ 可降权
+     - soft: = 瞬时网络错误（DNS/timeout/TLS）→ 仅提示不降权
+     - 三处：provider=null 分支（行 ~88）、validateKey 无效分支（行 ~116，null 保护）、transport catch（行 ~151）
+  2. router.ts 新增 platformHealthFactors(db)（行 ~483）：一次查询预聚合 platform→health factor（hard→0.9 / soft→0.98 / 无信号→1）
+  3. scoreChainEntry 新增 healthFactors 参数，reliability 乘 healthFactor（并入 reliability 轴，combineScore 保持 2 乘法阻尼不变）
+- 好/坏：坏=旧裸文本错误无法区分严重度，评分无法感知"永真不可用平台"；好=分级协议让健康信号可被评分消费，语义正确
+- 回滚：Copy-Item dist.bak-20260907-t1\* dist\ -Recurse -Force + 还原 src（git 或手工）
+- 漂移检测：Select-String health.ts 'hard:|soft:'（应 3 处）；Select-String router.ts 'platformHealthFactors'（应 3 处引用）
+- 状态：Windows 侧已落地验证（xunfei/sense nova hard 落库、测试 12+59 绿、auto 无破坏）；**待 macOS 侧同步**（health.ts + router.ts + tsc + 重启）
+
+
+### §4.14 B-1 测试补全 + T0-2 执行器（2026-09-07）
+
+- **测试**：server/src/__tests__/services/router.test.ts +2（platformHealthFactors 单测：hard 0.9/soft 0.98/hard 优先/无信号中性；bandit 集成：hard 平台被压）。router 测试 12→14，全绿。
+- **导出**：platformHealthFactors 加 export（router.ts 行 483），dist 已重编译。
+- **工具**：scripts/platform-quality-audit.py（质量矩阵+无效模型+门禁）；scripts/apply-invalid-models.py v3（key级/模型级分层处置，dry-run 默认）。
+- **关键结论**：cloudflare 26 模型全 key 级问题（key id=39 无冒号），模型保留禁 key；7 个真无效模型待清（--apply）。
+- **状态**：未 apply（待用户确认）；未 commit（cb-2102 裁决前）。
+
+### §4.15 推演深挖（2026-09-07）
+
+- **catalog 根因**：静态清单无端点验证（catalog-sync.ts applyCatalog 信任 m.enabled）；防回潮=user tombstone（isCatalogModelTombstoned）。
+- **评分矛盾**：平台聚合榜 ≠ 模型级路由；openrouter rank2 强模型是 auto 首选真因。
+- **僵尸平台**：14 平台 0 key / 126 模型在链——执行器 v4 新增 C 部分（摘链，配 key 可加回）。
+- **强模型**：nvidia minimax-m3（rank2/76%）需模型级保护，勿平台级禁用。
+- **工具**：apply-invalid-models.py v4（A key 级 + B 模型级 + C 僵尸平台）。
+- **状态**：dry-run 完成，--apply 待用户确认；未 commit。
+
+### §4.16 T0 方案 A 推翻（2026-09-07）
+
+- **链头**：profile 1 链头 = glm-4-flash（rank45，priority=1，被置顶）；切 priority 会固定到弱模型。
+- **auto 实际**：24h 分布已多样化（agnes 12x/modelscope 多成功）——"死选 openrouter"为瞬时快照。
+- **结论**：T0 方案 A 不建议；推荐 T0-2 v4（清无效）+ 评分信任 + 巡检定时化。
+
+### §4.17 推演收尾（2026-09-07）
+
+- **修正**：/api/health/* 鉴权 = requireAuth（dashboard session），非 unified key。
+- **验证**：服务重启后 .env 检查 9→1 unrecognised（死键治理生效）；3001 = PID 15792 正常。
+- **定时任务**：豆包 cron「freellmapi平台质量周巡检」（每周一 10:30）→ platform-quality-audit.py --gate。
+- **待确认**：T0-2 v4 --apply。
+
+### §4.18 cloudflare key 过期确认（2026-09-07）
+
+- **确认**：cloudflare key 月度轮换（约 1 个月），已过期 → 26 模型休眠非无效，换 key 全部恢复。
+- **处置**：T0-2 A 部分改等待；巡检脚本已加"key 过期"提示（platform-quality-audit.py）。
+- **换 key 方式**：替换 api_keys id=39 的 encrypted_key/iv/auth_tag（encrypt() 生成）。
+
+### §4.19 免费模型生命周期管理（2026-09-07）
+
+- **历史**：灰狐 F004 政策监控（7 平台半月检）+ 探活周检 #15 + 蓝图 v2.2 §308。
+- **整合**：三层闭环（政策预警 → catalog 同步 → 运行时 audit 确认清理）。
+- **对齐建议**：audit 脚本与灰狐 #15 统一，防双轨漂移（待讨论区）。
+- **真无效模型** = 平台免费模型下架（openrouter unavailable for free 等）→ 运行时 404 是事实确认信号。
+
+### §4.20 免费模型下架治理洞：source='user' 三层全跳过（2026-09-07 · 关键发现）
+
+- **实证**：nvidia 8+ EOL 模型（下架 1~6 周）仍在链，7 天 410 失败 400+ 次；上游 catalog 已移除，本地未删。
+- **根因**：source='user' + key_id 非空 → applyCatalog removed / model-retirement / user tombstone **三层全排除**。
+- **规模**：user 模型 71 个，7 天失败 ≥2 的 34 条。
+- **修复**：A 代码（user 410 → disable-only 不删行）/ B 执行器 v5 D 类 / C 巡检单列。
+- **附带**：NSSM 只配 err 日志（运行时盲区）；JSON 解析错误 5 次待定位。
+
+### §4.21 codegraph 支撑推演：根因链闭合（2026-09-07）
+
+- **codegraph 索引修复**：unresolved_refs 缺失 → index 重建（9634 节点/35164 边）。
+- **爆炸半径**：isCatalogManagedModel 2 调用方 / retire 12 符号 / 410 接线 fallback-loop:288——A 级修复低风险。
+- **根因链**：declarative 配置注册 user 模型 → 配置源 free-channels-20260824.json 已清空（2B）→ 71 个孤儿残留 → EOL 三层跳过 → 410 循环。
+- **设计缺口**：declarative-config 无配置移除→DB 清理路径。
+- **修复**：D1 清残留 / D2 user 410 disable-only / D3 移除清理路径（讨论）/ D4 监控。
+- **JSON 错误**：errorHandler:85 请求级，建议加 path+脱敏 body。
+
+### §4.22 人工免费渠道清单跟踪（2026-09-07）
+
+- **free-channels-20260824.json**：8/29 清空后未更新（2B，停滞 9 天）。
+- **free-model-audit.ts**：Y: 盘输出已修 F:（2 处）；探活审计工具，未调度。
+- **free-tier-reference.md**：数据 7/15 过时，待更新。
+- **定时任务**：清单跟踪（周一/四 9:00）。
+- **待对齐**：三个探活审计工具统一。
+
+### §4.23 free-model-audit 探活首跑（2026-09-07）
+
+- **执行**：node dist/scripts/free-model-audit.js --report（Y:→F: 已修）。
+- **结果**：🟢62 / 🟡100 / 🔴91；报告 F:/KnowledgeBase-V2/freellmapi-audit-2026-09-07.md。
+- **死亡分类**：cloudflare key 过期 ~34（等换）/ no_provider 平台 ~15（摘链）/ aihorde 406 ~8（清理）/ custom 3 / nvidia 410。
+- **建议**：audit 月度全量 + quality 周度轻量错峰；T0-2 清单按探活修订。
+
+### §4.24 no_provider 深挖（2026-09-07）
+
+- **xunfei/xfyun 漂移**：providers=xfyun，models/api_keys=xunfei → no_provider（B-1 hard: 真相）。修复=注册别名。
+- **未实现平台**：coze 10 / sense nova 2（补注册或摘链）。
+- **Unverified**：no_key 僵尸为主（huggingface/mistral/cohere/google/groq/ollama）。
+
+### §4.25 xunfei/xfyun 修复 + 清理清单修订（2026-09-07）
+
+- **修复**：数据对齐类型（models/api_keys 3+1 行 xunfei→xfyun）；tsc 0 + 重启 3001。
+- **清理清单五层**：A 无 provider 12 摘链 / B 下架 ~27 / C 429 观察 4 / D cloudflare 等 key 26 / E 僵尸平台保留 ~60。真清 ≈39。
+- **新下架**：openrouter qwen3-coder:free（历史 rank2 滞后揭穿）。
+
+### §4.26 catalog 127 skipped 根因 + NSSM 误判修正（2026-09-07）
+
+- **NSSM**：out.log 存在且活跃（误判修正，console.log 全落盘）。
+- **catalog 09.07**：127 skipped = navy 104 + requesty 8 + sealion 5 + aion 4 + nara 3（本地无 provider）。
+- **navy**：GPT-5.x Frontier 免费通道（~1M-3.5M tok/month），补 provider 解锁；需先验证。
+
+### §4.27 验证 + 清理执行完成（2026-09-07）
+
+- **xfyun 验证**：3 模型 spark-4.0-ultra/3.5/lite available=True；canonicalId=slug 非 model_id；**DB 时间戳=UTC（+8h 比对）**。
+- **清理 40 模型**：A 12（coze/sense nova）+ B 28（nvidia 8/aihorde 5/modelscope 1/openrouter 14）；tombstone 5；fallback 43。
+- **navy**：api.navy OpenAI 兼容，号池风险待评估。
+
+### §4.28 推演续：B-1 测试确认 + cloudflare 预演 + 补清 4 EOL（2026-09-07）
+
+- B-1 测试已存在（router.test.ts 281/303）。
+- cloudflare 26 全 Could not route（key 过期，换 key 全复活）。
+- 补清 4：glm-5.1/gpt-oss-120b/kimi-k2.6 + github gpt-4.1（enabled 212→208）。
+- 教训：清理清单合并探活+requests 410 双源。
+
+### §4.29 双源清理固化 v5（2026-09-07）
+
+- apply-invalid-models.py v5：MODEL_EOL_PATTERNS 增加 410/end of life/retirement——修复"410 不在模式导致 EOL 漏网"（glm-5.1 案例）。
+- 执行部分增加 fallback_config 同步 disabled（此前仅手动）。
+- 幂等保护：enabled=0 模型跳过（防重复 tombstone/摘链）。
+- ⚠️ 人工决策点：cloudflare key 39 在 dry-run 显示"禁 key"建议——**用户要换 key 复活，执行时排除**。
+
+### §4.30 双源清理 v5 + B-1 验证 + 三方一致性巡检（2026-09-07）
+
+- apply-invalid-models v5：+410/EOL + fallback 同步 + 幂等。
+- B-1 验证：429 33→4；minimax-m3 保留正确；xfyun 端到端路由成功。
+- platform-consistency-audit.py v1：4 种注册写法，0 漂移；sense nova key 12 已禁。
+
+### §4.31 catalog 缺口闭环 + 新平台评估（2026-09-07）
+
+- catalog-sync skipped 明细日志（bumpSkipped 4 处 + counts 类型 + 日志排序）。
+- catalog-gap-audit.py v1：缺口 124/5 平台。
+- 周巡检升级：quality+consistency+gap 三串联。
+- 接入评估：requesty/sealion/aion/nara 可接入；navy 观察。
+
+### §4.32 交叉验证（2026-09-07）
+
+- dist 产物核对 ✅；缺口三源一致 ✅；端点实测 4 真 1 疑。
+- navy 风险实锤：无认证 + gpt-6-astra + metadata unknown = 中转站特征 → 不接入。
+
+### §4.33 清理后一致性 + 路由质量（2026-09-07）
+
+- 摘链 39 个 disabled（链内=enabled=208 完美一致）。
+- fallback 0 残留；cloudflare 差异=媒体模型；kimi-k2.6 用户手加。
+- glm-4-flash（zhipu）87% 主流量健康；agnes/openrouter 主力。
+
+### §4.34 GLM 免费核查 + 无 key 僵尸清理（2026-09-07）
+
+- glm-4-flash 仍可用；GLM-5.3-Flash 收费（5 折至 9/9）；免费 GLM 最新 4.7-Flash。
+- 回滚误插入 glm-5.3-flash（收费）。
+- 无 key 僵尸清理 99 个（enabled 208→109，链内 109 一致，僵尸 0）；aihorde keyless 保留。
+- platform-consistency-audit.py v1.1：加 ④ 无 key 僵尸检查（keyless 白名单+探活动态）。
+
+### §4.35 GLM 免费解 + 不可达平台矩阵（2026-09-07）
+
+- modelscope GLM-5.2 免费旗舰入池（实测 200）。
+- GLM-5.3-Flash 收费实锤（429 请充值）；魔搭仅权重（empty completion）；GLM-7 不存在。
+- 俄罗斯 GLM-Free-API：可达但强制 SSE → custom 502；SSE 转发修复列入待办（key 53 保留）。
+- 矩阵：A 国内替代落地 / B 国内 provider 待 key / C 俄罗斯待修 / D 代理软件待决策。
+- disabled 5 个（5.3-Flash + GLM-Free-API 4），池 109=109。
+
+> 📌 **代码层修改日志**：自 2026-09-07 起，代码修改（文件/函数/原因/验证）统一记入 DEV-LOG.md（本台账专注数据/操作层）。git 工作区改动在 cb-2102 裁决前不 commit，DEV-LOG 为权威留痕。
+
+### §4.36 cloudflare 探活盲区 + 换 key 复活（2026-09-08）
+
+- validateKey 只验 token 活性（/user/tokens/verify）→ 旧 key 39 假阳性 healthy（实际 404）；新 key 54 真健康。
+- 处置：key 39 disabled；kimi-k2.6 + llama-3.2-11b-vision 403 disabled；26 模型 24 复活。
+- 池 107=107；修复建议：validateKey 加账户服务探测（待评审）。

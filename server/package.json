@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "tsx watch src/index.ts",
-    "build": "tsc && cp -r src/docs dist/docs",
+    "build": "tsc && node -e \"const fs=require('fs'),p=require('path');const src=p.join(process.cwd(),'src/docs'),dst=p.join(process.cwd(),'dist/docs');fs.mkdirSync(dst,{recursive:true});for(const f of fs.readdirSync(src)){  if(!f.endsWith('.ts')){fs.copyFileSync(p.join(src,f),p.join(dst,f));}}console.log('docs assets:',fs.readdirSync(dst).filter(x=>!x.endsWith('.js')&&!x.endsWith('.map')&&!x.endsWith('.d.ts')).join(','))\"",
     "start": "node dist/index.js",
     "test": "vitest run --pool=forks --fileParallelism=false",
     "test:watch": "vitest",

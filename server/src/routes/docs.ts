@@ -1,4 +1,7 @@
 import { Router, type Request, type Response } from 'express';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import { openapiSpec } from '../docs/openapi.js';
 import { DOCS_HTML } from '../docs/docs-page.js';
 
@@ -15,6 +18,12 @@ docsRouter.get('/openapi.json', (_req: Request, res: Response) => {
   // Long-cacheable: the spec only changes when the server binary does.
   res.setHeader('Cache-Control', 'public, max-age=3600');
   res.json(openapiSpec);
+});
+
+docsRouter.get('/openapi-zh.json', (_req: Request, res: Response) => {
+  // Chinese locale spec: serve the static JSON so the zh viewer works.
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.sendFile(path.resolve(__dirname, '../docs/openapi-zh.json'));
 });
 
 docsRouter.get('/docs', (_req: Request, res: Response) => {

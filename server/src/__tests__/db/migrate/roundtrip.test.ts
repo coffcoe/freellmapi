@@ -30,6 +30,7 @@ const PROVIDER_VERIFICATION_META_FILENAME = '20260824_000001_provider_verificati
 const BACKUPS_TABLE_FILENAME = '20260823_000002_backups_table.ts';
 const CUSTOM_MODEL_TOMBSTONES_FILENAME = '20260819_000001_custom_model_tombstones.ts';
 const IDEMPOTENCY_CLAIMS_FILENAME = '20260901_000001_idempotency_claims.ts';
+const PROBE_LOGS_CASCADE_FILENAME = '20260907_000001_probe_logs_cascade.ts';
 
 /**
  * Hardcoded canonical list of applied-migration filenames, in the exact order
@@ -68,6 +69,7 @@ const EXPECTED_MIGRATION_FILENAMES = [
   BACKUPS_TABLE_FILENAME,
   CUSTOM_MODEL_TOMBSTONES_FILENAME,
   IDEMPOTENCY_CLAIMS_FILENAME,
+  PROBE_LOGS_CASCADE_FILENAME,
 ];
 
 interface SchemaRow {

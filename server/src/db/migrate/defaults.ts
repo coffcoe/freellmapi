@@ -24,6 +24,7 @@ import * as providerVerificationMeta from '../migrations/20260824_000001_provide
 import * as backupsTable from '../migrations/20260823_000002_backups_table.js';
 import * as idempotencyClaims from '../migrations/20260901_000001_idempotency_claims.js';
 import * as customModelTombstones from '../migrations/20260819_000001_custom_model_tombstones.js';
+import * as probeLogsCascade from '../migrations/20260907_000001_probe_logs_cascade.js';
 
 
 export interface MigrationModule {
@@ -61,6 +62,7 @@ export const PROVIDER_VERIFICATION_META_FILENAME = '20260824_000001_provider_ver
 export const BACKUPS_TABLE_FILENAME = '20260823_000002_backups_table.ts';
 export const IDEMPOTENCY_CLAIMS_FILENAME = '20260901_000001_idempotency_claims.ts';
 export const CUSTOM_MODEL_TOMBSTONES_FILENAME = '20260819_000001_custom_model_tombstones.ts';
+export const PROBE_LOGS_CASCADE_FILENAME = '20260907_000001_probe_logs_cascade.ts';
 
 
 export const DEFAULT_MIGRATIONS: readonly DefaultMigration[] = [
@@ -89,5 +91,6 @@ export const DEFAULT_MIGRATIONS: readonly DefaultMigration[] = [
   { filename: BACKUPS_TABLE_FILENAME, module: backupsTable },
   { filename: CUSTOM_MODEL_TOMBSTONES_FILENAME, module: customModelTombstones },
   { filename: IDEMPOTENCY_CLAIMS_FILENAME, module: idempotencyClaims },
+  { filename: PROBE_LOGS_CASCADE_FILENAME, module: probeLogsCascade },
 
 ];

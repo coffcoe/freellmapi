@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Free Model Audit — Batch probe all models and write results to DB.
  * Usage: npx tsx src/scripts/free-model-audit.ts [--scope all|enabled-only|disabled-only|platform:<name>|top-usage:N]
  *
@@ -10,7 +10,7 @@
  * Output:
  *   - Updates probe_status / last_verified_at in models table
  *   - Inserts records into probe_logs table
- *   - Generates Y:/KnowledgeBase-V2/freellmapi-audit-<YYYY-MM-DD>.md
+ *   - Generates F:/KnowledgeBase-V2/freellmapi-audit-<YYYY-MM-DD>.md
  */
 import { initDb, getDb } from '../db/index.js';
 import { decrypt } from '../lib/crypto.js';
@@ -312,7 +312,7 @@ if (OUTPUT_REPORT && !DRY_RUN) {
   }
 
   const date = new Date().toISOString().split('T')[0];
-  const reportPath = `Y:/KnowledgeBase-V2/freellmapi-audit-${date}.md`;
+  const reportPath = `F:/KnowledgeBase-V2/freellmapi-audit-${date}.md`;
   
   let md = `# FreeLLMAPI 模型探活审计报告\n\n`;
   md += `**审计时间**：${new Date().toISOString()}\n`;

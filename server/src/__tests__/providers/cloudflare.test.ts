@@ -67,8 +67,9 @@ describe('CloudflareProvider', () => {
       });
 
       expect(await provider.validateKey('acc123:tok')).toBe(true);
-      expect(calls).toHaveLength(1);
+      expect(calls).toHaveLength(2);
       expect(calls[0]).toBe('https://api.cloudflare.com/client/v4/user/tokens/verify');
+      expect(calls[1]).toContain('/ai/models/search?per_page=1');
     });
 
     it('falls back to the account-scoped endpoint when /user 403s (#297)', async () => {
@@ -86,8 +87,9 @@ describe('CloudflareProvider', () => {
       });
 
       expect(await provider.validateKey('acc123:tok')).toBe(true);
-      expect(calls).toHaveLength(2);
+      expect(calls).toHaveLength(3);
       expect(calls[1]).toBe('https://api.cloudflare.com/client/v4/accounts/acc123/tokens/verify');
+      expect(calls[2]).toContain('/ai/models/search?per_page=1');
     });
 
     it('fails with the upstream reason when both scopes reject the token', async () => {

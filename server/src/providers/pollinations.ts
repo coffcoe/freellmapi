@@ -2,8 +2,14 @@ import { OpenAICompatProvider } from './openai-compat.js';
 import type { KeyValidationResult } from './base.js';
 import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
 
-const POLLINATIONS_BASE_URL = 'https://gen.pollinations.ai/v1';
-/** Authenticated key-introspection endpoint — note it sits OUTSIDE /v1. */
+const POLLINATIONS_BASE_URL = 'https://text.pollinations.ai/openai/v1';
+/**
+ * 2026-09-08 实测：gen.pollinations.ai/v1 已要求 API key（匿名 401，
+ * "A valid API key is required"）；text.pollinations.ai/openai/v1 老端点
+ * 仍匿名可用（openai=GPT-5.4-nano 实测 200）。BASE_URL 切老端点走
+ * keyless 匿名路由；若未来注册 key（enter.pollinations.ai/keys）想用
+ * gen 全模型池，再切回并启用 key 验证。
+ */
 const POLLINATIONS_ACCOUNT_KEY_URL = 'https://gen.pollinations.ai/account/key';
 
 /**
@@ -36,6 +42,7 @@ export class PollinationsProvider extends OpenAICompatProvider {
       platform: 'pollinations',
       name: 'Pollinations',
       baseUrl: POLLINATIONS_BASE_URL,
+      keyless: true,
     });
   }
 

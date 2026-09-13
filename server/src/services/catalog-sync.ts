@@ -1,4 +1,4 @@
-import crypto from 'crypto';
+﻿import crypto from 'crypto';
 import type { Db } from '../db/types.js';
 import { getDb, getSetting, setSetting } from '../db/index.js';
 import { hasProvider } from '../providers/index.js';
@@ -166,7 +166,7 @@ export interface SyncResult {
   version?: string;
   tier?: string;
   detail?: string;
-  counts?: { updated: number; inserted: number; removed: number; skippedUnknownPlatform: number; quirks: number };
+  counts?: { updated: number; inserted: number; removed: number; skippedUnknownPlatform: number; quirks: number; skippedByPlatform: Record<string, number> };
 }
 
 /** Minimal structural check — enough to fail loudly on a wrong/garbled body. */
@@ -241,8 +241,13 @@ function routableContextWindow(platform: string, modelId: string, contextWindow:
  *    dead-model migrations do (fallback_config row first, FK order).
  */
 export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['counts']> {
-  const counts = { updated: 0, inserted: 0, removed: 0, skippedUnknownPlatform: 0, quirks: 0 };
+  const counts = { updated: 0, inserted: 0, removed: 0, skippedUnknownPlatform: 0, quirks: 0, skippedByPlatform: {} as Record<string, number> };
 
+  // v2026-09-07: skipped 明细按平台记录（此前只有计数，127 skipped 看不到是哪些平台）。
+  const bumpSkipped = (platform: string) => {
+    counts.skippedUnknownPlatform++;
+    counts.skippedByPlatform[platform] = (counts.skippedByPlatform[platform] ?? 0) + 1;
+  };
   const selectModel = db.prepare('SELECT id, enabled, source FROM models WHERE platform = ? AND model_id = ?');
   // NOTE: raw_capabilities / capability_sources are LOCAL-ONLY fields populated
   // by the capability collector. They are intentionally excluded from both the
@@ -328,7 +333,7 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
       const modality = m.modality ?? 'text';
       if (MEDIA_MODALITIES.has(modality)) {
         if (!MEDIA_PLATFORMS.has(m.platform)) {
-          counts.skippedUnknownPlatform++;
+          bumpSkipped(m.platform);
           continue;
         }
         if (isCatalogModelTombstoned(db, 'media', m.platform, m.modelId)) continue;
@@ -354,7 +359,7 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
       if (m.platform === 'custom' || !hasProvider(m.platform as Platform)) {
         // An older binary may receive models for providers it cannot route yet;
         // skip them — they will appear after the user updates the app.
-        counts.skippedUnknownPlatform++;
+        bumpSkipped(m.platform);
         continue;
       }
       if (isCatalogModelTombstoned(db, 'chat', m.platform, m.modelId)) continue;
@@ -405,7 +410,7 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
     if (catalog.embeddings) {
       for (const m of catalog.embeddings) {
         if (!EMBEDDING_PLATFORMS.has(m.platform)) {
-          counts.skippedUnknownPlatform++;
+          bumpSkipped(m.platform);
           continue;
         }
         inEmbeddingCatalog.add(`${m.platform}:${m.modelId}`);
@@ -441,7 +446,7 @@ export function applyCatalog(db: Db, catalog: Catalog): NonNullable<SyncResult['
     if (catalog.transcriptionModels) {
       for (const m of catalog.transcriptionModels) {
         if (!TRANSCRIPTION_PLATFORMS.has(m.platform)) {
-          counts.skippedUnknownPlatform++;
+          bumpSkipped(m.platform);
           continue;
         }
         if (isCatalogModelTombstoned(db, 'media', m.platform, m.modelId)) continue;
@@ -640,7 +645,13 @@ export async function syncCatalog(force = false): Promise<SyncResult> {
         `[catalog-sync] applied ${catalog.tier} v${catalog.version}: ` +
           `${counts.updated} updated, ${counts.inserted} new, ${counts.removed} removed, ` +
           `${counts.quirks} quirks` +
-          (counts.skippedUnknownPlatform ? `, ${counts.skippedUnknownPlatform} skipped (unknown platform)` : ''),
+          (counts.skippedUnknownPlatform
+            ? `, ${counts.skippedUnknownPlatform} skipped (unknown platform): ` +
+              Object.entries(counts.skippedByPlatform)
+                .sort((a, b) => b[1] - a[1])
+                .map(([p, n]) => `${p} ${n}`)
+                .join(', ')
+            : ''),
       );
       setSetting(SETTING_LAST_SYNC_MS, String(Date.now()));
       setSetting(SETTING_LAST_ERROR, '');

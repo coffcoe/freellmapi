@@ -171,15 +171,70 @@ export class CloudflareProvider extends BaseProvider {
       token,
       quotaContext,
     );
-    if ('result' in userResult) return userResult.result;
+    if ('result' in userResult) {
+      // Token verified — but token-active ≠ account-service-usable (2026-09-08
+      // cb-2140): a token stays "active" while the account's AI routing is gone
+      // (404 Could not route), which used to leave bad keys "healthy" forever.
+      // Probe the account AI service before returning the verdict.
+      if (userResult.result !== true) return userResult.result;
+      return this.verifyAccountService(accountId, token, quotaContext);
+    }
 
     const accountResult = await this.verifyAt(
       `https://api.cloudflare.com/client/v4/accounts/${accountId}/tokens/verify`,
       token,
       quotaContext,
     );
-    if ('result' in accountResult) return accountResult.result;
+    if ('result' in accountResult) {
+      if (accountResult.result !== true) return accountResult.result;
+      return this.verifyAccountService(accountId, token, quotaContext);
+    }
     return accountResult.authFailed;
+  }
+
+  // Account-service availability probe (2026-09-08 · cb-2140). token-verify
+  // alone is a false-positive blind spot: a token can stay "active" while the
+  // account's AI endpoints are gone (404 Could not route) or the token lacks
+  // Workers AI access (403). Probe the account AI models endpoint so a dead
+  // account demotes hard (health.ts → hard:) instead of staying "healthy"
+  // forever. Transport errors propagate to health.ts as soft (network, not a
+  // verdict on the key), so a flaky edge never mis-diagnoses a good key.
+  private async verifyAccountService(
+    accountId: string,
+    token: string,
+    quotaContext?: QuotaObservationContext,
+  ): Promise<KeyValidationResult> {
+    const res = await this.fetchWithTimeout(
+      `https://api.cloudflare.com/client/v4/accounts/${accountId}/ai/models/search?per_page=1`,
+      { method: 'GET', headers: { 'Authorization': `Bearer ${token}` } },
+      10000,
+      { timeoutBounds: 'request' },
+    );
+    recordQuotaObservationsFromResponse(res, {
+      platform: this.platform,
+      keyId: quotaContext?.keyId,
+      providerAccountId: quotaContext?.providerAccountId,
+      modelId: quotaContext?.modelId,
+      quotaPoolKey: quotaContext?.quotaPoolKey,
+      endpoint: 'ai/models/search',
+    });
+    if (res.ok) return true;
+
+    // 404 Could not route / 403 no AI access / 410 / 5xx — the account's AI
+    // service is unusable even though the token verified. This is the actual
+    // fix: demote hard so the dashboard/audit surfaces it instead of freezing
+    // the key in a false "healthy".
+    let detail: string | null = null;
+    try {
+      const body: any = await res.json();
+      detail = body?.errors?.[0]?.message ?? body?.message ?? null;
+    } catch {
+      // keep the status-only diagnostic
+    }
+    return {
+      valid: false,
+      error: `${this.name} account AI service unavailable (HTTP ${res.status})${detail ? `: ${detail}` : ' — could not route to account AI endpoints'}`,
+    };
   }
 
   // Hits a Cloudflare token-verify endpoint. Returns {result} for a definitive
